@@ -28,6 +28,13 @@
         "tree-sitter-typescript": "^0.23.2",
       },
     },
+    "packages/lyra-host": {
+      "name": "@lyra/host",
+      "version": "0.1.0",
+      "dependencies": {
+        "@lyra/core": "workspace:*",
+      },
+    },
     "packages/lyra-lsp": {
       "name": "@lyra/lsp",
       "version": "0.1.0",
@@ -39,6 +46,15 @@
     "packages/lyra-provider": {
       "name": "@lyra/provider",
       "version": "0.1.0",
+    },
+    "packages/lyra-runtime": {
+      "name": "@lyra/runtime",
+      "version": "0.1.0",
+      "dependencies": {
+        "@lyra/core": "workspace:*",
+        "@lyra/host": "workspace:*",
+        "@lyra/tools": "workspace:*",
+      },
     },
     "packages/lyra-session": {
       "name": "@lyra/session",
@@ -62,9 +78,13 @@
 
     "@lyra/edit": ["@lyra/edit@workspace:packages/lyra-edit"],
 
+    "@lyra/host": ["@lyra/host@workspace:packages/lyra-host"],
+
     "@lyra/lsp": ["@lyra/lsp@workspace:packages/lyra-lsp"],
 
     "@lyra/provider": ["@lyra/provider@workspace:packages/lyra-provider"],
+
+    "@lyra/runtime": ["@lyra/runtime@workspace:packages/lyra-runtime"],
 
     "@lyra/session": ["@lyra/session@workspace:packages/lyra-session"],
 
