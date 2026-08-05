@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = []
+members = ["packages/lyra-tui"]
 
 [workspace.package]
 edition = "2024"

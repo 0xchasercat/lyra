@@ -1,0 +1,11 @@
+[package]
+name = "lyra-tui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "lyra_tui"
+path = "src/lib.rs"
+
+[dependencies]
