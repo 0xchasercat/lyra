@@ -19,6 +19,15 @@ test("first-run wizard configures a local provider with keyboard defaults", () =
   expect(wizard.result()).toEqual({ provider: "local", baseUrl: "http://localhost:11434/v1", apiType: "openai_completions", model: "qwen2.5-coder:14b", auth: { type: "none" } });
 });
 
+test("first-run wizard exposes labeled choices and accurate progress", () => {
+  const wizard = new ProviderSetupWizard();
+  expect(wizard.progress()).toEqual({ current: 1, total: 5 });
+  expect(wizard.current().options?.map((option) => option.label)).toEqual(["OpenAI", "Anthropic", "OpenAI-compatible", "Local"]);
+  wizard.submit("4");
+  expect(wizard.progress()).toEqual({ current: 2, total: 5 });
+  expect(wizard.current()).toMatchObject({ title: "Provider id", defaultValue: "local" });
+});
+
 test("setup persists keychain references and roles without writing the token", async () => {
   const home = await temporaryRoot();
   const origin = await temporaryRoot();

@@ -1,4 +1,7 @@
-use lyra_tui::{Color, Renderer, RetryStatus, Row, THEMES, Theme, TuiState};
+use lyra_tui::{
+    Color, Renderer, RetryStatus, Row, SetupControl, SetupOption, SetupSaved, SetupScreen, THEMES,
+    Theme, TuiState,
+};
 use serde::{Deserialize, Serialize};
 use std::io::{self, BufRead, Write};
 
@@ -35,6 +38,51 @@ struct FrameRequest {
     cost_cents: u64,
     #[serde(default)]
     elapsed_ms: u64,
+    setup: Option<WireSetup>,
+}
+
+#[derive(Debug, Deserialize)]
+struct WireSetup {
+    step: usize,
+    total: usize,
+    title: String,
+    detail: String,
+    #[serde(default)]
+    answers: Vec<String>,
+    error: Option<String>,
+    saved: Option<WireSetupSaved>,
+    control: WireSetupControl,
+}
+
+#[derive(Debug, Deserialize)]
+struct WireSetupSaved {
+    path: String,
+    provider: String,
+    model: String,
+    auth: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+enum WireSetupControl {
+    Select {
+        options: Vec<WireSetupOption>,
+        selected: usize,
+    },
+    Input {
+        value: String,
+        #[serde(rename = "defaultValue")]
+        default_value: Option<String>,
+        secret: bool,
+    },
+    Complete,
+}
+
+#[derive(Debug, Deserialize)]
+struct WireSetupOption {
+    key: String,
+    label: String,
+    detail: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -101,6 +149,43 @@ fn main() -> io::Result<()> {
                         _ => Row::notice(id, row.text),
                     });
                 }
+                state.setup = request.setup.map(|setup| SetupScreen {
+                    step: setup.step,
+                    total: setup.total,
+                    title: setup.title,
+                    detail: setup.detail,
+                    answers: setup.answers,
+                    error: setup.error,
+                    saved: setup.saved.map(|saved| SetupSaved {
+                        path: saved.path,
+                        provider: saved.provider,
+                        model: saved.model,
+                        auth: saved.auth,
+                    }),
+                    control: match setup.control {
+                        WireSetupControl::Select { options, selected } => SetupControl::Select {
+                            options: options
+                                .into_iter()
+                                .map(|option| SetupOption {
+                                    key: option.key,
+                                    label: option.label,
+                                    detail: option.detail,
+                                })
+                                .collect(),
+                            selected,
+                        },
+                        WireSetupControl::Input {
+                            value,
+                            default_value,
+                            secret,
+                        } => SetupControl::Input {
+                            value,
+                            default_value,
+                            secret,
+                        },
+                        WireSetupControl::Complete => SetupControl::Complete,
+                    },
+                });
                 state.activity.live_agents = request.agents;
                 state.activity.queued = request.queued;
                 state.composer = request.composer;

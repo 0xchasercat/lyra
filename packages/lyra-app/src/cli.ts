@@ -11,8 +11,12 @@ import { LyraRuntime } from "./runtime.ts";
 
 interface CliOptions { origin: string; session?: string; model?: string; prompt?: string; acp: boolean; help: boolean; allowAutoGit: boolean; }
 interface UiRow { kind: "user" | "assistant" | "tool" | "notice" | "boundary"; text: string; name?: string; path?: string; added?: number; removed?: number; id?: string; expanded?: boolean; }
-interface FrameRequest { project: string; branch: string; model: string; session: string; theme: string; accent: string; width: number; height: number; rows: UiRow[]; agents: string[]; queued: number; composer: string; streaming: boolean; input_tokens: number; context_tokens: number; context_window: number; cost_cents: number; elapsed_ms: number; retry?: { attempt: number; max_attempts: number; reason: string; remaining_ms: number }; }
+interface SetupOption { key: string; label: string; detail: string; }
+interface SetupView { step: number; total: number; title: string; detail: string; answers: string[]; error?: string; saved?: { path: string; provider: string; model: string; auth: string }; control: { kind: "select"; options: SetupOption[]; selected: number } | { kind: "input"; value: string; defaultValue?: string; secret: boolean } | { kind: "complete" }; }
+interface FrameRequest { project: string; branch: string; model: string; session: string; theme: string; accent: string; width: number; height: number; rows: UiRow[]; agents: string[]; queued: number; composer: string; streaming: boolean; input_tokens: number; context_tokens: number; context_window: number; cost_cents: number; elapsed_ms: number; retry?: { attempt: number; max_attempts: number; reason: string; remaining_ms: number }; setup?: SetupView; }
 interface SessionStats { inputTokens: number; contextTokens: number; contextWindow: number; costCents: number; }
+const ENTER_TUI = "\x1b[?1049h\x1b[2J\x1b[H\x1b[?25l";
+const LEAVE_TUI = "\x1b[0m\x1b[?25h\x1b[?1049l";
 
 async function main(): Promise<void> {
   const options = parseArgs(process.argv.slice(2));
@@ -31,6 +35,7 @@ async function main(): Promise<void> {
 }
 async function runInteractive(cli: CliOptions & { confirmAuto(): Promise<boolean> }): Promise<void> {
   const bridge = await TuiBridge.start();
+  process.stdout.write(ENTER_TUI);
   let runtime: LyraRuntime | undefined;
   try {
     if (await needsProviderSetup(cli.origin, cli.model)) {
@@ -42,7 +47,7 @@ async function runInteractive(cli: CliOptions & { confirmAuto(): Promise<boolean
     const ui = new InteractiveUi(client, bridge, { project: basename(cli.origin), branch: await branchName(cli.origin), model: runtime.session.environment.model, session: runtime.session.descriptor.name, theme: runtime.app.config.tui.theme, accent: runtime.app.config.tui.accent });
     client.onNotification((method, params) => { if (method === "session/update") void ui.update(params); });
     await ui.run();
-  } finally { await bridge.close(); await runtime?.close(); process.stdout.write("\x1b[0m\x1b[?25h\n"); }
+  } finally { await bridge.close(); await runtime?.close(); process.stdout.write(LEAVE_TUI); }
 }
 
 class ProviderSetupUi {
@@ -51,6 +56,8 @@ class ProviderSetupUi {
   #composer = "";
   #error = "";
   #saved: SavedProviderSetup | undefined;
+  #selected = 0;
+  #promptTitle = "";
   #tail: Promise<void> = Promise.resolve();
   constructor(private readonly bridge: TuiBridge, private readonly cli: CliOptions) {}
   async run(): Promise<boolean> {
@@ -61,6 +68,7 @@ class ProviderSetupUi {
     process.stdout.on("resize", this.#onResize);
     await this.render();
     const result = await this.#done.promise;
+    await this.#tail;
     process.stdin.off("keypress", this.#onKeypress);
     process.stdout.off("resize", this.#onResize);
     process.stdin.setRawMode?.(false);
@@ -70,9 +78,24 @@ class ProviderSetupUi {
   readonly #onKeypress = (text: string, key: { name?: string; ctrl?: boolean; meta?: boolean }): void => {
     this.#tail = this.#tail.then(async () => {
       if ((key.ctrl && key.name === "c") || key.name === "escape") { this.#done.resolve(false); return; }
+      const prompt = this.#wizard.current();
+      if (prompt.options) {
+        if (key.name === "up" || key.name === "down") {
+          const delta = key.name === "up" ? -1 : 1;
+          this.#selected = (this.#selected + delta + prompt.options.length) % prompt.options.length;
+          await this.render();
+          return;
+        }
+        const optionIndex = prompt.options.findIndex((option) => option.key === text);
+        if (optionIndex >= 0) {
+          this.#selected = optionIndex;
+          await this.render();
+          return;
+        }
+      }
       if (key.name === "backspace") this.#composer = [...this.#composer].slice(0, -1).join("");
       else if (key.name === "return") await this.submit();
-      else if (!key.ctrl && !key.meta && text && text >= " ") this.#composer += text;
+      else if (!prompt.options && !key.ctrl && !key.meta && text && text >= " ") this.#composer += text;
       await this.render();
     }).catch((error) => { this.#error = error instanceof Error ? error.message : String(error); return this.render(); });
   };
@@ -80,21 +103,26 @@ class ProviderSetupUi {
     this.#error = "";
     if (this.#saved) { this.#done.resolve(true); return; }
     const prompt = this.#wizard.current();
-    if (prompt.title === "Credential source" && this.#composer.trim() === "1" && !supportsOsKeychain()) throw new Error("No supported OS keychain is available. Choose environment or plaintext storage.");
-    if (!this.#wizard.complete) { this.#wizard.submit(this.#composer); this.#composer = ""; }
+    const raw = prompt.options?.[this.#selected]?.key ?? this.#composer;
+    if (prompt.title === "Credential source" && raw === "1" && !supportsOsKeychain()) throw new Error("No supported OS keychain is available. Choose environment or plaintext storage.");
+    if (!this.#wizard.complete) { this.#wizard.submit(raw); this.#composer = ""; }
     if (this.#wizard.complete) this.#saved = await saveProviderSetup(this.#wizard.result());
   }
   render(): Promise<void> {
     const prompt = this.#wizard.current();
-    const rows: UiRow[] = [
-      { kind: "user", text: "First run · provider setup" },
-      ...this.#wizard.answers.map((answer) => ({ kind: "notice" as const, text: answer })),
-      { kind: "assistant", text: `${prompt.title}\n${prompt.detail}${prompt.options ? `\n\n${prompt.options.join("\n")}` : ""}${prompt.defaultValue ? `\n\nDefault · ${prompt.defaultValue}` : ""}` },
-      ...(this.#error ? [{ kind: "notice" as const, text: `Setup error · ${this.#error}` }] : []),
-      ...(this.#saved ? [{ kind: "notice" as const, text: `Saved · ${this.#saved.path}\nAuth · ${this.#saved.auth}\nPress Enter to start.` }] : []),
-    ];
-    const composer = prompt.secret ? "•".repeat([...this.#composer].length) : this.#composer;
-    return this.bridge.render({ project: basename(this.cli.origin), branch: "setup", model: this.#saved ? `${this.#saved.provider}/${this.#saved.model}` : "provider required", session: "first-run", theme: "graphite", accent: "#7aa2f7", width: process.stdout.columns ?? 80, height: process.stdout.rows ?? 24, rows, agents: [], queued: 0, composer, streaming: false, input_tokens: 0, context_tokens: 0, context_window: 0, cost_cents: 0, elapsed_ms: 0 }).then((frame) => { process.stdout.write(frame); });
+    if (prompt.title !== this.#promptTitle) { this.#promptTitle = prompt.title; this.#selected = 0; }
+    const progress = this.#wizard.progress();
+    const setup: SetupView = {
+      step: progress.current,
+      total: progress.total,
+      title: prompt.title,
+      detail: prompt.detail,
+      answers: this.#wizard.answers,
+      ...(this.#error ? { error: this.#error } : {}),
+      ...(this.#saved ? { saved: this.#saved } : {}),
+      control: this.#saved ? { kind: "complete" } : prompt.options ? { kind: "select", options: [...prompt.options], selected: this.#selected } : { kind: "input", value: this.#composer, ...(prompt.defaultValue ? { defaultValue: prompt.defaultValue } : {}), secret: prompt.secret === true },
+    };
+    return this.bridge.render({ project: basename(this.cli.origin), branch: "setup", model: this.#saved ? `${this.#saved.provider}/${this.#saved.model}` : "provider required", session: "first-run", theme: "graphite", accent: "#7aa2f7", width: process.stdout.columns ?? 80, height: process.stdout.rows ?? 24, rows: [], agents: [], queued: 0, composer: "", streaming: false, input_tokens: 0, context_tokens: 0, context_window: 0, cost_cents: 0, elapsed_ms: 0, setup }).then((frame) => { process.stdout.write(frame); });
   }
 }
 
@@ -126,6 +154,8 @@ class InteractiveUi {
     process.stdout.on("resize", this.#onResize);
     await this.render();
     await this.#done.promise;
+    await this.#inputTail;
+    await this.#renderTail;
     process.stdin.off("keypress", this.#onKeypress);
     process.stdout.off("resize", this.#onResize);
     process.stdin.setRawMode?.(false);

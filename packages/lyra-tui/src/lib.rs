@@ -152,6 +152,47 @@ impl Default for Footer {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SetupOption {
+    pub key: String,
+    pub label: String,
+    pub detail: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SetupControl {
+    Select {
+        options: Vec<SetupOption>,
+        selected: usize,
+    },
+    Input {
+        value: String,
+        default_value: Option<String>,
+        secret: bool,
+    },
+    Complete,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SetupSaved {
+    pub path: String,
+    pub provider: String,
+    pub model: String,
+    pub auth: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SetupScreen {
+    pub step: usize,
+    pub total: usize,
+    pub title: String,
+    pub detail: String,
+    pub answers: Vec<String>,
+    pub error: Option<String>,
+    pub saved: Option<SetupSaved>,
+    pub control: SetupControl,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TuiState {
     pub project: String,
     pub branch: String,
@@ -162,6 +203,7 @@ pub struct TuiState {
     pub composer: String,
     pub streaming: bool,
     pub footer: Footer,
+    pub setup: Option<SetupScreen>,
     pub next_id: u64,
 }
 
@@ -182,6 +224,7 @@ impl TuiState {
             composer: String::new(),
             streaming: false,
             footer: Footer::default(),
+            setup: None,
             next_id: 1,
         }
     }
@@ -217,6 +260,9 @@ impl TuiState {
         }
     }
     pub fn activity_line(&self) -> String {
+        if self.activity.live_agents.is_empty() && self.activity.queued == 0 {
+            return "  Enter send  ·  Ctrl+Enter queue  ·  Tab inspect tools  ·  Esc exit".into();
+        }
         let agents = self
             .activity
             .live_agents
@@ -320,7 +366,7 @@ impl Renderer {
             .cloned()
             .unwrap_or_else(|| Buffer::new(width as u16, height as u16));
         let mut bytes = if initial {
-            b"\x1b[?25l".to_vec()
+            b"\x1b[2J\x1b[H\x1b[?25l".to_vec()
         } else {
             Vec::new()
         };
@@ -347,8 +393,10 @@ impl Renderer {
         width: usize,
         height: usize,
     ) -> RenderBatch {
-        if let Some(row) = state.rows.last_mut()
-            && row.kind == RowKind::Assistant
+        if let Some(row) = state
+            .rows
+            .last_mut()
+            .filter(|row| row.kind == RowKind::Assistant && state.streaming)
         {
             row.text.push_str(chunk);
         }
@@ -369,6 +417,9 @@ fn compose(state: &TuiState, width: usize, height: usize, theme: Theme) -> Frame
     if height > 1 {
         put_wrapped(&mut frame, 0, 1, &"─".repeat(width), width);
     }
+    if let Some(setup) = &state.setup {
+        return compose_setup(setup, width, height);
+    }
     let footer_rows = if height >= 4 {
         4
     } else {
@@ -376,6 +427,18 @@ fn compose(state: &TuiState, width: usize, height: usize, theme: Theme) -> Frame
     };
     let body_end = height.saturating_sub(footer_rows);
     let mut y = 2;
+    if state.rows.is_empty() {
+        put_wrapped(&mut frame, 0, y, "  Ready", width);
+        y += 1;
+        put_wrapped(
+            &mut frame,
+            0,
+            y,
+            "  Describe a coding task, ask about the repository, or type /help.",
+            width,
+        );
+        y += 2;
+    }
     for row in &state.rows {
         if y >= body_end {
             break;
@@ -401,7 +464,7 @@ fn compose(state: &TuiState, width: usize, height: usize, theme: Theme) -> Frame
             &mut frame,
             0,
             body_end + 2,
-            &format!("  {}", state.composer),
+            &format!("  > {}", state.composer),
             width,
         );
     }
@@ -444,6 +507,167 @@ fn compose(state: &TuiState, width: usize, height: usize, theme: Theme) -> Frame
     frame
 }
 
+fn compose_setup(setup: &SetupScreen, width: usize, height: usize) -> Frame {
+    let mut frame = Frame::blank(width, height);
+    if width == 0 || height == 0 {
+        return frame;
+    }
+    put_wrapped(
+        &mut frame,
+        0,
+        0,
+        &format!(
+            " lyra   / first-run setup                 step {}/{}",
+            setup.step, setup.total
+        ),
+        width,
+    );
+    if height > 1 {
+        put_wrapped(&mut frame, 0, 1, &"─".repeat(width), width);
+    }
+    let mut y = 3;
+    put_setup_wrapped(
+        &mut frame,
+        &mut y,
+        &format!("SETUP  /  {}", setup.title),
+        width,
+        height,
+    );
+    put_setup_wrapped(&mut frame, &mut y, &setup.detail, width, height);
+    if !setup.answers.is_empty() {
+        y += 1;
+        put_setup_wrapped(&mut frame, &mut y, "Completed", width, height);
+        for answer in setup.answers.iter().rev().take(4).rev() {
+            put_setup_wrapped(&mut frame, &mut y, &format!("  ✓ {answer}"), width, height);
+        }
+    }
+    y += 1;
+    match &setup.control {
+        SetupControl::Select { options, selected } => {
+            put_setup_wrapped(
+                &mut frame,
+                &mut y,
+                "Choose one  ·  ↑/↓ move  ·  number jump  ·  Enter confirm",
+                width,
+                height,
+            );
+            for (index, option) in options.iter().enumerate() {
+                let marker = if index == *selected { "▸" } else { " " };
+                put_setup_wrapped(
+                    &mut frame,
+                    &mut y,
+                    &format!("  {marker} {}  {}", option.key, option.label),
+                    width,
+                    height,
+                );
+                put_setup_wrapped(
+                    &mut frame,
+                    &mut y,
+                    &format!("        {}", option.detail),
+                    width,
+                    height,
+                );
+            }
+        }
+        SetupControl::Input {
+            value,
+            default_value,
+            secret,
+        } => {
+            put_setup_wrapped(
+                &mut frame,
+                &mut y,
+                "Type in the field below  ·  Enter accept  ·  Esc cancel",
+                width,
+                height,
+            );
+            let shown = if value.is_empty() {
+                default_value
+                    .as_ref()
+                    .map(|value| format!("<default: {value}>"))
+                    .unwrap_or_else(|| "<type here>".into())
+            } else if *secret {
+                "•".repeat(value.chars().count())
+            } else {
+                value.clone()
+            };
+            put_setup_wrapped(
+                &mut frame,
+                &mut y,
+                &format!("  > [ {shown} ]"),
+                width,
+                height,
+            );
+            if value.is_empty() && default_value.is_some() {
+                put_setup_wrapped(
+                    &mut frame,
+                    &mut y,
+                    "    Leave blank to use the default.",
+                    width,
+                    height,
+                );
+            }
+        }
+        SetupControl::Complete => {
+            put_setup_wrapped(&mut frame, &mut y, "✓ Provider saved", width, height);
+            if let Some(saved) = &setup.saved {
+                put_setup_wrapped(
+                    &mut frame,
+                    &mut y,
+                    &format!("  {}/{}", saved.provider, saved.model),
+                    width,
+                    height,
+                );
+                put_setup_wrapped(
+                    &mut frame,
+                    &mut y,
+                    &format!("  Auth: {}", saved.auth),
+                    width,
+                    height,
+                );
+                put_setup_wrapped(
+                    &mut frame,
+                    &mut y,
+                    &format!("  File: {}", saved.path),
+                    width,
+                    height,
+                );
+            }
+            put_setup_wrapped(
+                &mut frame,
+                &mut y,
+                "Press Enter to start Lyra  ·  Esc cancel",
+                width,
+                height,
+            );
+        }
+    }
+    if let Some(error) = &setup.error {
+        y += 1;
+        put_setup_wrapped(&mut frame, &mut y, &format!("! {error}"), width, height);
+    }
+    if height >= 2 {
+        put_wrapped(&mut frame, 0, height - 2, &"─".repeat(width), width);
+        put_wrapped(
+            &mut frame,
+            0,
+            height - 1,
+            &format!("  step {}/{}  ·  Esc cancel", setup.step, setup.total),
+            width,
+        );
+    }
+    frame
+}
+
+fn put_setup_wrapped(frame: &mut Frame, y: &mut usize, text: &str, width: usize, height: usize) {
+    for wrapped in wrap_text(text, width.saturating_sub(2)) {
+        if *y < height.saturating_sub(2) {
+            put_wrapped(frame, 1, *y, &wrapped, width.saturating_sub(1));
+        }
+        *y += 1;
+    }
+}
+
 fn row_line(row: &Row) -> String {
     match &row.kind {
         RowKind::User => format!("you · {}", row.text),
@@ -471,7 +695,10 @@ fn row_line(row: &Row) -> String {
     }
 }
 fn put_wrapped(frame: &mut Frame, x: usize, y: usize, text: &str, width: usize) {
-    for (index, ch) in text.chars().take(width.saturating_sub(x)).enumerate() {
+    for (index, ch) in display_chars(text)
+        .take(width.saturating_sub(x))
+        .enumerate()
+    {
         frame.set(x + index, y, ch);
     }
 }
@@ -479,11 +706,27 @@ fn wrap_text(text: &str, width: usize) -> Vec<String> {
     if width == 0 {
         return vec![String::new()];
     }
-    let chars: Vec<char> = text.chars().collect();
-    chars
-        .chunks(width)
-        .map(|chunk| chunk.iter().collect())
-        .collect()
+    let mut output = Vec::new();
+    for logical_line in text.split('\n') {
+        let chars: Vec<char> = display_chars(logical_line).collect();
+        if chars.is_empty() {
+            output.push(String::new());
+        } else {
+            output.extend(chars.chunks(width).map(|chunk| chunk.iter().collect()));
+        }
+    }
+    output
+}
+fn display_chars(text: &str) -> impl Iterator<Item = char> + '_ {
+    text.chars().map(|ch| {
+        if ch == '\t' {
+            ' '
+        } else if ch.is_control() {
+            '�'
+        } else {
+            ch
+        }
+    })
 }
 fn flywheel_buffer(frame: &Frame) -> Buffer {
     let mut buffer = Buffer::new(frame.width as u16, frame.height as u16);
@@ -583,16 +826,93 @@ mod tests {
     }
 
     #[test]
+    fn empty_session_explains_the_prompt_and_visible_controls() {
+        let state = TuiState::new("proj", "main", "model", "session");
+        let mut renderer = Renderer::new(THEMES[0]);
+        let batch = renderer.render(&state, 90, 12);
+        assert!(batch.frame.line(2).contains("Ready"));
+        assert!(batch.frame.line(3).contains("Describe a coding task"));
+        assert!(batch.frame.line(9).contains("Enter send"));
+        assert!(batch.frame.line(10).contains(">"));
+    }
+
+    #[test]
     fn second_render_diffs_only_changed_cells_and_streaming_uses_fast_path() {
         let mut state = TuiState::new("proj", "main", "model", "session");
         state.push(Row::assistant(1, "hello"));
         state.streaming = true;
         let mut renderer = Renderer::new(THEMES[0]);
         let first = renderer.render(&state, 40, 10);
-        assert!(!first.ansi.is_empty());
+        assert!(first.ansi.starts_with("\x1b[2J\x1b[H\x1b[?25l"));
         let second = renderer.append_stream(&mut state, " world", 40, 10);
         assert!(second.fast_path);
+        assert!(!second.ansi.starts_with("\x1b[2J"));
         assert!(second.frame.line(2).contains("world"));
+        let resized = renderer.render(&state, 41, 10);
+        assert!(resized.ansi.starts_with("\x1b[2J\x1b[H\x1b[?25l"));
+    }
+
+    #[test]
+    fn multiline_rows_never_emit_literal_terminal_control_bytes() {
+        let mut state = TuiState::new("proj", "main", "model", "session");
+        state.push(Row::assistant(1, "first line\nsecond line\x1b[31m"));
+        let mut renderer = Renderer::new(THEMES[0]);
+        let batch = renderer.render(&state, 50, 12);
+        assert!(batch.frame.line(2).contains("first line"));
+        assert!(batch.frame.line(3).contains("second line�[31m"));
+        assert!(!batch.ansi.contains('\n'));
+        assert!(!batch.ansi.contains("\x1b[31m"));
+    }
+
+    #[test]
+    fn setup_screen_renders_visible_selection_and_input_controls() {
+        let mut state = TuiState::new("proj", "setup", "provider required", "first-run");
+        state.setup = Some(SetupScreen {
+            step: 1,
+            total: 5,
+            title: "Choose a provider".into(),
+            detail: "Use arrows, then confirm.".into(),
+            answers: Vec::new(),
+            error: None,
+            saved: None,
+            control: SetupControl::Select {
+                options: vec![
+                    SetupOption {
+                        key: "1".into(),
+                        label: "OpenAI".into(),
+                        detail: "Official API".into(),
+                    },
+                    SetupOption {
+                        key: "2".into(),
+                        label: "Anthropic".into(),
+                        detail: "Official API".into(),
+                    },
+                ],
+                selected: 0,
+            },
+        });
+        let mut renderer = Renderer::new(THEMES[0]);
+        let selection = renderer.render(&state, 90, 24);
+        let selection_text = (0..24)
+            .map(|line| selection.frame.line(line))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(selection_text.contains("step 1/5"));
+        assert!(selection_text.contains("↑/↓ move"));
+        assert!(selection_text.contains("▸ 1  OpenAI"));
+
+        state.setup.as_mut().unwrap().control = SetupControl::Input {
+            value: String::new(),
+            default_value: Some("gpt-5.6".into()),
+            secret: false,
+        };
+        let input = renderer.render(&state, 90, 24);
+        let input_text = (0..24)
+            .map(|line| input.frame.line(line))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(input_text.contains("> [ <default: gpt-5.6> ]"));
+        assert!(input_text.contains("Leave blank to use the default."));
     }
 
     #[test]

@@ -19,8 +19,10 @@ export interface ProviderSetupInput {
   auth: SetupAuth;
 }
 
-export interface SetupPrompt { title: string; detail: string; options?: readonly string[]; defaultValue?: string; secret?: boolean; }
+export interface SetupOption { key: string; label: string; detail: string; }
+export interface SetupPrompt { title: string; detail: string; options?: readonly SetupOption[]; defaultValue?: string; secret?: boolean; }
 type SetupPhase = "provider" | "provider-id" | "base-url" | "api-type" | "model" | "auth" | "credential" | "complete";
+
 
 export class ProviderSetupWizard {
   #phase: SetupPhase = "provider";
@@ -36,15 +38,31 @@ export class ProviderSetupWizard {
   get complete(): boolean { return this.#phase === "complete"; }
   current(): SetupPrompt {
     switch (this.#phase) {
-      case "provider": return { title: "Choose provider", detail: "Select a protocol preset. Advanced compatible endpoints stay fully editable.", options: ["1  OpenAI", "2  Anthropic", "3  OpenAI-compatible", "4  Local / no authentication"] };
-      case "provider-id": return { title: "Provider id", detail: "Lowercase identifier used in model references and config.", defaultValue: this.#kind === "local" ? "local" : "gateway" };
-      case "base-url": return { title: "Base URL", detail: "Include the API prefix expected by the endpoint.", defaultValue: this.#kind === "local" ? "http://localhost:11434/v1" : "https://api.example.com/v1" };
-      case "api-type": return { title: "API protocol", detail: "Choose the wire protocol implemented by the compatible endpoint.", options: ["1  OpenAI chat completions", "2  OpenAI responses"] };
-      case "model": { const defaultValue = this.#kind === "openai" ? "gpt-5.6" : this.#kind === "anthropic" ? "claude-opus-5" : undefined; return { title: "Default model", detail: "Exact model id sent to the provider.", ...(defaultValue === undefined ? {} : { defaultValue }) }; }
-      case "auth": return { title: "Credential source", detail: "Keychain is the secure default. Environment and explicit plaintext config remain supported.", options: ["1  OS keychain", "2  Existing environment variable", "3  Plaintext in providers.toml"] };
-      case "credential": return this.#auth?.type === "env" ? { title: "Environment variable", detail: "Enter the name of an environment variable already present in this process.", defaultValue: `${this.#provider.toUpperCase().replace(/-/g, "_")}_API_KEY` } : { title: "API credential", detail: this.#auth?.type === "static" ? "Stored explicitly in ~/.lyra/providers.toml with mode 0600." : "Stored in the operating system keychain; the TOML file contains only a reference.", secret: true };
-      case "complete": return { title: "Provider ready", detail: `${this.#provider}/${this.#model} will be used as @default. Press Enter to start Lyra.` };
+      case "provider": return { title: "Choose a provider", detail: "Use ↑/↓ or a number to highlight one, then press Enter.", options: [
+        { key: "1", label: "OpenAI", detail: "Official OpenAI API · Responses" },
+        { key: "2", label: "Anthropic", detail: "Official Anthropic API · Messages" },
+        { key: "3", label: "OpenAI-compatible", detail: "Gateway or hosted endpoint" },
+        { key: "4", label: "Local", detail: "Ollama or another local endpoint · no auth" },
+      ] };
+      case "provider-id": return { title: "Provider id", detail: "A short name used in model references and config.", defaultValue: this.#kind === "local" ? "local" : "gateway" };
+      case "base-url": return { title: "Base URL", detail: "The endpoint Lyra sends requests to, including its API path.", defaultValue: this.#kind === "local" ? "http://localhost:11434/v1" : "https://api.example.com/v1" };
+      case "api-type": return { title: "API protocol", detail: "Choose the request format implemented by this endpoint.", options: [
+        { key: "1", label: "OpenAI chat completions", detail: "The widely supported /chat/completions format" },
+        { key: "2", label: "OpenAI responses", detail: "The newer /responses format" },
+      ] };
+      case "model": { const defaultValue = this.#kind === "openai" ? "gpt-5.6" : this.#kind === "anthropic" ? "claude-opus-5" : undefined; return { title: "Default model", detail: "The exact model id Lyra will send to this provider.", ...(defaultValue === undefined ? {} : { defaultValue }) }; }
+      case "auth": return { title: "Credential source", detail: "Choose where Lyra should read the API credential.", options: [
+        { key: "1", label: "OS keychain", detail: "Recommended · token stays outside the config file" },
+        { key: "2", label: "Environment variable", detail: "Reference a variable already exported in this shell" },
+        { key: "3", label: "providers.toml", detail: "Explicit plaintext · file is protected mode 0600" },
+      ] };
+      case "credential": return this.#auth?.type === "env" ? { title: "Environment variable", detail: "Type the name of a variable already set in this shell.", defaultValue: `${this.#provider.toUpperCase().replace(/-/g, "_")}_API_KEY` } : { title: "API credential", detail: this.#auth?.type === "static" ? "Stored in ~/.lyra/providers.toml (mode 0600)." : "Stored in the OS keychain; the config stores only a reference.", secret: true };
+      case "complete": return { title: "Provider ready", detail: `${this.#provider}/${this.#model} is configured as @default.` };
     }
+  }
+  progress(): { current: number; total: number } {
+    const phases = this.#kind === "local" ? ["provider", "provider-id", "base-url", "model", "complete"] : this.#kind === "compatible" ? ["provider", "provider-id", "base-url", "api-type", "model", "auth", "credential", "complete"] : ["provider", "model", "auth", "credential", "complete"];
+    return { current: phases.indexOf(this.#phase) + 1, total: phases.length };
   }
   submit(raw: string): void {
     const value = raw.trim();
