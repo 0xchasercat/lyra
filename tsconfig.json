@@ -8,6 +8,7 @@
     { "path": "./packages/lyra-tools" },
     { "path": "./packages/lyra-lsp" },
     { "path": "./packages/lyra-host" },
-    { "path": "./packages/lyra-runtime" }
+    { "path": "./packages/lyra-runtime" },
+    { "path": "./packages/lyra-git" }
   ]
 }

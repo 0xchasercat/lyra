@@ -28,6 +28,14 @@
         "tree-sitter-typescript": "^0.23.2",
       },
     },
+    "packages/lyra-git": {
+      "name": "@lyra/git",
+      "version": "0.1.0",
+      "dependencies": {
+        "@lyra/core": "workspace:*",
+        "@lyra/host": "workspace:*",
+      },
+    },
     "packages/lyra-host": {
       "name": "@lyra/host",
       "version": "0.1.0",
@@ -77,6 +85,8 @@
     "@lyra/core": ["@lyra/core@workspace:packages/lyra-core"],
 
     "@lyra/edit": ["@lyra/edit@workspace:packages/lyra-edit"],
+
+    "@lyra/git": ["@lyra/git@workspace:packages/lyra-git"],
 
     "@lyra/host": ["@lyra/host@workspace:packages/lyra-host"],
 
