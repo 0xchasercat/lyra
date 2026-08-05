@@ -51,6 +51,14 @@
         "@lyra/tools": "workspace:*",
       },
     },
+    "packages/lyra-mcp": {
+      "name": "@lyra/mcp",
+      "version": "0.1.0",
+      "dependencies": {
+        "@lyra/core": "workspace:*",
+        "@lyra/provider": "workspace:*",
+      },
+    },
     "packages/lyra-provider": {
       "name": "@lyra/provider",
       "version": "0.1.0",
@@ -91,6 +99,8 @@
     "@lyra/host": ["@lyra/host@workspace:packages/lyra-host"],
 
     "@lyra/lsp": ["@lyra/lsp@workspace:packages/lyra-lsp"],
+
+    "@lyra/mcp": ["@lyra/mcp@workspace:packages/lyra-mcp"],
 
     "@lyra/provider": ["@lyra/provider@workspace:packages/lyra-provider"],
 
