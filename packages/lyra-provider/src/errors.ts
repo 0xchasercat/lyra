@@ -85,6 +85,8 @@ const TRANSIENT_CODES = new Set([
   "rate_limit_exceeded",
   "overloaded_error",
   "server_error",
+  "upstream_unavailable",
+  "service_unavailable",
   "connection_reset",
   "stream_stalled",
   "timeout",

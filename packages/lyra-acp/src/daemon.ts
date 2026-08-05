@@ -158,5 +158,19 @@ function isRecord(value: unknown): value is Record<string, unknown> { return val
 function validId(value: unknown): value is JsonRpcId { return typeof value === "string" || typeof value === "number" && Number.isFinite(value); }
 function requestId(value: unknown): JsonRpcId | null { return isRecord(value) && validId(value.id) ? value.id : null; }
 function isAcpMethod(value: string): value is AcpMethod { return (ACP_METHODS as readonly string[]).includes(value); }
-function rpcError(error: unknown, signal: AbortSignal): RpcError { const reason = signal.aborted ? signal.reason : error; if (reason instanceof AcpError) return { code: reason.code, message: reason.message, ...(reason.data === undefined ? {} : { data: reason.data }) }; return { code: -32603, message: reason instanceof Error ? reason.message : String(reason) }; }
+function rpcError(error: unknown, signal: AbortSignal): RpcError {
+  const reason = signal.aborted ? signal.reason : error;
+  if (reason instanceof AcpError) return { code: reason.code, message: reason.message, ...(reason.data === undefined ? {} : { data: reason.data }) };
+  const data = errorData(reason);
+  return { code: -32603, message: reason instanceof Error ? reason.message : String(reason), ...(data === undefined ? {} : { data }) };
+}
+function errorData(error: unknown): Readonly<Record<string, unknown>> | undefined {
+  if (typeof error !== "object" || error === null) return undefined;
+  const value = error as Record<string, unknown>;
+  const data: Record<string, unknown> = {};
+  for (const key of ["name", "classification", "code", "status", "retryAfterMs"] as const) {
+    if (typeof value[key] === "string" || typeof value[key] === "number") data[key] = value[key];
+  }
+  return Object.keys(data).length === 0 ? undefined : data;
+}
 function abortPromise(signal: AbortSignal): Promise<never> { if (signal.aborted) return Promise.reject(signal.reason); return new Promise((_, reject) => signal.addEventListener("abort", () => reject(signal.reason), { once: true })); }

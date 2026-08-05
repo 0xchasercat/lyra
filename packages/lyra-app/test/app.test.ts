@@ -76,6 +76,9 @@ describe("Lyra application composition", () => {
       expect(spawned.isError).not.toBe(true);
       expect(spawned.content.toString()).toContain("assembled");
       expect(seenModels).toContain("fast-model");
+      const scoped = await runtime.app.tools.execute("spawn", { task: "inspect outside the default apply root", blocking: true, workspace: runtime.app.workspace.path, tools: ["read", "glob"] }, { signal: new AbortController().signal, sessionId: "runtime-test", workspace: runtime.app.workspace.path, callId: "spawn-scoped" });
+      expect(scoped.isError).not.toBe(true);
+      expect(scoped.content.toString()).toContain("assembled");
       const childWorkspace = (await runtime.app.workspaces.list()).find((workspace) => workspace.name !== runtime.app.workspace.name && workspace.state === "archived");
       expect(childWorkspace?.task).toBe("child proof");
       const review = await runtime.command("/review") as { error?: string; output?: { path?: string; workspaces?: unknown[] } };

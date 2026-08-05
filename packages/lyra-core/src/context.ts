@@ -77,13 +77,26 @@ export function deriveContext(
 
   return {
     request,
-    repairs,
+    repairs: freshRepairs(entries, repairs),
     tokenEstimate,
     sourceEntryIds: unique([
       ...(active.summary === undefined ? [] : [active.summary.id]),
       ...paired.flatMap((message) => message.sourceEntryIds),
     ]),
   };
+}
+
+function freshRepairs(entries: readonly TranscriptEntry[], repairs: readonly ContextRepair[]): ContextRepair[] {
+  const recorded = new Set<string>();
+  for (const entry of entries) {
+    if (entry.type !== "repair") continue;
+    for (const repair of entry.repairs) recorded.add(repairKey(repair));
+  }
+  return repairs.filter((repair) => !recorded.has(repairKey(repair)));
+}
+
+function repairKey(repair: { code: string; detail: string; entryId?: string }): string {
+  return `${repair.code}\u0000${repair.entryId ?? ""}\u0000${repair.detail}`;
 }
 
 function activeEntries(entries: readonly TranscriptEntry[]): {

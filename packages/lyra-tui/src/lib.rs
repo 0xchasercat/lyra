@@ -679,13 +679,25 @@ fn row_line(row: &Row) -> String {
             added,
             removed,
         } => {
-            if row.expanded && !row.text.is_empty() {
-                format!(
-                    "{name}  {path}  +{added} −{removed}  [Tab/Enter collapse]\n{}",
-                    row.text
-                )
+            let location = if path.is_empty() {
+                String::new()
             } else {
-                format!("{name}  {path}  +{added} −{removed}  [Tab/Enter expand]")
+                format!("  {path}")
+            };
+            let stats = if *added == 0 && *removed == 0 {
+                String::new()
+            } else {
+                format!("  +{added} −{removed}")
+            };
+            let hint = if row.expanded {
+                "[Tab/Enter collapse]"
+            } else {
+                "[Tab/Enter expand]"
+            };
+            if row.expanded && !row.text.is_empty() {
+                format!("{name}{location}{stats}  {hint}\n{}", row.text)
+            } else {
+                format!("{name}{location}{stats}  {hint}")
             }
         }
         RowKind::ToolExpanded => row.text.clone(),
@@ -823,6 +835,24 @@ mod tests {
         let batch = renderer.render(&state, 50, 12);
         assert!(batch.frame.line(2).contains("▸ edit  src/auth.ts  +12 −4"));
         assert!(batch.frame.line(9).contains("◎ hollow-peak"));
+    }
+
+    #[test]
+    fn non_diff_tools_do_not_claim_zero_file_changes() {
+        let mut state = TuiState::new("proj", "main", "model", "session");
+        let mut spawn = Row::tool(1, "spawn", "failed", 0, 0);
+        spawn.text = "Input\n{}".into();
+        spawn.expanded = true;
+        state.push(spawn);
+        let mut renderer = Renderer::new(THEMES[0]);
+        let batch = renderer.render(&state, 80, 12);
+        assert!(
+            batch
+                .frame
+                .line(2)
+                .contains("spawn  failed  [Tab/Enter collapse]")
+        );
+        assert!(!batch.frame.line(2).contains("+0"));
     }
 
     #[test]

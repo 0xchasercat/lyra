@@ -24,13 +24,13 @@ export type BashCompleted = ProcessResult;
 
 export const BASH_DEFINITION: ToolDefinition = Object.freeze({
   name: "bash",
-  description: "Run a shell command in the active workspace and report complete stdout, stderr, exit status, and cancellation details.",
+  description: "Run a shell command from the model-selected working directory and report complete stdout, stderr, exit status, and cancellation details.",
   inputSchema: Object.freeze({
     type: "object",
     additionalProperties: false,
     properties: {
       command: { type: "string", minLength: 1, description: "The exact command to run." },
-      cwd: { type: "string", minLength: 1, description: "Optional workspace-relative working directory." },
+      cwd: { type: "string", minLength: 1, description: "Optional absolute or cwd-relative working directory." },
       timeoutMs: { type: "integer", minimum: 1, maximum: 3_600_000, description: "Optional deadline in milliseconds." },
     },
     required: ["command"],
@@ -46,10 +46,6 @@ function runtime(context: ToolExecutionContext, root?: string): { cwd: string; o
   return { cwd, origin, store };
 }
 
-function contained(path: string, root: string): boolean {
-  const relative = resolve(path).slice(resolve(root).length);
-  return relative === "" || relative.startsWith("/");
-}
 
 
 function parseArgs(args: unknown): BashRequest | string {
@@ -96,8 +92,6 @@ export class BashTool implements LyraTool {
     if (typeof parsed === "string") return errorResult(`Invalid bash arguments: ${parsed}.`);
     const base = runtime(context, this.#options.root);
     const requested = parsed.cwd === undefined ? base.cwd : resolve(base.cwd, parsed.cwd);
-    const root = resolve(this.#options.root ?? base.origin);
-    if (!contained(requested, root)) return errorResult(`Bash cwd escapes the workspace root ${root}; choose a workspace-relative directory.`);
     const cwd = requested;
     const timeoutMs = parsed.timeoutMs ?? this.#options.maxInlineMs;
     this.#options.activity?.({ type: "bash_started", command: parsed.command, cwd });

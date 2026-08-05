@@ -12,6 +12,7 @@ describe("classifyProviderError adversarial inputs", () => {
     ["request timeout", { status: 408, message: "request timeout" }, "transient"],
     ["provider overload", { status: 529, message: "overloaded" }, "transient"],
     ["connection reset", { cause: codedError("socket reset", "ECONNRESET") }, "transient"],
+    ["upstream unavailable", nested("upstream_unavailable", "proxy could not reach upstream", 400), "transient"],
     ["context code", nested("context_length_exceeded", "too many tokens"), "context_overflow"],
     ["context spelling", { message: "maximum context length is too long" }, "context_overflow"],
     ["content shape", nested("orphaned-tool-use", "orphaned call"), "content_shape"],

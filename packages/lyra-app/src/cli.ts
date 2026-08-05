@@ -3,7 +3,7 @@ import { realpathSync } from "node:fs";
 import { access, readFile } from "node:fs/promises";
 import { basename, dirname, join, resolve } from "node:path";
 import { emitKeypressEvents } from "node:readline";
-import type { AcpDaemon } from "@lyra/acp";
+import { AcpDaemon, AcpError } from "@lyra/acp";
 import type { AgentEvent, AgentTurnResult } from "@lyra/core";
 import { supportsOsKeychain } from "@lyra/provider";
 import { needsProviderSetup, ProviderSetupWizard, saveProviderSetup, type SavedProviderSetup } from "./provider-setup.ts";
@@ -186,13 +186,13 @@ class InteractiveUi {
     else if (event.type === "retry") this.#retry = { attempt: event.attempt, max_attempts: event.maxAttempts, reason: event.reason, remaining_ms: event.delayMs };
     else if (event.type === "complete") this.#retry = undefined;
     else if (event.type === "compacted") this.#rows.push({ kind: "boundary", text: `context compacted ${event.tokensBefore} → ${event.tokensAfter}` });
-    else if (event.type === "context_repaired") this.#rows.push({ kind: "notice", text: `context repaired (${event.repairs.length})` });
+    else if (event.type === "context_repaired") { /* Repairs remain inspectable through /context; do not pollute the conversation. */ }
     await this.render();
   }
 
   readonly #onResize = (): void => { void this.render(); };
   readonly #onKeypress = (text: string, key: { name?: string; ctrl?: boolean; meta?: boolean; shift?: boolean }): void => {
-    this.#inputTail = this.#inputTail.then(() => this.handleKey(text, key)).catch((error) => { this.#rows.push({ kind: "notice", text: error instanceof Error ? error.message : String(error) }); return this.render(); });
+    this.#inputTail = this.#inputTail.then(() => this.handleKey(text, key)).catch((error) => { this.#rows.push({ kind: "notice", text: formatUiError(error) }); return this.render(); });
   };
 
   async handleKey(text: string, key: { name?: string; ctrl?: boolean; meta?: boolean; shift?: boolean }): Promise<void> {
@@ -231,7 +231,7 @@ class InteractiveUi {
       if (sequence !== this.#turnSequence) return;
       this.#streaming = false; await this.render();
       const next = this.#queued.shift(); if (next) this.startTurn(next, false);
-    }, async (error) => { if (sequence !== this.#turnSequence) return; this.#streaming = false; this.#rows.push({ kind: "notice", text: error instanceof Error ? error.message : String(error) }); await this.render(); });
+    }, async (error) => { if (sequence !== this.#turnSequence) return; this.#streaming = false; this.#rows.push({ kind: "notice", text: formatUiError(error) }); await this.render(); });
   }
 
   async runSlash(command: string): Promise<void> {
@@ -262,7 +262,7 @@ class InProcessAcpClient {
   static async connect(daemon: AcpDaemon): Promise<InProcessAcpClient> { const client = new InProcessAcpClient(daemon); await client.request("initialize", {}); return client; }
   onNotification(listener: (method: string, params: unknown) => void): () => void { this.#listeners.add(listener); return () => this.#listeners.delete(listener); }
   async request(method: string, params?: unknown): Promise<unknown> { const id = ++this.#sequence; const deferred = Promise.withResolvers<unknown>(); this.#pending.set(id, deferred); await this.#daemon.handleLine(JSON.stringify({ jsonrpc: "2.0", id, method, ...(params === undefined ? {} : { params }) }), { write: (data) => this.receive(data) }); return deferred.promise; }
-  private receive(data: string | Uint8Array): void { const text = typeof data === "string" ? data : new TextDecoder().decode(data); for (const line of text.trim().split("\n").filter(Boolean)) { const message = JSON.parse(line) as { id?: unknown; method?: unknown; params?: unknown; result?: unknown; error?: { message?: unknown } }; if (typeof message.method === "string") { for (const listener of this.#listeners) listener(message.method, message.params); continue; } if (typeof message.id !== "number") continue; const deferred = this.#pending.get(message.id); if (!deferred) continue; this.#pending.delete(message.id); if (message.error) deferred.reject(new Error(typeof message.error.message === "string" ? message.error.message : "ACP request failed.")); else deferred.resolve(message.result); } }
+  private receive(data: string | Uint8Array): void { const text = typeof data === "string" ? data : new TextDecoder().decode(data); for (const line of text.trim().split("\n").filter(Boolean)) { const message = JSON.parse(line) as { id?: unknown; method?: unknown; params?: unknown; result?: unknown; error?: { code?: number; message?: unknown; data?: unknown } }; if (typeof message.method === "string") { for (const listener of this.#listeners) listener(message.method, message.params); continue; } if (typeof message.id !== "number") continue; const deferred = this.#pending.get(message.id); if (!deferred) continue; this.#pending.delete(message.id); if (message.error) deferred.reject(new AcpError(message.error.code ?? -32603, typeof message.error.message === "string" ? message.error.message : "ACP request failed.", message.error.data)); else deferred.resolve(message.result); } }
 }
 
 class TuiBridge {
@@ -290,6 +290,19 @@ function parseArgs(args: string[]): CliOptions { const parsed: CliOptions = { or
 function assistantText(result: AgentTurnResult): string { return result.assistant.content.flatMap((block) => block.type === "text" ? [block.text] : []).join(""); }
 function extractAssistant(result: unknown): string { if (!result || typeof result !== "object" || !("assistant" in result)) return ""; const assistant = (result as { assistant?: { content?: Array<{ type?: string; text?: string }> } }).assistant; return assistant?.content?.flatMap((block) => block.type === "text" && typeof block.text === "string" ? [block.text] : []).join("") ?? ""; }
 function formatOutput(value: unknown): string { return typeof value === "string" ? value : JSON.stringify(value, null, 2); }
+function formatUiError(error: unknown): string {
+  const value = error as { message?: unknown; data?: unknown };
+  const data = value && typeof value.data === "object" && value.data !== null ? value.data as Record<string, unknown> : {};
+  const classification = typeof data.classification === "string" ? data.classification : undefined;
+  const code = typeof data.code === "string" ? data.code : undefined;
+  if (classification) {
+    const label = code ? code.replaceAll("_", " ") : classification.replaceAll("_", " ");
+    const advice = classification === "transient" ? "Retry the turn or switch provider/model." : "Check the provider configuration and retry.";
+    return `Provider error · ${label}. ${advice}`;
+  }
+  const message = typeof value?.message === "string" ? value.message : String(error);
+  return message.replace(/\s*request[_ -]?id\s*:\s*\S+/gi, "").replace(/\s+/g, " ").trim().slice(0, 500);
+}
 async function branchName(origin: string): Promise<string> { try { const head = (await readFile(join(origin, ".git", "HEAD"), "utf8")).trim(); return head.startsWith("ref: refs/heads/") ? head.slice(16) : head.slice(0, 8); } catch { return "no-git"; } }
 async function firstAccessible(paths: readonly string[]): Promise<string | undefined> { for (const path of paths) { try { await access(path); return path; } catch {} } return undefined; }
 function helpText(): string { return `Lyra — autonomous coding agent\n\nUsage: lyra [--origin PATH] [--session NAME] [--model PROVIDER/MODEL] [--prompt TEXT] [--acp] [--yes-auto-git]\n\nFirst interactive launch opens provider setup in the TUI. Credentials may use the OS keychain, an existing environment variable, or explicitly chosen plaintext TOML.\n\nInteractive controls:\n  Enter       send or steer the active turn\n  Ctrl+Enter  queue a follow-up while streaming\n  Escape      cancel the active turn; exit when idle\n  Ctrl+C      cancel the active turn; exit when idle\n\nConfiguration: ~/.lyra/config.toml, ~/.lyra/providers.toml, and <origin>/.lyra/config.toml\n`; }

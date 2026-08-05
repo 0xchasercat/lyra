@@ -52,6 +52,19 @@ describe("ACP stdio daemon", () => {
     await daemon.close();
   });
 
+  test("preserves structured provider diagnostics without exposing raw metadata as the contract", async () => {
+    const writer = new Writer();
+    const fault = Object.assign(new Error("provider request failed; request_id: noisy"), { classification: "transient", code: "upstream_unavailable", status: 400 });
+    const daemon = new AcpDaemon({ handlers: { "session/prompt": async () => { throw fault; } } });
+    await daemon.handleLine(JSON.stringify({ jsonrpc: "2.0", id: 1, method: "session/prompt" }), writer);
+    await settle();
+    expect(writer.messages().find((message) => message.id === 1)?.error).toMatchObject({
+      code: -32603,
+      data: { classification: "transient", code: "upstream_unavailable", status: 400 },
+    });
+    await daemon.close();
+  });
+
   test("rejects oversized frames and caps concurrent state-changing requests", async () => {
     const writer = new Writer();
     const daemon = new AcpDaemon({ handlers: { "session/load": async (_params, context) => { const { promise, reject } = Promise.withResolvers<never>(); context.signal.addEventListener("abort", () => reject(context.signal.reason), { once: true }); return promise; } }, maxFrameBytes: 128, maxConcurrentRequests: 1 });

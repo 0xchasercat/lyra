@@ -41,6 +41,24 @@ describe("deriveContext", () => {
     expect(derived.repairs.every((repair) => repair.tokenEstimate > 0)).toBe(true);
   });
 
+  test("does not emit the same persisted repair on every subsequent turn", () => {
+    const entries = transcript([
+      message("u1", "user", [{ type: "text", text: "one" }]),
+      message("u2", "user", [{ type: "text", text: "two" }]),
+    ]);
+    entries.push({
+      id: "repair-1",
+      parentId: "u2",
+      timestamp: timestamp(3),
+      type: "repair",
+      requestId: "request-1",
+      repairs: [{ code: "adjacent_role_merge", detail: "Merged adjacent user transcript entries u1 and u2", entryId: "u2" }],
+    });
+    const derived = deriveContext(entries, baseOptions);
+    expect(derived.request.messages).toHaveLength(1);
+    expect(derived.repairs).toEqual([]);
+  });
+
   test("drops unsigned Anthropic thinking and exposes the exact loss", () => {
     const entries = transcript([message("a1", "assistant", [
       { type: "thinking", thinking: "unsigned" },

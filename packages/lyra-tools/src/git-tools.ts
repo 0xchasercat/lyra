@@ -1,5 +1,5 @@
 import { realpath } from "node:fs/promises";
-import { isAbsolute, relative, resolve } from "node:path";
+import { resolve } from "node:path";
 import type { ToolDefinition } from "@lyra/provider";
 import type { ToolExecutionContext, ToolExecutionResult } from "@lyra/core";
 import { boundText } from "./filesystem-tools.ts";
@@ -15,13 +15,13 @@ export interface GitToolOptions {
 
 export const GIT_DEFINITION: ToolDefinition = Object.freeze({
   name: "git",
-  description: "Run a validated git subcommand in the active workspace and report repository state, output, and exit status.",
+  description: "Run a validated git subcommand from the model-selected working directory and report repository state, output, and exit status.",
   inputSchema: Object.freeze({
     type: "object",
     additionalProperties: false,
     properties: {
       args: { type: "array", minItems: 1, items: { type: "string" }, description: "Git arguments after the git executable." },
-      cwd: { type: "string", minLength: 1, description: "Optional workspace-relative working directory." },
+      cwd: { type: "string", minLength: 1, description: "Optional absolute or cwd-relative working directory." },
       timeoutMs: { type: "integer", minimum: 1, maximum: 3_600_000, description: "Optional deadline in milliseconds." },
     },
     required: ["args"],
@@ -36,11 +36,7 @@ function runtime(context: ToolExecutionContext, root?: string): { cwd: string; o
   const origin = typeof value.origin === "string" && value.origin.length > 0 ? value.origin : root ?? workspace;
   return { cwd, origin, store: value.artifactStore ?? createArtifactStore(origin) };
 }
-async function contained(path: string, root: string): Promise<string | undefined> {
-  const [child, parent] = await Promise.all([realpath(path), realpath(root)]);
-  const relation = relative(parent, child);
-  return relation === "" || (!relation.startsWith("..") && !isAbsolute(relation)) ? child : undefined;
-}
+async function realCwd(path: string): Promise<string> { return await realpath(path); }
 function parse(args: unknown): { args: string[]; cwd?: string; timeoutMs?: number } | string {
   if (args === null || typeof args !== "object" || Array.isArray(args)) return "arguments must be an object with args";
   const value = args as Record<string, unknown>;
@@ -80,10 +76,9 @@ export class GitTool implements LyraTool {
     if (typeof parsed === "string") return errorResult(`Invalid git arguments: ${parsed}.`);
     const base = runtime(context, this.#options.root);
     const requested = parsed.cwd === undefined ? base.cwd : resolve(base.cwd, parsed.cwd);
-    const root = resolve(this.#options.root ?? base.origin);
-    let cwd: string | undefined;
-    try { cwd = await contained(requested, root); } catch (error) { return errorResult(`Git cwd is unavailable: ${error instanceof Error ? error.message : String(error)}.`); }
-    if (!cwd) return errorResult(`Git cwd escapes the workspace root ${root}; choose a workspace-relative directory.`);
+    let cwd: string;
+    try { cwd = await realCwd(requested); }
+    catch (error) { return errorResult(`Git cwd is unavailable: ${error instanceof Error ? error.message : String(error)}.`); }
     if (parsed.args.some((arg) => arg.includes("\0"))) return errorResult("Git arguments cannot contain NUL bytes.");
     const destructive = isDestructive(parsed.args);
     this.#options.activity?.({ type: "git_started", args: parsed.args, cwd });

@@ -159,7 +159,7 @@ test("cancels queued and running jobs and closes the manager", async () => {
   unblock?.();
 });
 
-test("inherits model and tools from parent context", async () => {
+test("inherits model while allowing each child to choose its own tools", async () => {
   const seen: Array<{ model?: string; tools: readonly string[] }> = [];
   const manager = track(new SpawnManager({
     defaultWorkspace: "/repo",
@@ -172,10 +172,9 @@ test("inherits model and tools from parent context", async () => {
   }));
 
   await manager.spawn({ task: "child", blocking: true }, { depth: 1, model: "@parent", tools: ["read"] });
-  expect(seen).toEqual([{ model: "@parent", tools: ["read"] }]);
-  expect(() => manager.spawn({ task: "widen", tools: ["write"] }, { depth: 1, model: "@parent", tools: ["read"] })).toThrow(/parent/);
-  await manager.spawn({ task: "depth cap", blocking: true }, { depth: 1, model: "@parent", tools: ["read", "spawn"] });
-  expect(seen.at(-1)).toEqual({ model: "@parent", tools: ["read"] });
+  expect(seen).toEqual([{ model: "@parent", tools: ["read", "write"] }]);
+  await manager.spawn({ task: "widen", tools: ["write"], blocking: true }, { depth: 1, model: "@parent", tools: ["read"] });
+  expect(seen.at(-1)).toEqual({ model: "@parent", tools: ["write"] });
 });
 
 function track(manager: SpawnManager): SpawnManager {

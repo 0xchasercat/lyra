@@ -513,23 +513,14 @@ export class SpawnManager {
     }
 
     const model = request.model ?? parent?.model ?? this.defaultModel;
-    const inheritedTools = request.tools ?? parent?.tools ?? this.availableTools ?? [];
-    const tools = depth >= this.maxDepth ? inheritedTools.filter((tool) => tool !== "spawn") : [...inheritedTools];
+    const selectedTools = request.tools ?? this.availableTools ?? [];
+    const tools = depth >= this.maxDepth ? selectedTools.filter((tool) => tool !== "spawn") : [...selectedTools];
     if (this.availableTools !== undefined) {
       const allowed = new Set(this.availableTools);
       for (const tool of tools) {
         if (!allowed.has(tool)) throw new SpawnRequestError(`tool is not available: ${tool}`, { tool });
       }
     }
-    if (parent?.tools !== undefined) {
-      const parentTools = new Set(parent.tools);
-      for (const tool of tools) {
-        if (!parentTools.has(tool)) {
-          throw new SpawnRequestError(`child tool is not allowed by parent: ${tool}`, { tool });
-        }
-      }
-    }
-
     const isolated = request.isolated ?? (request.workspace === undefined && this.createWorkspace !== undefined);
     if (isolated && this.createWorkspace === undefined) throw new SpawnRequestError("isolated spawn requires createWorkspace");
     if (!isolated && request.workspace !== undefined && this.resolveNamedWorkspace === undefined) throw new SpawnRequestError("named workspace spawn requires resolveWorkspace");
@@ -544,6 +535,7 @@ export class SpawnManager {
       isolated,
       workspaceReady: !isolated && request.workspace === undefined,
     };
+
   }
 
   private validateParent(parent: SpawnParentContext): void {

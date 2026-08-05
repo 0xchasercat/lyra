@@ -1,4 +1,4 @@
-import { basename, isAbsolute, join, relative } from "node:path";
+import { basename, isAbsolute, resolve } from "node:path";
 import { AcpDaemon, type AcpHandler, type AcpHandlers } from "@lyra/acp";
 import { IrcBus, SpawnManager, type SpawnExecutor, type SpawnRequest } from "@lyra/core";
 import { GitPipeline } from "@lyra/git";
@@ -120,12 +120,7 @@ function makeSlashServices(sessions: SessionServices, parts: { workspaces: Works
   };
 }
 async function resolveSpawnWorkspace(manager: WorkspaceManager, name: string): Promise<{ name: string; path: string }> {
-  if (isAbsolute(name)) {
-    const applyRoot = join(manager.origin, ".lyra", "apply");
-    const child = relative(applyRoot, name);
-    if (child === "" || child === ".." || child.startsWith(`..${process.platform === "win32" ? "\\" : "/"}`) || isAbsolute(child)) throw new Error("Internal spawn workspace is outside the transactional apply root.");
-    return { name: basename(name), path: name };
-  }
+  if (isAbsolute(name)) return { name: basename(name), path: resolve(name) };
   const existing = await manager.get(name);
   if (!existing || existing.state === "dropped") throw new Error(`Workspace ${name} does not exist.`);
   const resumed = existing.state === "active" ? existing : await manager.resume(name);

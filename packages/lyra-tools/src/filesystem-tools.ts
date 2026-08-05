@@ -1,5 +1,5 @@
 import { mkdir, readFile, readdir, realpath, rename, stat, writeFile } from "node:fs/promises";
-import { dirname, isAbsolute, relative, resolve, sep } from "node:path";
+import { dirname, isAbsolute, resolve } from "node:path";
 import { EditEngine, type EditFileSystem, type EditRequest, type SnapshotTag } from "@lyra/edit";
 import type { ContentBlock, ToolDefinition } from "@lyra/provider";
 import type { ArtifactStore, LyraTool, ToolExecutionResult, ToolRuntimeContext } from "./types.ts";
@@ -34,44 +34,19 @@ function contextValues(context: ToolRuntimeContext | undefined, root?: string): 
   return { cwd, origin };
 }
 
-function contained(child: string, parent: string): boolean {
-  const rel = relative(parent, child);
-  return rel === "" || (rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel));
-}
 
 async function existingRealPath(path: string): Promise<string | undefined> {
   try { return await realpath(path); } catch { return undefined; }
 }
 
-/** Resolve a user path while defending against lexical and symlink escapes. */
+/** Resolve a local path from the model-selected cwd; Lyra runs in unapologetic YOLO mode. */
 export async function resolveToolPath(value: unknown, context?: ToolRuntimeContext, root?: string): Promise<string> {
-  if (typeof value !== "string" || value.trim().length === 0) throw new Error("A non-empty relative path is required.");
+  if (typeof value !== "string" || value.trim().length === 0) throw new Error("A non-empty filesystem path is required.");
   if (value.includes("\u0000")) throw new Error("Path contains a NUL byte; provide a normal filesystem path.");
   if (/^[a-z][a-z\d+.-]*:\/\//i.test(value)) throw new Error("URLs and artifact URIs are not filesystem paths; pass a local path.");
-  const { cwd, origin } = contextValues(context, root);
-  const lexicalOrigin = await existingRealPath(origin) ?? origin;
+  const { cwd } = contextValues(context, root);
   const lexical = isAbsolute(value) ? resolve(value) : resolve(cwd, value);
-  if (!contained(lexical, origin)) {
-    throw new Error(`Path ${JSON.stringify(value)} escapes the allowed origin ${origin}; use a path inside the workspace.`);
-  }
-  const actual = await existingRealPath(lexical);
-  if (actual) {
-    if (!contained(actual, lexicalOrigin)) throw new Error(`Path ${JSON.stringify(value)} resolves through a symlink outside the allowed origin.`);
-    return actual;
-  }
-  // For a new file, verify the nearest existing parent (which catches a symlink
-  // in any existing directory component) and retain the lexical filename.
-  let parent = dirname(lexical);
-  const suffix: string[] = [];
-  while (!(await existingRealPath(parent))) {
-    const next = dirname(parent);
-    if (next === parent) break;
-    suffix.unshift(parent.slice(next.length + 1));
-    parent = next;
-  }
-  const parentReal = await existingRealPath(parent);
-  if (parentReal && !contained(parentReal, lexicalOrigin)) throw new Error(`Path ${JSON.stringify(value)} resolves through a symlink outside the allowed origin.`);
-  return lexical;
+  return await existingRealPath(lexical) ?? lexical;
 }
 
 export class NodeFileSystem implements EditFileSystem {
