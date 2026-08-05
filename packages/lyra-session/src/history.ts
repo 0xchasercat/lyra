@@ -1,5 +1,5 @@
 import { Database } from "bun:sqlite";
-import { mkdirSync } from "node:fs";
+import { chmodSync, closeSync, mkdirSync, openSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import type { EntryId, PromptSearchHit } from "./types.ts";
 
@@ -29,8 +29,10 @@ export class PromptHistory {
       throw new TypeError("Prompt history path must be a non-empty string");
     }
     this.path = inputPath === ":memory:" ? inputPath : resolve(inputPath);
-    if (this.path !== ":memory:") mkdirSync(dirname(this.path), { recursive: true });
-
+    if (this.path !== ":memory:") {
+      const directory = dirname(this.path); mkdirSync(directory, { recursive: true, mode: 0o700 }); chmodSync(directory, 0o700);
+      const fd = openSync(this.path, "a", 0o600); closeSync(fd); chmodSync(this.path, 0o600);
+    }
     this.#database = new Database(this.path, { create: true, strict: true });
     this.#database.exec("PRAGMA journal_mode = WAL");
     this.#database.exec("PRAGMA synchronous = FULL");
@@ -62,6 +64,7 @@ export class PromptHistory {
         INSERT INTO prompts_fts(rowid, prompt) VALUES (new.rowid, new.prompt);
       END;
     `);
+    this.#secureFiles();
   }
 
   static open(path: string): PromptHistory {
@@ -93,6 +96,7 @@ export class PromptHistory {
         "INSERT INTO prompts(session_id, entry_id, prompt, created_at) VALUES (?, ?, ?, ?)",
       )
       .run(entry.sessionId, entry.entryId, entry.prompt, createdAt);
+    this.#secureFiles();
   }
 
   search(query: string, limit = 20): PromptSearchHit[] {
@@ -135,6 +139,7 @@ export class PromptHistory {
       throw new TypeError("Prompt history entry id must be a non-empty string");
     }
     const result = this.#database.query<void, [string]>("DELETE FROM prompts WHERE entry_id = ?").run(entryId);
+    this.#secureFiles();
     return result.changes > 0;
   }
 
@@ -147,6 +152,7 @@ export class PromptHistory {
       .query<{ count: number }, [string]>("SELECT COUNT(*) AS count FROM prompts WHERE session_id = ?")
       .get(sessionId)?.count ?? 0;
     this.#database.query<void, [string]>("DELETE FROM prompts WHERE session_id = ?").run(sessionId);
+    this.#secureFiles();
     return count;
   }
 
@@ -159,6 +165,8 @@ export class PromptHistory {
   [Symbol.dispose](): void {
     this.close();
   }
+
+  #secureFiles(): void { if (this.path === ":memory:") return; for (const path of [this.path, `${this.path}-wal`, `${this.path}-shm`]) { try { chmodSync(path, 0o600); } catch (error) { if (!(error instanceof Error && "code" in error && (error as { code?: unknown }).code === "ENOENT")) throw error; } } }
 
   #assertOpen(): void {
     if (this.#closed) throw new Error("Prompt history is closed");

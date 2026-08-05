@@ -149,6 +149,10 @@ export default {
     auth.invalidate();
     expect((await auth.getToken()).token).toBe("token-2");
   });
+
+  test("rejects plugin identifiers that can traverse directories", () => {
+    expect(() => new PluginAuth("../outside", "/tmp/plugins")).toThrow("plugin id");
+  });
 });
 
 async function temporaryDirectory(): Promise<string> {

@@ -1,5 +1,6 @@
+import { realpath } from "node:fs/promises";
 import { pathToFileURL } from "node:url";
-import { resolve } from "node:path";
+import { isAbsolute, relative, resolve } from "node:path";
 import { homedir } from "node:os";
 import type { AuthSource, AuthToken } from "./auth.ts";
 import { authenticationFault } from "./auth.ts";
@@ -16,8 +17,9 @@ export class PluginAuth implements AuthSource {
   private cached: AuthToken | undefined;
 
   constructor(pluginId: string, pluginDirectory = resolve(homedir(), ".lyra", "plugins")) {
+    if (!/^[a-z][a-z0-9-]{0,63}$/.test(pluginId)) throw authenticationFault(`Auth plugin id ${pluginId} is invalid`);
     this.pluginId = pluginId;
-    this.pluginDirectory = pluginDirectory;
+    this.pluginDirectory = resolve(pluginDirectory);
   }
 
   async getToken(signal?: AbortSignal): Promise<AuthToken> {
@@ -47,7 +49,14 @@ export class PluginAuth implements AuthSource {
 
   private async load(): Promise<AuthPlugin> {
     if (this.plugin !== undefined) return this.plugin;
-    const entry = resolve(this.pluginDirectory, this.pluginId, "index.ts");
+    const requested = resolve(this.pluginDirectory, this.pluginId, "index.ts");
+    let entry: string;
+    try {
+      const [root, candidate] = await Promise.all([realpath(this.pluginDirectory), realpath(requested)]);
+      const contained = relative(root, candidate);
+      if (contained.startsWith("..") || isAbsolute(contained)) throw new Error("entry resolves outside the plugin directory");
+      entry = candidate;
+    } catch (cause) { throw authenticationFault(`Auth plugin ${this.pluginId} is not a contained plugin entry under ${this.pluginDirectory}.`, cause); }
     let module: Record<string, unknown>;
     try {
       // Plugin entrypoints are user-installed and selected by runtime configuration.

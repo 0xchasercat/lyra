@@ -12,6 +12,7 @@
     { "path": "./packages/lyra-git" },
     { "path": "./packages/lyra-mcp" },
     { "path": "./packages/lyra-skills" },
-    { "path": "./packages/lyra-acp" }
+    { "path": "./packages/lyra-acp" },
+    { "path": "./packages/lyra-app" }
   ]
 }

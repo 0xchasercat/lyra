@@ -9,6 +9,7 @@
     { "path": "../lyra-provider" },
     { "path": "../lyra-core" },
     { "path": "../lyra-edit" }
+    ,{ "path": "../lyra-host" }
   ],
   "include": ["src/**/*.ts"]
 }

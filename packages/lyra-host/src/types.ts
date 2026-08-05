@@ -9,6 +9,8 @@ export interface WorkspaceRecord {
   mode: WorkspaceMode;
   /** Present when a workspace had to use the shared-ref worktree fallback. */
   degradedReason?: string;
+  /** Original child task contract, retained for review and merge resolution. */
+  task?: string;
   createdAt: string;
   updatedAt: string;
 }

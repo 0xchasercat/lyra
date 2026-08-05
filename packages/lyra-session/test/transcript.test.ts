@@ -4,10 +4,11 @@ import {
   mkdtempSync,
   readFileSync,
   rmSync,
+  statSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import {
   TranscriptCorruptionError,
   TranscriptStore,
@@ -63,6 +64,8 @@ describe("TranscriptStore", () => {
     const lines = text.trimEnd().split("\n");
     expect(lines).toHaveLength(2);
     expect(lines.every((line) => JSON.parse(line))).toBeTruthy();
+    expect(statSync(path).mode & 0o777).toBe(0o600);
+    expect(statSync(dirname(path)).mode & 0o777).toBe(0o700);
     expect(JSON.parse(lines[0]!)).toMatchObject({ type: "session", id: "root" });
     expect(JSON.parse(lines[1]!)).toMatchObject({
       type: "message",

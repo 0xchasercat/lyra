@@ -367,6 +367,7 @@ interface JobInternal {
   readonly resolveResult: (result: ProcessResult) => void;
   acquireCancel: (() => void) | undefined;
   child: Bun.Subprocess | undefined;
+  cgroupUnit?: string;
   result?: ProcessResult;
   cancelRequested: boolean;
   deadlineRequested: boolean;
@@ -383,6 +384,8 @@ export interface ProcessHostOptions {
   lightLimit?: number;
   acquisitionTimeoutMs?: number;
   defaultTimeoutMs?: number;
+  /** Wrap heavy Linux jobs in a transient systemd user service. */
+  cgroup?: boolean;
 }
 export interface ProcessStatus {
   readonly id: string;
@@ -406,13 +409,25 @@ function readOutput(stream: unknown): Promise<string> {
   return new Response(stream as unknown as BodyInit).text().catch((error: unknown) => `Unable to read process output: ${error instanceof Error ? error.message : String(error)}`);
 }
 
+function processGroupAlive(pgid: number): boolean { try { process.kill(-pgid, 0); return true; } catch (error) { return error instanceof Error && "code" in error && (error as { code?: unknown }).code === "EPERM"; } }
+
 function killProcessTree(child: Bun.Subprocess, signal: "SIGTERM" | "SIGKILL"): void {
-  // detached:true puts bash and its descendants in a private process group on macOS.
-  // Killing both the group and the Bun handle handles shells that have already exited.
   if (typeof child.pid === "number" && child.pid > 1) {
     try { process.kill(-child.pid, signal); } catch { /* the group may have exited */ }
   }
-  try { child.kill(); } catch { /* the child may have exited between checks */ }
+  try { child.kill(signal); } catch { /* the child may have exited between checks */ }
+}
+
+function killCgroupUnit(unit: string, signal: "SIGTERM" | "SIGKILL"): void {
+  try { const child = Bun.spawn(["/usr/bin/env", "systemctl", "--user", "kill", "--kill-whom=all", `--signal=${signal}`, unit], { stdin: "ignore", stdout: "ignore", stderr: "ignore" }); void child.exited; }
+  catch { /* systemd-run will still report the service failure through its own process */ }
+}
+
+async function reapProcessGroup(child: Bun.Subprocess): Promise<void> {
+  if (typeof child.pid !== "number" || child.pid <= 1 || !processGroupAlive(child.pid)) return;
+  killProcessTree(child, "SIGTERM");
+  await Bun.sleep(150);
+  if (processGroupAlive(child.pid)) killProcessTree(child, "SIGKILL");
 }
 
 export class ProcessHost implements HostProcess {
@@ -421,6 +436,8 @@ export class ProcessHost implements HostProcess {
   readonly #jobs = new Map<string, JobInternal>();
   readonly #acquisitionTimeoutMs: number;
   readonly #defaultTimeoutMs: number;
+  readonly #cgroup: boolean;
+  readonly #cgroupCpuQuota: string;
   #sequence = 0;
   #closed = false;
 
@@ -428,7 +445,7 @@ export class ProcessHost implements HostProcess {
     const parallelism = options.nproc ?? options.parallelism ?? defaultParallelism();
     const defaults = classSemaphoreLimits(parallelism);
     const limits = {
-      heavy: options.heavyLimit ?? defaults.heavy,
+      heavy: Math.min(options.heavyLimit ?? defaults.heavy, 8),
       io: options.ioLimit ?? defaults.io,
       light: options.lightLimit ?? defaults.light,
       free: Infinity,
@@ -449,6 +466,8 @@ export class ProcessHost implements HostProcess {
     };
     this.#acquisitionTimeoutMs = acquisitionTimeoutMs;
     this.#defaultTimeoutMs = defaultTimeoutMs;
+    this.#cgroup = options.cgroup === true && process.platform === "linux";
+    this.#cgroupCpuQuota = `${Math.min(limits.heavy, 8) * 100}%`;
   }
 
   get limits(): ClassSemaphoreLimits { return this.#limits; }
@@ -603,7 +622,8 @@ export class ProcessHost implements HostProcess {
     const started = Date.now();
     let child: Bun.Subprocess;
     try {
-      child = Bun.spawn(["/bin/bash", "-lc", job.request.command], {
+      const command = this.#cgroup && job.class === "heavy" ? this.#cgroupCommand(job) : ["/bin/bash", "-lc", job.request.command];
+      child = Bun.spawn(command, {
         cwd: job.request.cwd,
         stdout: "pipe",
         stderr: "pipe",
@@ -624,9 +644,10 @@ export class ProcessHost implements HostProcess {
     let forceTimer: ReturnType<typeof setTimeout> | undefined;
     const terminate = (): void => {
       if (terminationSignal === null) terminationSignal = "SIGTERM";
+      if (job.cgroupUnit) killCgroupUnit(job.cgroupUnit, "SIGTERM");
       killProcessTree(child, "SIGTERM");
       if (forceTimer === undefined) {
-        forceTimer = setTimeout(() => killProcessTree(child, "SIGKILL"), 150);
+        forceTimer = setTimeout(() => { if (job.cgroupUnit) killCgroupUnit(job.cgroupUnit, "SIGKILL"); killProcessTree(child, "SIGKILL"); }, 150);
       }
     };
     const onAbort = (): void => terminate();
@@ -665,8 +686,15 @@ export class ProcessHost implements HostProcess {
     } finally {
       if (forceTimer !== undefined) clearTimeout(forceTimer);
       job.controller.signal.removeEventListener("abort", onAbort);
+      await reapProcessGroup(child);
       job.child = undefined;
     }
+  }
+  #cgroupCommand(job: JobInternal): string[] {
+    const unit = `lyra-${process.pid}-${job.handle.id}`;
+    job.cgroupUnit = unit;
+    const inheritedEnvironment = Object.keys(process.env).filter((name) => /^[A-Za-z_][A-Za-z0-9_]*$/.test(name)).map((name) => `--setenv=${name}`);
+    return ["/usr/bin/env", "systemd-run", "--user", "--pipe", "--wait", "--collect", "--quiet", `--unit=${unit}`, `--working-directory=${job.request.cwd}`, "--service-type=exec", "--property=MemoryMax=4G", `--property=CPUQuota=${this.#cgroupCpuQuota}`, "--property=TasksMax=512", "--property=PrivatePIDs=yes", ...inheritedEnvironment, "/bin/bash", "-lc", job.request.command];
   }
 
   #settle(job: JobInternal, result: ProcessResult): void {

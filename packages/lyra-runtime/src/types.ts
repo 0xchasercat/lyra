@@ -1,11 +1,11 @@
 export interface RuntimeAdapters {
-  spawn(options: unknown): Promise<unknown>;
-  exec(command: string, options?: unknown): Promise<unknown>;
-  tool(name: "read" | "write" | "edit" | "glob" | "grep", args: unknown): Promise<unknown>;
-  irc(operation: "send" | "publish" | "wait", args: unknown): Promise<unknown>;
-  git(operation: "preview" | "apply" | "rollback", args?: unknown): Promise<unknown>;
-  workspace(operation: "create" | "list" | "drop", args?: unknown): Promise<unknown>;
-  report(message: string): void | Promise<void>;
+  spawn(options: unknown, signal: AbortSignal): Promise<unknown>;
+  exec(command: string, options: unknown | undefined, signal: AbortSignal): Promise<unknown>;
+  tool(name: "read" | "write" | "edit" | "glob" | "grep", args: unknown, signal: AbortSignal): Promise<unknown>;
+  irc(operation: "send" | "publish" | "wait", args: unknown, signal: AbortSignal): Promise<unknown>;
+  git(operation: "preview" | "apply" | "rollback", args: unknown | undefined, signal: AbortSignal): Promise<unknown>;
+  workspace(operation: "create" | "list" | "drop", args: unknown | undefined, signal: AbortSignal): Promise<unknown>;
+  report(message: string, signal: AbortSignal): void | Promise<void>;
 }
 
 export interface RuntimeScriptRecord {

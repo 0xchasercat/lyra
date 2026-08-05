@@ -5,7 +5,7 @@ export interface SnapshotRecord { name: string; path: string; createdAt: string;
 export interface GitConflict { files: string[]; workspace: AgentWorkspace; priorTasks: string[]; }
 export interface ApplyResult { ok: boolean; preview: string; snapshot: SnapshotRecord; appliedHead?: string; conflicts?: GitConflict[]; message: string; }
 export interface GitActivity { operation: string; destructive: boolean; detail: string; createdAt: string; }
-export interface ConflictResolver { resolve(args: { repo: string; conflict: GitConflict; allWorkspaces: readonly AgentWorkspace[] }): Promise<boolean>; }
+export interface ConflictResolver { resolve(args: { repo: string; conflict: GitConflict; allWorkspaces: readonly AgentWorkspace[] }, signal?: AbortSignal): Promise<boolean>; }
 export interface GitPipelineOptions {
   origin: string;
   mode?: GitMode;

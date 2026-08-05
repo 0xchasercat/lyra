@@ -1,3 +1,5 @@
+import { createHash } from "node:crypto";
+import { homedir, tmpdir } from "node:os";
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { McpStdioClient, McpError } from "./client.ts";
@@ -37,31 +39,62 @@ export class McpRegistry {
   async client(name: string): Promise<McpStdioClient> { await this.load(); const config = this.#configs[name]; if (!config) throw new McpError("unknown_server", `Unknown MCP server ${name}. Available: ${Object.keys(this.#configs).sort().join(", ") || "none"}.`); const existing = this.#clients.get(name); if (existing) return existing; const created = new McpStdioClient({ ...config, name, ...(this.#timeoutMs === undefined ? {} : { timeoutMs: this.#timeoutMs }) }); this.#clients.set(name, created); return created; }
   async index(): Promise<readonly McpToolSummary[]> { await this.load(); const summaries: McpToolSummary[] = []; for (const server of Object.keys(this.#configs).sort()) { const descriptors = await this.allTools(await this.client(server)); summaries.push(...descriptors.map(({ name, description }) => ({ server, name, description }))); } this.#index = summaries; return this.#index; }
   get cachedIndex(): readonly McpToolSummary[] { return this.#index; }
-  async describe(server: string, tool: string): Promise<McpToolDescriptor> { const descriptors = await this.allTools(await this.client(server)); const found = descriptors.find((candidate) => candidate.name === tool); if (!found) throw new McpError("unknown_tool", `MCP tool ${server}/${tool} is not available.`); return found; }
-  async call(server: string, tool: string, args: unknown): Promise<unknown> { return (await this.client(server)).callTool(tool, args); }
+  async describe(server: string, tool: string, signal?: AbortSignal): Promise<McpToolDescriptor> { const client = await this.client(server); try { const descriptors = await this.allTools(client, signal); const found = descriptors.find((candidate) => candidate.name === tool); if (!found) throw new McpError("unknown_tool", `MCP tool ${server}/${tool} is not available.`); return found; } finally { if (client.closed) this.#clients.delete(server); } }
+  async call(server: string, tool: string, args: unknown, signal?: AbortSignal): Promise<unknown> { const client = await this.client(server); try { return await client.callTool(tool, args, signal); } finally { if (client.closed) { this.#clients.delete(server); } } }
   async close(): Promise<void> { await Promise.all([...this.#clients.values()].map((client) => client.close())); this.#clients.clear(); }
-  private async allTools(client: McpStdioClient): Promise<McpToolDescriptor[]> { const output: McpToolDescriptor[] = []; let cursor: string | undefined; do { const page = await client.listTools(cursor); output.push(...page.tools); cursor = page.nextCursor; } while (cursor); return output; }
+  private async allTools(client: McpStdioClient, signal?: AbortSignal): Promise<McpToolDescriptor[]> { const output: McpToolDescriptor[] = []; const cursors = new Set<string>(); let cursor: string | undefined; for (let pageNumber = 0; pageNumber < 100; pageNumber += 1) { const page = await client.listTools(cursor, signal); output.push(...page.tools); if (output.length > 10_000) throw new McpError("protocol", "MCP tools/list exceeded 10,000 tools."); const next = page.nextCursor; if (!next) return output; if (cursors.has(next)) throw new McpError("protocol", `MCP tools/list repeated cursor ${next}.`); cursors.add(next); cursor = next; } throw new McpError("protocol", "MCP tools/list exceeded 100 pages."); }
   private validate(name: string, config: unknown): asserts config is McpServerConfig { if (!/^[a-z][a-z0-9-]{0,63}$/.test(name)) throw new TypeError(`MCP server name ${name} is invalid.`); if (!config || typeof config !== "object" || typeof (config as { command?: unknown }).command !== "string" || (config as { command: string }).command.trim().length === 0) throw new TypeError(`MCP server ${name} needs a command.`); }
-  private async save(): Promise<void> { await mkdir(join(this.path, ".."), { recursive: true }); const temporary = `${this.path}.${process.pid}.tmp`; await writeFile(temporary, `${JSON.stringify(this.#configs, null, 2)}\n`, { flag: "w", mode: 0o600 }); await rename(temporary, this.path); }
+  private async save(): Promise<void> { await mkdir(join(this.path, ".."), { recursive: true, mode: 0o700 }); const temporary = `${this.path}.${process.pid}.tmp`; await writeFile(temporary, `${JSON.stringify(this.#configs, null, 2)}\n`, { flag: "w", mode: 0o600 }); await rename(temporary, this.path); }
 }
 
 export const MCP_DEFINITION: ToolDefinition = Object.freeze({ name: "mcp", description: "Describe one indexed MCP tool or call it with explicit server, tool, and arguments.", inputSchema: Object.freeze({ type: "object", additionalProperties: false, properties: { op: { type: "string", enum: ["describe", "call"] }, server: { type: "string" }, tool: { type: "string" }, args: {} }, required: ["op", "server", "tool"] }) });
+interface McpArtifactStore { put(content: string | Uint8Array, options?: { mimeType?: string; name?: string }): Promise<string>; }
 export class McpGateway implements McpToolLike {
-  readonly definition = MCP_DEFINITION;
-  constructor(private readonly registry: McpRegistry) {}
-  async execute(input: unknown, _context: ToolExecutionContext): Promise<ToolExecutionResult> { try { if (!input || typeof input !== "object" || Array.isArray(input)) throw new McpError("invalid_request", "mcp requires op, server, and tool."); const value = input as Record<string, unknown>; if (value.op !== "describe" && value.op !== "call") throw new McpError("invalid_request", "mcp op must be describe or call."); if (typeof value.server !== "string" || typeof value.tool !== "string") throw new McpError("invalid_request", "mcp server and tool must be strings."); if (value.op === "describe") return { content: JSON.stringify(await this.registry.describe(value.server, value.tool)) }; const result = await this.registry.call(value.server, value.tool, value.args ?? {}); return { content: JSON.stringify(result), ...(result && typeof result === "object" && (result as { isError?: unknown }).isError === true ? { isError: true } : {}) }; } catch (error) { return { content: `MCP call failed: ${error instanceof Error ? error.message : String(error)} Check server/tool names and use mcp describe first.`, isError: true }; } }
+  readonly definition: ToolDefinition;
+  constructor(private readonly registry: McpRegistry, private readonly artifactStore?: McpArtifactStore) {
+    const index = registry.cachedIndex;
+    const available = index.length === 0 ? "No MCP tools are currently registered." : `Available MCP tools:\n${index.map((tool) => `${tool.server}/${tool.name} — ${tool.description}`).join("\n")}`;
+    this.definition = Object.freeze({ ...MCP_DEFINITION, description: `${MCP_DEFINITION.description} ${available}` });
+  }
+  async execute(input: unknown, context: ToolExecutionContext): Promise<ToolExecutionResult> {
+    try {
+      if (!input || typeof input !== "object" || Array.isArray(input)) throw new McpError("invalid_request", "mcp requires op, server, and tool.");
+      if (!("op" in input) || (input.op !== "describe" && input.op !== "call")) throw new McpError("invalid_request", "mcp op must be describe or call.");
+      if (!("server" in input) || typeof input.server !== "string" || !("tool" in input) || typeof input.tool !== "string") throw new McpError("invalid_request", "mcp server and tool must be strings.");
+      if (input.op === "describe") return { content: await boundedResult(await this.registry.describe(input.server, input.tool, context.signal), context, this.artifactStore) };
+      const args = "args" in input ? input.args : {};
+      const result = await this.registry.call(input.server, input.tool, args, context.signal);
+      return { content: await boundedResult(result, context, this.artifactStore), ...(result && typeof result === "object" && "isError" in result && result.isError === true ? { isError: true } : {}) };
+    } catch (error) { return { content: `MCP call failed: ${error instanceof Error ? error.message : String(error)} Check server/tool names and use mcp describe first.`, isError: true }; }
+  }
 }
 
+async function boundedResult(value: unknown, context: ToolExecutionContext, fallbackStore?: McpArtifactStore): Promise<string> {
+  const serialized = JSON.stringify(value);
+  const limit = 128 * 1024;
+  if (Buffer.byteLength(serialized) <= limit) return serialized;
+  const preview = serialized.slice(0, 16 * 1024);
+  const contextStore = (context as ToolExecutionContext & { artifactStore?: McpArtifactStore }).artifactStore;
+  const store = contextStore ?? fallbackStore;
+  if (!store) throw new McpError("output_too_large", "MCP result exceeded 128 KiB and no durable artifact store is configured.");
+  return `${preview}\n[truncated MCP result; full content: ${await store.put(serialized, { mimeType: "application/json", name: "mcp-result.json" })}]`;
+}
+
+const DRACO_REVISION = "32402e599d043660dccff74b2bf50692da530a0b";
+const DRACO_INSTALL_URL = `https://raw.githubusercontent.com/0xchasercat/draco/${DRACO_REVISION}/install.sh`;
+const DRACO_INSTALL_SHA256 = "a0058f92ff643a2a56346a2f4365f7fd9d01c68e8d3f5ae6e788e22f0b040831";
+const MAX_INSTALLER_BYTES = 64 * 1024;
 export class DracoInstaller {
   readonly origin: string;
   readonly statePath: string;
   readonly installUrl: string;
+  readonly #expectedSha256: string;
   readonly #fetch: typeof globalThis.fetch;
   readonly #run: NonNullable<DracoInstallerOptions["run"]>;
-  constructor(options: DracoInstallerOptions) { if (!options || typeof options.origin !== "string" || options.origin.length === 0) throw new TypeError("Draco installer origin is required."); this.origin = resolve(options.origin); this.statePath = join(resolve(options.home ?? this.origin), ".lyra", "draco.json"); this.installUrl = options.installUrl ?? "https://raw.githubusercontent.com/0xchasercat/draco/main/install.sh"; this.#fetch = options.fetch ?? fetch; this.#run = options.run ?? defaultRun; }
+  constructor(options: DracoInstallerOptions) { if (!options || typeof options.origin !== "string" || options.origin.length === 0) throw new TypeError("Draco installer origin is required."); this.origin = resolve(options.origin); this.statePath = join(resolve(options.home ?? this.origin), ".lyra", "draco.json"); this.installUrl = options.installUrl ?? DRACO_INSTALL_URL; this.#expectedSha256 = options.expectedSha256 ?? (options.installUrl === undefined ? DRACO_INSTALL_SHA256 : ""); if (!/^[a-f0-9]{64}$/.test(this.#expectedSha256)) throw new TypeError("A lowercase SHA-256 is required for a custom Draco installer URL."); this.#fetch = options.fetch ?? fetch; this.#run = options.run ?? defaultRun; }
   async shouldOffer(): Promise<boolean> { try { const value = JSON.parse(await readFile(this.statePath, "utf8")) as { offered?: unknown }; return value.offered !== true; } catch (error) { if (error instanceof Error && "code" in error && (error as { code?: unknown }).code === "ENOENT") return true; throw error; } }
   async recordOffer(choice: "install" | "skip"): Promise<void> { await this.writeState({ offered: true, choice, recordedAt: new Date().toISOString() }); }
-  async install(registry: McpRegistry): Promise<{ scriptPath: string; registered: string }> { await this.recordOffer("install"); const response = await this.#fetch(this.installUrl); if (!response.ok) throw new Error(`Draco installer returned HTTP ${response.status}.`); const script = await response.text(); if (!script.includes("draco") || script.trim().length < 100) throw new Error("Draco installer did not look like the expected script; refusing to execute it."); const directory = join(this.origin, ".lyra", "install"); await mkdir(directory, { recursive: true }); const scriptPath = join(directory, "draco-install.sh"); await writeFile(scriptPath, script, { mode: 0o700 }); const result = await this.#run(scriptPath, { LYRA_INSTALLER: "lyra" }); if (result.exitCode !== 0) throw new Error(`Draco installation failed: ${result.stderr || result.stdout}`); await registry.set("draco", { command: "draco", args: ["mcp"] }); return { scriptPath, registered: "draco" }; }
-  private async writeState(state: unknown): Promise<void> { await mkdir(join(this.statePath, ".."), { recursive: true }); const temporary = `${this.statePath}.${process.pid}.tmp`; await writeFile(temporary, `${JSON.stringify(state)}\n`, { mode: 0o600 }); await rename(temporary, this.statePath); }
+  async install(registry: McpRegistry): Promise<{ scriptPath: string; registered: string }> { await this.recordOffer("install"); const response = await this.#fetch(this.installUrl); if (!response.ok) throw new Error(`Draco installer returned HTTP ${response.status}.`); const bytes = new Uint8Array(await response.arrayBuffer()); if (bytes.byteLength > MAX_INSTALLER_BYTES) throw new Error("Draco installer exceeded the 64 KiB safety limit."); const actual = createHash("sha256").update(bytes).digest("hex"); if (actual !== this.#expectedSha256) throw new Error(`Draco installer SHA-256 mismatch; expected ${this.#expectedSha256}, received ${actual}.`); const script = new TextDecoder().decode(bytes); const directory = join(this.origin, ".lyra", "install"); await mkdir(directory, { recursive: true, mode: 0o700 }); const scriptPath = join(directory, "draco-install.sh"); await writeFile(scriptPath, script, { mode: 0o700 }); const result = await this.#run(scriptPath, { LYRA_INSTALLER: "lyra" }); if (result.exitCode !== 0) throw new Error(`Draco install failed (${result.exitCode}): ${result.stderr.trim() || result.stdout.trim()}`); await registry.set("draco", { command: "draco", args: ["mcp"] }); return { scriptPath, registered: "draco" }; }
+  private async writeState(state: unknown): Promise<void> { await mkdir(join(this.statePath, ".."), { recursive: true, mode: 0o700 }); const temporary = `${this.statePath}.${process.pid}.tmp`; await writeFile(temporary, `${JSON.stringify(state)}\n`, { mode: 0o600 }); await rename(temporary, this.statePath); }
 }
-async function defaultRun(scriptPath: string, env: Readonly<Record<string, string>>): Promise<{ exitCode: number; stdout: string; stderr: string }> { const child = Bun.spawn(["/bin/sh", scriptPath], { env: { ...process.env, ...env }, stdout: "pipe", stderr: "pipe" }); const [stdout, stderr, exitCode] = await Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited]); return { exitCode, stdout, stderr }; }
+async function defaultRun(scriptPath: string, env: Readonly<Record<string, string>>): Promise<{ exitCode: number; stdout: string; stderr: string }> { const child = Bun.spawn(["/bin/sh", scriptPath], { env: { HOME: homedir(), PATH: process.env.PATH ?? "/usr/local/bin:/usr/bin:/bin", SHELL: process.env.SHELL ?? "/bin/sh", TMPDIR: process.env.TMPDIR ?? tmpdir(), ...env }, stdout: "pipe", stderr: "pipe" }); const [stdout, stderr, exitCode] = await Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited]); return { exitCode, stdout, stderr }; }

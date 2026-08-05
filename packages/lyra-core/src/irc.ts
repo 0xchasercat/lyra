@@ -41,6 +41,7 @@ export interface IrcWaitRequest {
   peer?: string;
   channel?: string;
   timeoutMs?: number;
+  signal?: AbortSignal;
 }
 
 export interface IrcBusConstructorOptions extends IrcBusOptions {
@@ -60,7 +61,10 @@ type PendingWait = {
   kind: "peer" | "channel";
   target: string;
   resolve: (messages: IrcMessage[]) => void;
+  reject: (error: unknown) => void;
   timer: ReturnType<typeof setTimeout>;
+  signal?: AbortSignal;
+  onAbort?: () => void;
 };
 export class IrcBus {
   private readonly peers = new Map<string, IrcPeer>();
@@ -285,12 +289,15 @@ export class IrcBus {
     else this.assertChannel(selected.target);
     const existing = selected.kind === "peer" ? this.drainPeer(selected.target) : this.drainChannel(selected.target);
     if (existing.length) return Promise.resolve(existing);
+    if (request.signal?.aborted) return Promise.reject(request.signal.reason);
     const timeout = this.waitDuration(request.timeoutMs);
     if (timeout <= 0 || (selected.kind === "peer" && !this.peers.has(selected.target))) return Promise.resolve([]);
-    return new Promise<IrcMessage[]>((resolve) => {
-      const pending: PendingWait = { ...selected, resolve, timer: setTimeout(() => this.finishWait(pending, []), timeout) };
-      this.waits.add(pending);
-    });
+    const { promise, resolve, reject } = Promise.withResolvers<IrcMessage[]>();
+    const pending: PendingWait = { ...selected, resolve, reject, timer: setTimeout(() => this.finishWait(pending, []), timeout), ...(request.signal === undefined ? {} : { signal: request.signal }) };
+    pending.onAbort = (): void => { if (!this.waits.delete(pending)) return; clearTimeout(pending.timer); pending.signal?.removeEventListener("abort", pending.onAbort!); pending.reject(pending.signal?.reason); };
+    this.waits.add(pending);
+    if (request.signal?.aborted) pending.onAbort(); else request.signal?.addEventListener("abort", pending.onAbort, { once: true });
+    return promise;
   }
 
   waitPeer(peer: string, timeoutMs?: number): Promise<IrcMessage[]> {
@@ -418,6 +425,7 @@ export class IrcBus {
   private finishWait(wait: PendingWait, messages: IrcMessage[]): void {
     if (!this.waits.delete(wait)) return;
     clearTimeout(wait.timer);
+    if (wait.signal && wait.onAbort) wait.signal.removeEventListener("abort", wait.onAbort);
     wait.resolve(messages.map((message) => this.cloneMessage(message)));
   }
 

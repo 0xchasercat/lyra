@@ -1,4 +1,5 @@
-import { resolve } from "node:path";
+import { realpath } from "node:fs/promises";
+import { isAbsolute, relative, resolve } from "node:path";
 import type { ToolDefinition } from "@lyra/provider";
 import type { ToolExecutionContext, ToolExecutionResult } from "@lyra/core";
 import { boundText } from "./filesystem-tools.ts";
@@ -35,10 +36,10 @@ function runtime(context: ToolExecutionContext, root?: string): { cwd: string; o
   const origin = typeof value.origin === "string" && value.origin.length > 0 ? value.origin : root ?? workspace;
   return { cwd, origin, store: value.artifactStore ?? createArtifactStore(origin) };
 }
-function contained(path: string, root: string): boolean {
-  const child = resolve(path);
-  const parent = resolve(root);
-  return child === parent || child.startsWith(`${parent}/`);
+async function contained(path: string, root: string): Promise<string | undefined> {
+  const [child, parent] = await Promise.all([realpath(path), realpath(root)]);
+  const relation = relative(parent, child);
+  return relation === "" || (!relation.startsWith("..") && !isAbsolute(relation)) ? child : undefined;
 }
 function parse(args: unknown): { args: string[]; cwd?: string; timeoutMs?: number } | string {
   if (args === null || typeof args !== "object" || Array.isArray(args)) return "arguments must be an object with args";
@@ -78,9 +79,11 @@ export class GitTool implements LyraTool {
     const parsed = parse(input);
     if (typeof parsed === "string") return errorResult(`Invalid git arguments: ${parsed}.`);
     const base = runtime(context, this.#options.root);
-    const cwd = parsed.cwd === undefined ? base.cwd : resolve(base.cwd, parsed.cwd);
+    const requested = parsed.cwd === undefined ? base.cwd : resolve(base.cwd, parsed.cwd);
     const root = resolve(this.#options.root ?? base.origin);
-    if (!contained(cwd, root)) return errorResult(`Git cwd escapes the workspace root ${root}; choose a workspace-relative directory.`);
+    let cwd: string | undefined;
+    try { cwd = await contained(requested, root); } catch (error) { return errorResult(`Git cwd is unavailable: ${error instanceof Error ? error.message : String(error)}.`); }
+    if (!cwd) return errorResult(`Git cwd escapes the workspace root ${root}; choose a workspace-relative directory.`);
     if (parsed.args.some((arg) => arg.includes("\0"))) return errorResult("Git arguments cannot contain NUL bytes.");
     const destructive = isDestructive(parsed.args);
     this.#options.activity?.({ type: "git_started", args: parsed.args, cwd });

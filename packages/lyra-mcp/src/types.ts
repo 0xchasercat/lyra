@@ -8,4 +8,4 @@ export interface McpCallResult { content: unknown; isError?: boolean; structured
 export interface McpClientOptions extends McpServerConfig { name: string; timeoutMs?: number; onLog?: (line: string) => void; }
 export interface McpGatewayOptions { servers: Readonly<Record<string, McpServerConfig>>; timeoutMs?: number; }
 export interface McpToolLike { readonly definition: ToolDefinition; execute(args: unknown, context: ToolExecutionContext): Promise<ToolExecutionResult>; }
-export interface DracoInstallerOptions { origin: string; home?: string; fetch?: typeof globalThis.fetch; run?: (scriptPath: string, env: Readonly<Record<string, string>>) => Promise<{ exitCode: number; stdout: string; stderr: string }>; installUrl?: string; }
+export interface DracoInstallerOptions { origin: string; home?: string; fetch?: typeof globalThis.fetch; run?: (scriptPath: string, env: Readonly<Record<string, string>>) => Promise<{ exitCode: number; stdout: string; stderr: string }>; installUrl?: string; expectedSha256?: string; }

@@ -27,6 +27,9 @@ describe("classed process execution", () => {
     expect(classifyCommand("grep needle one-file.txt")).toBe("light");
     expect(classifyCommand("echo 'cargo build'")).toBe("free");
     expect(classifyCommand("printf 'ok'")).toBe("free");
+    const capped = new ProcessHost({ heavyLimit: 99 });
+    hosts.push(capped);
+    expect(capped.limits.heavy).toBe(8);
   });
 
   test("enforces class limits and expires queued tickets", async () => {
@@ -104,6 +107,18 @@ describe("classed process execution", () => {
     expect((await host.wait(second.id))?.signal).toBe("SIGTERM");
     expect(host.status(first.id)?.status).toBe("cancelled");
     await expect(host.run({ command: "printf no", cwd: root })).rejects.toThrow("closed");
+  });
+
+  test("reaps redirected background descendants when their shell exits", async () => {
+    const root = await mkdtemp(join(tmpdir(), "lyra-host-process-"));
+    roots.push(root);
+    const host = new ProcessHost({ nproc: 1 });
+    hosts.push(host);
+    const handle = await host.run({ command: "/bin/sleep 30 >/dev/null 2>&1 & echo $!", cwd: root });
+    const result = "id" in handle ? await host.wait(handle.id) : handle;
+    const pid = Number(result?.stdout.trim());
+    expect(Number.isSafeInteger(pid)).toBe(true);
+    expect(() => process.kill(pid, 0)).toThrow();
   });
 
   test("rejects malformed requests promptly", async () => {

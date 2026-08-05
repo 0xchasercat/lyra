@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { PromptHistory } from "../src/index.ts";
 
 const temporaryDirectories: string[] = [];
@@ -38,6 +38,8 @@ describe("PromptHistory", () => {
     history.add("session-c", "entry-c", "write the release notes", createdAt);
 
     expect(existsSync(path)).toBe(true);
+    expect(statSync(path).mode & 0o777).toBe(0o600);
+    expect(statSync(dirname(path)).mode & 0o777).toBe(0o700);
     expect(history.search("compiler error").map((hit) => hit.entryId)).toEqual([
       "entry-a",
       "entry-b",

@@ -1,5 +1,5 @@
 import { expect, test, describe, beforeEach, afterEach } from "bun:test";
-import { lstat, mkdtemp, realpath, rm, symlink, writeFile } from "node:fs/promises";
+import { lstat, mkdtemp, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { WorkspaceError, WorkspaceManager, type GitResult } from "../src/workspaces.ts";
@@ -50,6 +50,21 @@ describe("WorkspaceManager", () => {
     const second = await restarted.create();
     expect(second.name).toBe("amber-beacon");
     expect((await restarted.list()).map((record) => record.name)).toEqual(["amber-arch", "amber-beacon"]);
+  });
+
+  test("mirrors tracked edits, deletions, and untracked files from the live origin", async () => {
+    await writeFile(join(origin, "delete-me.txt"), "tracked\n");
+    expect((await git(["-C", origin, "add", "delete-me.txt"], origin)).exitCode).toBe(0);
+    expect((await git(["-C", origin, "commit", "-qm", "add delete fixture"], origin)).exitCode).toBe(0);
+    await rm(join(origin, "delete-me.txt"));
+    await writeFile(join(origin, "README"), "dirty tracked\n");
+    await writeFile(join(origin, "untracked.txt"), "untracked\n");
+    const manager = await WorkspaceManager.open(origin);
+    const workspace = await manager.create("dirty-copy");
+    expect(await readFile(join(workspace.path, "README"), "utf8")).toBe("dirty tracked\n");
+    expect(await readFile(join(workspace.path, "untracked.txt"), "utf8")).toBe("untracked\n");
+    expect(await lstat(join(workspace.path, "delete-me.txt")).catch(() => undefined)).toBeUndefined();
+    expect((await lstat(join(workspace.path, ".git"))).isDirectory()).toBe(true);
   });
 
   test("recovers lifecycle metadata across restart", async () => {

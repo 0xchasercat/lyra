@@ -1,10 +1,10 @@
+import { createHash } from "node:crypto";
 import { describe, expect, test } from "bun:test";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { McpGateway, McpRegistry, McpStdioClient, DracoInstaller } from "../src/index.ts";
-
-const SERVER = `let buffer = ""; for await (const chunk of Bun.stdin.stream()) { buffer += new TextDecoder().decode(chunk); let index = buffer.indexOf("\\n"); while (index >= 0) { const line = buffer.slice(0, index); buffer = buffer.slice(index + 1); const message = JSON.parse(line); if (message.id === undefined) { index = buffer.indexOf("\\n"); continue; } let result; if (message.method === "initialize") result = { protocolVersion: "2025-11-25", capabilities: { tools: {} }, serverInfo: { name: "fake", version: "1" } }; else if (message.method === "tools/list") result = { tools: [{ name: "echo", description: "Echo values", inputSchema: { type: "object" } }] }; else if (message.method === "tools/call") result = { content: [{ type: "text", text: JSON.stringify(message.params.arguments) }] }; else if (message.method === "slow") { index = buffer.indexOf("\\n"); continue; } else result = {}; process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: message.id, result }) + "\\n"); index = buffer.indexOf("\\n"); } }`;
+const SERVER = `let buffer = ""; for await (const chunk of Bun.stdin.stream()) { buffer += new TextDecoder().decode(chunk); let index = buffer.indexOf("\\n"); while (index >= 0) { const line = buffer.slice(0, index); buffer = buffer.slice(index + 1); const message = JSON.parse(line); if (message.id === undefined) { index = buffer.indexOf("\\n"); continue; } let result; if (message.method === "initialize") result = { protocolVersion: "2025-11-25", capabilities: { tools: {} }, serverInfo: { name: "fake", version: "1" } }; else if (message.method === "tools/list") result = { tools: [{ name: "echo", description: "Echo values", inputSchema: { type: "object" } }] }; else if (message.method === "tools/call") result = { content: [{ type: "text", text: message.params.arguments.large ? "x".repeat(200000) : JSON.stringify(message.params.arguments) }] }; else if (message.method === "slow") { index = buffer.indexOf("\\n"); continue; } else result = {}; process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: message.id, result }) + "\\n"); index = buffer.indexOf("\\n"); } }`;
 
 function context() { return { signal: new AbortController().signal, sessionId: "mcp", workspace: ".", callId: "mcp-call" }; }
 
@@ -28,12 +28,16 @@ describe("MCP client and Draco installer", () => {
     await writeFile(script, SERVER);
     const registry = new McpRegistry(root, { timeoutMs: 500 });
     await registry.set("fake", { command: process.execPath, args: [script], cwd: root });
-    const gateway = new McpGateway(registry);
+    let artifact = "";
+    const gateway = new McpGateway(registry, { put: async (content) => { artifact = content.toString(); return "artifact://durable"; } });
     try {
       const described = await gateway.execute({ op: "describe", server: "fake", tool: "echo" }, context());
       expect(described.isError).not.toBe(true);
       const called = await gateway.execute({ op: "call", server: "fake", tool: "echo", args: { value: 3 } }, context());
       expect(called.content.toString()).toContain("value");
+      const large = await gateway.execute({ op: "call", server: "fake", tool: "echo", args: { large: true } }, context());
+      expect(large.content.toString()).toContain("artifact://durable");
+      expect(artifact.length).toBeGreaterThan(128 * 1024);
       const client = await registry.client("fake");
       await expect(client.request("slow")).rejects.toMatchObject({ code: "timeout" });
       await expect(gateway.execute({ op: "describe", server: "fake", tool: "missing" }, context())).resolves.toMatchObject({ isError: true });
@@ -43,7 +47,8 @@ describe("MCP client and Draco installer", () => {
   test("Draco offers once, validates fetched installer, runs it, and registers draco mcp", async () => {
     const root = await mkdtemp(join(tmpdir(), "lyra-draco-"));
     const registry = new McpRegistry(root);
-    const installer = new DracoInstaller({ origin: root, fetch: async () => new Response("#!/bin/sh\n# draco installer\n" + "echo draco\\n".repeat(30)), run: async () => ({ exitCode: 0, stdout: "installed", stderr: "" }) });
+    const script = "#!/bin/sh\n# draco installer\n" + "echo draco\n".repeat(30);
+    const installer = new DracoInstaller({ origin: root, installUrl: "https://installer.invalid/draco.sh", expectedSha256: createHash("sha256").update(script).digest("hex"), fetch: async () => new Response(script), run: async () => ({ exitCode: 0, stdout: "installed", stderr: "" }) });
     try {
       expect(await installer.shouldOffer()).toBe(true);
       const result = await installer.install(registry);

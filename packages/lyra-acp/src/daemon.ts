@@ -1,6 +1,8 @@
 import { ACP_METHODS, type AcpCapabilities, type AcpDaemonOptions, type AcpHandlerContext, type AcpMethod, type AcpWriter, type JsonRpcId } from "./types.ts";
 
 const DEFAULT_TIMEOUT_MS = 60_000;
+const DEFAULT_MAX_FRAME_BYTES = 4 * 1024 * 1024;
+const DEFAULT_MAX_CONCURRENT = 32;
 interface PendingClient { resolve(value: unknown): void; reject(error: unknown): void; timer: ReturnType<typeof setTimeout>; }
 interface RpcError { code: number; message: string; data?: unknown; }
 
@@ -8,19 +10,25 @@ export class AcpError extends Error { readonly code: number; readonly data: unkn
 
 export class AcpDaemon {
   readonly capabilities: AcpCapabilities = Object.freeze({ methods: ACP_METHODS, bidirectional: true, cancellation: true, transport: "stdio" });
-  readonly #options: Required<Pick<AcpDaemonOptions, "requestTimeoutMs" | "serverName" | "serverVersion">> & AcpDaemonOptions;
+  readonly #options: Required<Pick<AcpDaemonOptions, "requestTimeoutMs" | "maxFrameBytes" | "maxConcurrentRequests" | "serverName" | "serverVersion">> & AcpDaemonOptions;
   readonly #active = new Map<JsonRpcId, AbortController>();
+  readonly #operations = new Set<Promise<void>>();
   readonly #clientPending = new Map<JsonRpcId, PendingClient>();
   #writer: AcpWriter | undefined;
   #writeTail: Promise<void> = Promise.resolve();
   #clientSequence = 0;
+  #notificationSequence = 0;
   #closed = false;
 
   constructor(options: AcpDaemonOptions) {
     if (!options || typeof options !== "object" || !options.handlers || typeof options.handlers !== "object") throw new TypeError("ACP handlers are required.");
     const timeout = options.requestTimeoutMs ?? DEFAULT_TIMEOUT_MS;
+    const maxFrameBytes = options.maxFrameBytes ?? DEFAULT_MAX_FRAME_BYTES;
+    const maxConcurrentRequests = options.maxConcurrentRequests ?? DEFAULT_MAX_CONCURRENT;
     if (!Number.isSafeInteger(timeout) || timeout < 1) throw new RangeError("ACP requestTimeoutMs must be a positive integer.");
-    this.#options = { requestTimeoutMs: timeout, serverName: options.serverName ?? "lyra", serverVersion: options.serverVersion ?? "0.1.0", ...options };
+    if (!Number.isSafeInteger(maxFrameBytes) || maxFrameBytes < 1) throw new RangeError("ACP maxFrameBytes must be a positive integer.");
+    if (!Number.isSafeInteger(maxConcurrentRequests) || maxConcurrentRequests < 1) throw new RangeError("ACP maxConcurrentRequests must be a positive integer.");
+    this.#options = { requestTimeoutMs: timeout, maxFrameBytes, maxConcurrentRequests, serverName: options.serverName ?? "lyra", serverVersion: options.serverVersion ?? "0.1.0", ...options };
   }
 
   async serve(input: AsyncIterable<Uint8Array | string>, writer: AcpWriter): Promise<void> {
@@ -33,11 +41,14 @@ export class AcpDaemon {
         buffer += typeof chunk === "string" ? chunk : new TextDecoder().decode(chunk);
         let newline = buffer.indexOf("\n");
         while (newline >= 0) {
-          const line = buffer.slice(0, newline).trim();
+          const rawLine = buffer.slice(0, newline);
+          if (Buffer.byteLength(rawLine) > this.#options.maxFrameBytes) { await this.writeError(null, { code: -32003, message: `ACP frame exceeds ${this.#options.maxFrameBytes} bytes.` }); return; }
+          const line = rawLine.trim();
           buffer = buffer.slice(newline + 1);
           if (line.length > 0) await this.handleLine(line);
           newline = buffer.indexOf("\n");
         }
+        if (Buffer.byteLength(buffer) > this.#options.maxFrameBytes) { await this.writeError(null, { code: -32003, message: `ACP frame exceeds ${this.#options.maxFrameBytes} bytes.` }); return; }
       }
       if (buffer.trim().length > 0) await this.handleLine(buffer.trim());
     } finally { await this.close(); }
@@ -45,6 +56,7 @@ export class AcpDaemon {
 
   async handleLine(line: string, writer?: AcpWriter): Promise<void> {
     if (writer) this.#writer = writer;
+    if (Buffer.byteLength(line) > this.#options.maxFrameBytes) { await this.writeError(null, { code: -32003, message: `ACP frame exceeds ${this.#options.maxFrameBytes} bytes.` }); return; }
     let message: unknown;
     try { message = JSON.parse(line); }
     catch { await this.writeError(null, { code: -32700, message: "Parse error: each ACP stdio line must be one JSON-RPC object." }); return; }
@@ -70,9 +82,10 @@ export class AcpDaemon {
     if (this.#closed) return;
     this.#closed = true;
     for (const controller of this.#active.values()) controller.abort(new AcpError(-32800, "ACP connection closed."));
-    this.#active.clear();
     for (const pending of this.#clientPending.values()) { clearTimeout(pending.timer); pending.reject(new AcpError(-32000, "ACP connection closed.")); }
     this.#clientPending.clear();
+    await Promise.allSettled([...this.#operations]);
+    this.#active.clear();
     await this.#writeTail.catch(() => undefined);
   }
 
@@ -82,25 +95,35 @@ export class AcpDaemon {
     if (value.method === "$/cancelRequest") { this.cancelFrom(value.params); return; }
     const id = validId(value.id) ? value.id : undefined;
     if (value.id !== undefined && id === undefined) { await this.writeError(null, { code: -32600, message: "JSON-RPC id must be a string or number." }); return; }
-    if (id === undefined) { void this.dispatchNotification(value.method, value.params); return; }
-    void this.dispatchRequest(id, value.method, value.params);
+    if (id === undefined) { this.launch(this.dispatchNotification(value.method, value.params)); return; }
+    this.launch(this.dispatchRequest(id, value.method, value.params));
   }
 
   private async dispatchRequest(id: JsonRpcId, method: string, params: unknown): Promise<void> {
     if (this.#active.has(id)) { await this.writeError(id, { code: -32600, message: `Duplicate in-flight request id ${String(id)}.` }); return; }
+    if (this.#active.size >= this.#options.maxConcurrentRequests) { await this.writeError(id, { code: -32002, message: `ACP concurrency limit ${this.#options.maxConcurrentRequests} reached.` }); return; }
     const controller = new AbortController();
     this.#active.set(id, controller);
     const timeout = setTimeout(() => controller.abort(new AcpError(-32001, `ACP request ${method} exceeded ${this.#options.requestTimeoutMs}ms.`)), this.#options.requestTimeoutMs);
+    const invocation = Promise.resolve(this.invoke(method, params, id, controller.signal));
     try {
-      const result = await Promise.race([this.invoke(method, params, id, controller.signal), abortPromise(controller.signal)]);
+      const result = await Promise.race([invocation, abortPromise(controller.signal)]);
       await this.write({ jsonrpc: "2.0", id, result: result ?? null });
     } catch (error) { await this.writeError(id, rpcError(error, controller.signal)); }
-    finally { clearTimeout(timeout); this.#active.delete(id); }
+    finally { clearTimeout(timeout); await invocation.catch(() => undefined); this.#active.delete(id); }
   }
 
   private async dispatchNotification(method: string, params: unknown): Promise<void> {
-    try { await this.invoke(method, params, `notification-${Date.now()}`, new AbortController().signal); } catch { /* notifications have no response channel */ }
+    if (this.#active.size >= this.#options.maxConcurrentRequests) return;
+    const id = `notification-${++this.#notificationSequence}`;
+    const controller = new AbortController(); this.#active.set(id, controller);
+    const timeout = setTimeout(() => controller.abort(new AcpError(-32001, `ACP notification ${method} exceeded ${this.#options.requestTimeoutMs}ms.`)), this.#options.requestTimeoutMs);
+    const invocation = Promise.resolve(this.invoke(method, params, id, controller.signal));
+    try { await Promise.race([invocation, abortPromise(controller.signal)]); } catch { /* notifications have no response channel */ }
+    finally { clearTimeout(timeout); await invocation.catch(() => undefined); this.#active.delete(id); }
   }
+
+  private launch(operation: Promise<void>): void { this.#operations.add(operation); void operation.then(() => this.#operations.delete(operation), () => this.#operations.delete(operation)); }
 
   private async invoke(method: string, params: unknown, id: JsonRpcId, signal: AbortSignal): Promise<unknown> {
     if (method === "initialize") return { protocolVersion: "1", serverInfo: { name: this.#options.serverName, version: this.#options.serverVersion }, capabilities: this.capabilities };

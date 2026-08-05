@@ -1,4 +1,6 @@
+import { constants } from "node:fs";
 import {
+  cp,
   lstat,
   mkdir,
   readdir,
@@ -36,7 +38,7 @@ export interface GitResult {
   stderr: string;
 }
 
-export type GitRunner = (args: readonly string[], cwd: string) => Promise<GitResult>;
+export type GitRunner = (args: readonly string[], cwd: string, signal?: AbortSignal) => Promise<GitResult>;
 
 export interface WorkspaceManagerOptions {
   /** The repository root to isolate. `origin` is accepted as an alias. */
@@ -52,6 +54,7 @@ export interface WorkspaceManagerOptions {
 
 export interface WorkspaceCreateOptions {
   name?: string;
+  task?: string;
   /** Test and operator escape hatch; the default always tries an independent clone first. */
   mode?: WorkspaceMode;
 }
@@ -90,21 +93,19 @@ function normalizeInput(value: WorkspaceManagerOptions | string): WorkspaceManag
   return typeof value === "string" ? { origin: value } : value;
 }
 
-async function defaultGit(args: readonly string[], cwd: string): Promise<GitResult> {
+async function defaultGit(args: readonly string[], cwd: string, signal?: AbortSignal): Promise<GitResult> {
+  if (signal?.aborted) throw signal.reason;
   try {
-    const child = Bun.spawn(["git", ...args], {
-      cwd,
-      stdout: "pipe",
-      stderr: "pipe",
-      env: { ...process.env, GIT_TERMINAL_PROMPT: "0" },
-    });
-    const [stdout, stderr, exitCode] = await Promise.all([
-      child.stdout ? new Response(child.stdout).text() : Promise.resolve(""),
-      child.stderr ? new Response(child.stderr).text() : Promise.resolve(""),
-      child.exited,
-    ]);
-    return { stdout, stderr, exitCode };
+    const child = Bun.spawn(["git", ...args], { cwd, stdout: "pipe", stderr: "pipe", env: { ...process.env, GIT_TERMINAL_PROMPT: "0" }, detached: true });
+    const abort = (): void => { if (typeof child.pid === "number" && child.pid > 1) { try { process.kill(-child.pid, "SIGTERM"); } catch {} } try { child.kill("SIGTERM"); } catch {} };
+    signal?.addEventListener("abort", abort, { once: true });
+    try {
+      const [stdout, stderr, exitCode] = await Promise.all([child.stdout ? new Response(child.stdout).text() : Promise.resolve(""), child.stderr ? new Response(child.stderr).text() : Promise.resolve(""), child.exited]);
+      if (signal?.aborted) throw signal.reason;
+      return { stdout, stderr, exitCode };
+    } finally { signal?.removeEventListener("abort", abort); }
   } catch (error) {
+    if (signal?.aborted) throw signal.reason;
     return { stdout: "", stderr: errorMessage(error), exitCode: 127 };
   }
 }
@@ -332,15 +333,17 @@ export class WorkspaceManager {
     }
   }
 
-  private async runGit(args: readonly string[], cwd: string): Promise<GitResult> {
+  private async runGit(args: readonly string[], cwd: string, signal?: AbortSignal): Promise<GitResult> {
     try {
-      const result = await this.git(args, cwd);
+      if (signal?.aborted) throw signal.reason;
+      const result = await this.git(args, cwd, signal);
       return {
         exitCode: Number.isFinite(result.exitCode) ? result.exitCode : 1,
         stdout: result.stdout ?? "",
         stderr: result.stderr ?? "",
       };
     } catch (error) {
+      if (signal?.aborted) throw signal.reason;
       return { exitCode: 127, stdout: "", stderr: errorMessage(error) };
     }
   }
@@ -391,7 +394,7 @@ export class WorkspaceManager {
     }
   }
 
-  private async removeWorkspace(record: WorkspaceRecord): Promise<void> {
+  private async removeWorkspace(record: WorkspaceRecord, signal?: AbortSignal): Promise<void> {
     const path = record.path;
     let exists = true;
     try {
@@ -406,7 +409,7 @@ export class WorkspaceManager {
     if (!exists) return;
 
     if (record.mode === "worktree") {
-      const result = await this.runGit(["worktree", "remove", "--force", path], this.originRoot);
+      const result = await this.runGit(["worktree", "remove", "--force", path], this.originRoot, signal);
       if (result.exitCode !== 0) {
         throw new WorkspaceError(
           "WORKTREE_REMOVE_FAILED",
@@ -487,6 +490,7 @@ export class WorkspaceManager {
     if (resolve(candidate.path) !== expectedPath) throw new Error("metadata path is not the persistent workspace path");
     if (candidate.origin !== this.originRoot) throw new Error("metadata origin does not match this repository");
     if (candidate.degradedReason !== undefined && typeof candidate.degradedReason !== "string") throw new Error("degradedReason must be text");
+    if (candidate.task !== undefined && (typeof candidate.task !== "string" || candidate.task.length === 0)) throw new Error("task must be non-empty text");
     const record: WorkspaceRecord = {
       name,
       path: expectedPath,
@@ -494,6 +498,7 @@ export class WorkspaceManager {
       state: candidate.state,
       mode: candidate.mode,
       ...(candidate.degradedReason ? { degradedReason: candidate.degradedReason } : {}),
+      ...(candidate.task ? { task: candidate.task } : {}),
       createdAt: candidate.createdAt,
       updatedAt: candidate.updatedAt,
     };
@@ -517,9 +522,12 @@ export class WorkspaceManager {
     return record;
   }
 
-  async create(input: WorkspaceCreateOptions | string = {}): Promise<WorkspaceRecord> {
+  async create(input: WorkspaceCreateOptions | string = {}, signal?: AbortSignal): Promise<WorkspaceRecord> {
     const requested: WorkspaceCreateOptions = typeof input === "string" ? { name: input } : input;
+    if (requested.task !== undefined && (typeof requested.task !== "string" || requested.task.length === 0)) throw new WorkspaceError("INVALID_TASK", "Workspace task must be non-empty text");
+    if (signal?.aborted) throw signal.reason;
     return this.enqueue(async () => {
+      if (signal?.aborted) throw signal.reason;
       await this.initialize();
       await this.assertRoots();
       const name = requested.name === undefined ? this.nextName() : validateName(requested.name);
@@ -541,7 +549,7 @@ export class WorkspaceManager {
         mode = "worktree";
         degradedReason = "Worktree mode was explicitly requested; refs are shared with the origin repository";
       } else if (this.capabilitiesValue.cloneLocal) {
-        const clone = await this.runGit(["clone", "--local", this.originRoot, path], this.originRoot);
+        const clone = await this.runGit(["clone", "--local", this.originRoot, path], this.originRoot, signal);
         if (clone.exitCode === 0) {
           created = true;
         } else {
@@ -554,7 +562,7 @@ export class WorkspaceManager {
       if (!created) {
         await this.removePartialPath(path);
         mode = "worktree";
-        const worktree = await this.runGit(["worktree", "add", "--detach", path, "HEAD"], this.originRoot);
+        const worktree = await this.runGit(["worktree", "add", "--detach", path, "HEAD"], this.originRoot, signal);
         if (worktree.exitCode !== 0) {
           await this.removePartialPath(path);
           throw new WorkspaceError(
@@ -565,6 +573,7 @@ export class WorkspaceManager {
         }
         created = true;
       }
+      await this.mirrorWorkingTree(path, signal);
 
       try {
         await this.assertWorkspacePath(path);
@@ -580,6 +589,7 @@ export class WorkspaceManager {
         state: "created",
         mode,
         ...(degradedReason ? { degradedReason } : {}),
+        ...(requested.task ? { task: requested.task } : {}),
         createdAt: timestamp,
         updatedAt: timestamp,
       };
@@ -593,6 +603,14 @@ export class WorkspaceManager {
       this.occupiedNames.add(name);
       return cloneRecord(record);
     });
+  }
+  private async mirrorWorkingTree(destination: string, signal?: AbortSignal): Promise<void> {
+    for (const entry of await readdir(destination)) if (entry !== ".git") await rm(join(destination, entry), { recursive: true, force: true });
+    for (const entry of await readdir(this.originRoot)) {
+      if (signal?.aborted) throw signal.reason;
+      if (entry === ".git" || entry === ".lyra") continue;
+      await cp(join(this.originRoot, entry), join(destination, entry), { recursive: true, force: true, preserveTimestamps: true, mode: constants.COPYFILE_FICLONE });
+    }
   }
 
   private async removePartialPath(path: string): Promise<void> {
@@ -658,14 +676,14 @@ export class WorkspaceManager {
     });
   }
 
-  async drop(name: string): Promise<WorkspaceRecord> {
+  async drop(name: string, signal?: AbortSignal): Promise<WorkspaceRecord> {
     return this.enqueue(async () => {
       const current = await this.existing(name);
       if (current.state === "dropped") return cloneRecord(current);
       const dropped = { ...current, state: "dropped" as const, updatedAt: nowIso(this.now) };
       await this.writeMetadata(dropped);
       try {
-        await this.removeWorkspace(current);
+        await this.removeWorkspace(current, signal);
       } catch (error) {
         // Keep the tombstone: a retry can finish cleanup without losing lifecycle history.
         this.records.set(name, dropped);

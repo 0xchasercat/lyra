@@ -1,4 +1,5 @@
-import { join, resolve } from "node:path";
+import { resolve } from "node:path";
+import { ProcessHost, type HostProcess, type JobHandle, type ProcessResult } from "@lyra/host";
 import type { ToolDefinition } from "@lyra/provider";
 import type { ToolExecutionContext, ToolExecutionResult } from "@lyra/core";
 import { boundText } from "./filesystem-tools.ts";
@@ -9,6 +10,7 @@ export interface BashToolOptions {
   displayBudget?: number;
   artifactStore?: ArtifactStore;
   maxInlineMs?: number;
+  processHost?: HostProcess;
   activity?: (event: { type: "bash_started" | "bash_finished"; command: string; cwd: string; jobId?: string; exitCode?: number | null }) => void;
 }
 
@@ -18,42 +20,7 @@ export interface BashRequest {
   timeoutMs?: number;
 }
 
-export interface BashJob {
-  readonly id: string;
-  readonly command: string;
-  readonly cwd: string;
-  readonly startedAt: number;
-  readonly promise: Promise<BashCompleted>;
-  cancel(): void;
-}
-
-export interface BashCompleted {
-  readonly stdout: string;
-  readonly stderr: string;
-  readonly exitCode: number | null;
-  readonly signal: string | null;
-  readonly timedOut: boolean;
-  readonly durationMs: number;
-}
-
-class JobManager {
-  readonly #jobs = new Map<string, BashJob>();
-  #sequence = 0;
-
-  start(command: string, cwd: string, timeoutMs: number, run: (onProcess: (process: Bun.Subprocess) => void) => Promise<BashCompleted>): BashJob {
-    const id = `bash-${Date.now().toString(36)}-${(++this.#sequence).toString(36)}`;
-    let child: Bun.Subprocess | undefined;
-    const promise = run((process) => { child = process; }).finally(() => { this.#jobs.delete(id); });
-    const job: BashJob = { id, command, cwd, startedAt: Date.now(), promise, cancel: () => child?.kill() };
-    this.#jobs.set(id, job);
-    return job;
-  }
-
-  get(id: string): BashJob | undefined { return this.#jobs.get(id); }
-  list(): readonly BashJob[] { return [...this.#jobs.values()]; }
-}
-
-export const bashJobs = new JobManager();
+export type BashCompleted = ProcessResult;
 
 export const BASH_DEFINITION: ToolDefinition = Object.freeze({
   name: "bash",
@@ -84,12 +51,6 @@ function contained(path: string, root: string): boolean {
   return relative === "" || relative.startsWith("/");
 }
 
-function commandClass(command: string): "light" | "heavy" {
-  return /(^|\s)(cargo|npm|bun|pnpm|yarn|go|rustc|tsc|pytest|vitest|jest|make|cmake)(\s|$)/i.test(command)
-    || /(^|\s)(build|test|check|install|compile|watch|serve|dev)(\s|$)/i.test(command)
-    || /\b(sleep|yes|tail\s+-f)\b/i.test(command)
-    ? "heavy" : "light";
-}
 
 function parseArgs(args: unknown): BashRequest | string {
   if (args === null || typeof args !== "object" || Array.isArray(args)) return "arguments must be an object with a command";
@@ -103,30 +64,13 @@ function parseArgs(args: unknown): BashRequest | string {
 
 function errorResult(message: string): ToolExecutionResult { return { content: message, isError: true }; }
 
-async function runBash(command: string, cwd: string, timeoutMs: number, signal: AbortSignal, notify?: (process: Bun.Subprocess) => void): Promise<BashCompleted> {
-  const started = Date.now();
-  const child = Bun.spawn(["/bin/bash", "-lc", command], { cwd, stdout: "pipe", stderr: "pipe" });
-  notify?.(child);
-  let timedOut = false;
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  const stop = (): void => { timedOut = true; child.kill(); };
-  if (timeoutMs > 0) timer = setTimeout(stop, timeoutMs);
-  const onAbort = (): void => child.kill();
-  signal.addEventListener("abort", onAbort, { once: true });
-  try {
-    const [stdout, stderr, exitCode] = await Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited]);
-    return { stdout, stderr, exitCode, signal: null, timedOut, durationMs: Date.now() - started };
-  } finally {
-    if (timer !== undefined) clearTimeout(timer);
-    signal.removeEventListener("abort", onAbort);
-  }
-}
+function isJobHandle(value: ProcessResult | JobHandle): value is JobHandle { return "id" in value; }
 
-async function present(result: BashCompleted, store: ArtifactStore, budget: number): Promise<string> {
+async function present(result: ProcessResult, store: ArtifactStore, budget: number): Promise<string> {
   const body = [
     `exit_code: ${result.exitCode ?? "null"}`,
     `signal: ${result.signal ?? "none"}`,
-    `timed_out: ${result.timedOut}`,
+    `timed_out: ${result.signal !== null}`,
     `duration_ms: ${result.durationMs}`,
     "--- stdout ---",
     result.stdout,
@@ -139,8 +83,12 @@ async function present(result: BashCompleted, store: ArtifactStore, budget: numb
 export class BashTool implements LyraTool {
   readonly definition = BASH_DEFINITION;
   readonly #options: Required<Pick<BashToolOptions, "displayBudget" | "maxInlineMs">> & BashToolOptions;
+  readonly #host: HostProcess;
+  readonly #ownsHost: boolean;
   constructor(options: BashToolOptions = {}) {
     this.#options = { displayBudget: 32 * 1024, maxInlineMs: 120_000, ...options };
+    this.#host = options.processHost ?? new ProcessHost();
+    this.#ownsHost = options.processHost === undefined;
   }
 
   async execute(args: unknown, context: ToolExecutionContext): Promise<ToolExecutionResult> {
@@ -152,17 +100,18 @@ export class BashTool implements LyraTool {
     if (!contained(requested, root)) return errorResult(`Bash cwd escapes the workspace root ${root}; choose a workspace-relative directory.`);
     const cwd = requested;
     const timeoutMs = parsed.timeoutMs ?? this.#options.maxInlineMs;
-    const heavy = commandClass(parsed.command) === "heavy";
-    if (heavy) {
-      const job = bashJobs.start(parsed.command, cwd, timeoutMs, (notify) => runBash(parsed.command, cwd, timeoutMs, context.signal, notify));
-      this.#options.activity?.({ type: "bash_started", command: parsed.command, cwd, jobId: job.id });
-      return { content: `Started heavy bash command as job ${job.id}. Use the host job wait/status API to retrieve complete output.`, metadata: { jobId: job.id, command: parsed.command, cwd, heavy: true } };
-    }
     this.#options.activity?.({ type: "bash_started", command: parsed.command, cwd });
-    const result = await runBash(parsed.command, cwd, timeoutMs, context.signal);
-    this.#options.activity?.({ type: "bash_finished", command: parsed.command, cwd, exitCode: result.exitCode });
-    return { content: await present(result, base.store, this.#options.displayBudget), ...(result.exitCode === 0 ? {} : { isError: true }) };
+    try {
+      const launched = await this.#host.run({ command: parsed.command, cwd, timeoutMs, signal: context.signal });
+      if (isJobHandle(launched)) {
+        this.#options.activity?.({ type: "bash_started", command: parsed.command, cwd, jobId: launched.id });
+        return { content: `Started heavy bash command as job ${launched.id}. Use the host job wait/status API to retrieve complete output.`, metadata: { jobId: launched.id, command: parsed.command, cwd, heavy: true } };
+      }
+      this.#options.activity?.({ type: "bash_finished", command: parsed.command, cwd, exitCode: launched.exitCode });
+      return { content: await present(launched, base.store, this.#options.displayBudget), ...(launched.exitCode === 0 ? {} : { isError: true }) };
+    } catch (error) { return errorResult(`Bash failed: ${error instanceof Error ? error.message : String(error)}`); }
   }
+  async close(): Promise<void> { if (this.#ownsHost) await this.#host.close(); }
 }
 
 export function createBashTool(options: BashToolOptions = {}): BashTool { return new BashTool(options); }

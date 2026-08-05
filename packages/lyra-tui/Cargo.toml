@@ -8,4 +8,11 @@ license.workspace = true
 name = "lyra_tui"
 path = "src/lib.rs"
 
+[[bin]]
+name = "lyra-tui"
+path = "src/main.rs"
+
 [dependencies]
+flywheel = { package = "flywheel-compositor", git = "https://github.com/0xchasercat/flywheel", rev = "067a68fc4bc1e5c6790b746f9ec053553f1ed3a8" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

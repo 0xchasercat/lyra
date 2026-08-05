@@ -48,7 +48,7 @@ describe("transactional git pipeline", () => {
       const preview = await pipeline.preview([one, two], "preview-one");
       expect(preview.branches).toEqual(["agent/purple-falcon", "agent/amber-forge"]);
       expect(await git(preview.path, ["show-ref", "--verify", "refs/heads/agent/purple-falcon"])).toContain("refs/heads/agent/purple-falcon");
-      const applied = await pipeline.apply("preview-one");
+      const applied = await pipeline.apply();
       expect(applied.ok).toBe(true);
       expect(await readFile(join(origin, "one.txt"), "utf8")).toBe("one\n");
       expect(await readFile(join(origin, "two.txt"), "utf8")).toBe("two\n");
@@ -75,6 +75,18 @@ describe("transactional git pipeline", () => {
     } finally { await rm(root, { recursive: true, force: true }); }
   }, 30_000);
 
+  test("refuses apply while any untracked origin file could be lost", async () => {
+    const { root, origin } = await repoFixture();
+    try {
+      const one = await workspace(root, origin, "safe-agent", "collision.txt", "preview\n", "add collision");
+      const pipeline = new GitPipeline({ origin, mode: "stage" });
+      await pipeline.preview([one], "untracked-preview");
+      await writeFile(join(origin, "collision.txt"), "private untracked bytes\n");
+      await expect(pipeline.apply("untracked-preview")).rejects.toThrow("tracked or untracked changes");
+      expect(await readFile(join(origin, "collision.txt"), "utf8")).toBe("private untracked bytes\n");
+    } finally { await rm(root, { recursive: true, force: true }); }
+  }, 30_000);
+
   test("conflicts surface both task contracts without changing origin", async () => {
     const { root, origin } = await repoFixture();
     try {
@@ -87,6 +99,25 @@ describe("transactional git pipeline", () => {
       expect(result.conflicts?.[0]).toMatchObject({ files: ["base.txt"], workspace: { name: "second-agent", task: "second intent" }, priorTasks: ["first intent"] });
       expect(await readFile(join(origin, "base.txt"), "utf8")).toBe("base\n");
       expect(await pipeline.listSnapshots()).toHaveLength(1);
+    } finally { await rm(root, { recursive: true, force: true }); }
+  }, 30_000);
+
+  test("auto mode invokes the resolver with task contracts and applies its staged resolution", async () => {
+    const { root, origin } = await repoFixture();
+    let seen: unknown;
+    try {
+      const one = await workspace(root, origin, "first-agent", "base.txt", "first\n", "first intent");
+      const two = await workspace(root, origin, "second-agent", "base.txt", "second\n", "second intent");
+      const pipeline = new GitPipeline({
+        origin,
+        confirmAuto: () => true,
+        resolver: { resolve: async ({ repo, conflict, allWorkspaces }) => { seen = { conflict, allWorkspaces }; await writeFile(join(repo, "base.txt"), "first and second\n"); await git(repo, ["add", "base.txt"]); return true; } },
+      });
+      await pipeline.setMode("auto");
+      await pipeline.preview([one, two], "auto-conflict-preview");
+      expect(await pipeline.apply("auto-conflict-preview")).toMatchObject({ ok: true });
+      expect(await readFile(join(origin, "base.txt"), "utf8")).toBe("first and second\n");
+      expect(seen).toMatchObject({ conflict: { priorTasks: ["first intent"], workspace: { task: "second intent" } }, allWorkspaces: [{ task: "first intent" }, { task: "second intent" }] });
     } finally { await rm(root, { recursive: true, force: true }); }
   }, 30_000);
 });

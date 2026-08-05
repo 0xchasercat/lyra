@@ -1,0 +1,21 @@
+{
+  "name": "@lyra/app",
+  "version": "0.1.0",
+  "type": "module",
+  "private": true,
+  "bin": { "lyra": "./src/cli.ts" },
+  "exports": { ".": "./src/index.ts" },
+  "dependencies": {
+    "@lyra/acp": "workspace:*",
+    "@lyra/core": "workspace:*",
+    "@lyra/git": "workspace:*",
+    "@lyra/host": "workspace:*",
+    "@lyra/lsp": "workspace:*",
+    "@lyra/mcp": "workspace:*",
+    "@lyra/provider": "workspace:*",
+    "@lyra/runtime": "workspace:*",
+    "@lyra/session": "workspace:*",
+    "@lyra/skills": "workspace:*",
+    "@lyra/tools": "workspace:*"
+  }
+}

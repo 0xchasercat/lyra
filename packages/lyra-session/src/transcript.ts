@@ -1,4 +1,5 @@
 import {
+  chmodSync,
   closeSync,
   fsyncSync,
   mkdirSync,
@@ -76,8 +77,8 @@ export class TranscriptStore {
 
   static create(options: TranscriptCreateOptions): TranscriptStore {
     const path = normalizePath(options.path);
-    mkdirSync(dirname(path), { recursive: true });
-
+    mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+    chmodSync(dirname(path), 0o700);
     const timestamp = options.timestamp ?? new Date().toISOString();
     const session = canonicalEntry({
       type: "session",
@@ -93,7 +94,7 @@ export class TranscriptStore {
     }) as SessionStartEntry;
     validateEntry(session, path, 1);
 
-    const fd = openSync(path, "wx+");
+    const fd = openSync(path, "wx+", 0o600);
     try {
       writeAll(fd, `${JSON.stringify(session)}\n`);
       fsyncSync(fd);
@@ -107,7 +108,8 @@ export class TranscriptStore {
   static open(inputPath: string): TranscriptStore {
     const path = normalizePath(inputPath);
     const entries = readAndRepair(path);
-    const fd = openSync(path, "a+");
+    chmodSync(path, 0o600);
+    const fd = openSync(path, "a+", 0o600);
     return new TranscriptStore(path, fd, entries);
   }
 

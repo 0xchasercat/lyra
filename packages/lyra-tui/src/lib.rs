@@ -1,9 +1,9 @@
-//! Lyra's small, deterministic TUI model and renderer.
-//! The compositor follows Flywheel's useful invariants: actor-owned state,
-//! double-buffered frames, and a fast append path for streaming text.
+//! Lyra's small, deterministic TUI model rendered by Flywheel's buffer and diff engine.
+//! Application state remains actor-owned; Flywheel supplies the double-buffered terminal compositor.
 #![forbid(unsafe_code)]
 
-use std::fmt::Write as _;
+use flywheel::buffer::diff::{DiffState, render_diff};
+use flywheel::{Buffer, Cell as FlywheelCell};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Color(pub u8, pub u8, pub u8);
@@ -16,9 +16,21 @@ pub struct Theme {
 }
 
 pub const THEMES: [Theme; 3] = [
-    Theme { name: "graphite", accent: Color(135, 175, 255), live_accent: Color(255, 190, 95) },
-    Theme { name: "paper", accent: Color(60, 95, 160), live_accent: Color(170, 95, 30) },
-    Theme { name: "forest", accent: Color(105, 190, 135), live_accent: Color(235, 175, 85) },
+    Theme {
+        name: "graphite",
+        accent: Color(135, 175, 255),
+        live_accent: Color(255, 190, 95),
+    },
+    Theme {
+        name: "paper",
+        accent: Color(60, 95, 160),
+        live_accent: Color(170, 95, 30),
+    },
+    Theme {
+        name: "forest",
+        accent: Color(105, 190, 135),
+        live_accent: Color(235, 175, 85),
+    },
 ];
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -26,7 +38,12 @@ pub enum RowKind {
     User,
     Assistant,
     Thinking,
-    ToolCollapsed { name: String, path: String, added: i32, removed: i32 },
+    ToolCollapsed {
+        name: String,
+        path: String,
+        added: i32,
+        removed: i32,
+    },
     ToolExpanded,
     Diff,
     Notice,
@@ -42,13 +59,57 @@ pub struct Row {
 }
 
 impl Row {
-    pub fn user(id: u64, text: impl Into<String>) -> Self { Self { id, kind: RowKind::User, text: text.into(), expanded: true } }
-    pub fn assistant(id: u64, text: impl Into<String>) -> Self { Self { id, kind: RowKind::Assistant, text: text.into(), expanded: true } }
-    pub fn tool(id: u64, name: impl Into<String>, path: impl Into<String>, added: i32, removed: i32) -> Self {
-        Self { id, kind: RowKind::ToolCollapsed { name: name.into(), path: path.into(), added, removed }, text: String::new(), expanded: false }
+    pub fn user(id: u64, text: impl Into<String>) -> Self {
+        Self {
+            id,
+            kind: RowKind::User,
+            text: text.into(),
+            expanded: true,
+        }
     }
-    pub fn notice(id: u64, text: impl Into<String>) -> Self { Self { id, kind: RowKind::Notice, text: text.into(), expanded: true } }
-    pub fn boundary(id: u64, before: u64, after: u64) -> Self { Self { id, kind: RowKind::Boundary, text: format!("context compacted · {before} → {after} tokens"), expanded: true } }
+    pub fn assistant(id: u64, text: impl Into<String>) -> Self {
+        Self {
+            id,
+            kind: RowKind::Assistant,
+            text: text.into(),
+            expanded: true,
+        }
+    }
+    pub fn tool(
+        id: u64,
+        name: impl Into<String>,
+        path: impl Into<String>,
+        added: i32,
+        removed: i32,
+    ) -> Self {
+        Self {
+            id,
+            kind: RowKind::ToolCollapsed {
+                name: name.into(),
+                path: path.into(),
+                added,
+                removed,
+            },
+            text: String::new(),
+            expanded: false,
+        }
+    }
+    pub fn notice(id: u64, text: impl Into<String>) -> Self {
+        Self {
+            id,
+            kind: RowKind::Notice,
+            text: text.into(),
+            expanded: true,
+        }
+    }
+    pub fn boundary(id: u64, before: u64, after: u64) -> Self {
+        Self {
+            id,
+            kind: RowKind::Boundary,
+            text: format!("context compacted · {before} → {after} tokens"),
+            expanded: true,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -61,6 +122,7 @@ pub struct Activity {
 pub struct Footer {
     pub input_tokens: u64,
     pub context_tokens: u64,
+    pub context_window: u64,
     pub cost_cents: u64,
     pub elapsed_ms: u64,
     pub retry: Option<RetryStatus>,
@@ -76,7 +138,17 @@ pub struct RetryStatus {
 }
 
 impl Default for Footer {
-    fn default() -> Self { Self { input_tokens: 0, context_tokens: 0, cost_cents: 0, elapsed_ms: 0, retry: None, context_repair: false } }
+    fn default() -> Self {
+        Self {
+            input_tokens: 0,
+            context_window: 200_000,
+            context_tokens: 0,
+            cost_cents: 0,
+            elapsed_ms: 0,
+            retry: None,
+            context_repair: false,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -94,77 +166,280 @@ pub struct TuiState {
 }
 
 impl TuiState {
-    pub fn new(project: impl Into<String>, branch: impl Into<String>, model: impl Into<String>, session: impl Into<String>) -> Self {
-        Self { project: project.into(), branch: branch.into(), model: model.into(), session: session.into(), rows: Vec::new(), activity: Activity::default(), composer: String::new(), streaming: false, footer: Footer::default(), next_id: 1 }
+    pub fn new(
+        project: impl Into<String>,
+        branch: impl Into<String>,
+        model: impl Into<String>,
+        session: impl Into<String>,
+    ) -> Self {
+        Self {
+            project: project.into(),
+            branch: branch.into(),
+            model: model.into(),
+            session: session.into(),
+            rows: Vec::new(),
+            activity: Activity::default(),
+            composer: String::new(),
+            streaming: false,
+            footer: Footer::default(),
+            next_id: 1,
+        }
     }
-    pub fn push(&mut self, row: Row) { self.next_id = self.next_id.max(row.id.saturating_add(1)); self.rows.push(row); }
+    pub fn push(&mut self, row: Row) {
+        self.next_id = self.next_id.max(row.id.saturating_add(1));
+        self.rows.push(row);
+    }
     pub fn append_assistant(&mut self, text: &str) {
-        if let Some(last) = self.rows.last_mut().filter(|row| row.kind == RowKind::Assistant && self.streaming) { last.text.push_str(text); } else { let id = self.next_id; self.next_id += 1; self.rows.push(Row::assistant(id, text)); }
+        if let Some(last) = self
+            .rows
+            .last_mut()
+            .filter(|row| row.kind == RowKind::Assistant && self.streaming)
+        {
+            last.text.push_str(text);
+        } else {
+            let id = self.next_id;
+            self.next_id += 1;
+            self.rows.push(Row::assistant(id, text));
+        }
     }
     pub fn toggle_tool(&mut self, id: u64) -> bool {
-        let Some(row) = self.rows.iter_mut().find(|row| row.id == id) else { return false };
-        if matches!(row.kind, RowKind::ToolCollapsed { .. } | RowKind::ToolExpanded) { row.expanded = !row.expanded; true } else { false }
+        let Some(row) = self.rows.iter_mut().find(|row| row.id == id) else {
+            return false;
+        };
+        if matches!(
+            row.kind,
+            RowKind::ToolCollapsed { .. } | RowKind::ToolExpanded
+        ) {
+            row.expanded = !row.expanded;
+            true
+        } else {
+            false
+        }
     }
     pub fn activity_line(&self) -> String {
-        let agents = self.activity.live_agents.iter().map(|agent| format!("◎ {agent}")).collect::<Vec<_>>().join("  ");
-        let queued = if self.activity.queued == 0 { String::new() } else { format!("  ○ {} queued", self.activity.queued) };
+        let agents = self
+            .activity
+            .live_agents
+            .iter()
+            .map(|agent| format!("◎ {agent}"))
+            .collect::<Vec<_>>()
+            .join("  ");
+        let queued = if self.activity.queued == 0 {
+            String::new()
+        } else {
+            format!("  ○ {} queued", self.activity.queued)
+        };
         format!("{agents}{queued}")
     }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct Cell { pub ch: char }
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct Frame { pub width: usize, pub height: usize, pub cells: Vec<Cell> }
-
-impl Frame {
-    pub fn blank(width: usize, height: usize) -> Self { Self { width, height, cells: vec![Cell { ch: ' ' }; width.saturating_mul(height)] } }
-    pub fn set(&mut self, x: usize, y: usize, ch: char) { if x < self.width && y < self.height { self.cells[y * self.width + x].ch = ch; } }
-    pub fn line(&self, y: usize) -> String { if y >= self.height { return String::new() } (0..self.width).map(|x| self.cells[y * self.width + x].ch).collect() }
+pub struct Cell {
+    pub ch: char,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct RenderBatch { pub ansi: String, pub frame: Frame, pub fast_path: bool }
+pub struct Frame {
+    pub width: usize,
+    pub height: usize,
+    pub cells: Vec<Cell>,
+}
+
+impl Frame {
+    pub fn blank(width: usize, height: usize) -> Self {
+        Self {
+            width,
+            height,
+            cells: vec![Cell { ch: ' ' }; width.saturating_mul(height)],
+        }
+    }
+    pub fn set(&mut self, x: usize, y: usize, ch: char) {
+        if x < self.width && y < self.height {
+            self.cells[y * self.width + x].ch = ch;
+        }
+    }
+    pub fn line(&self, y: usize) -> String {
+        if y >= self.height {
+            return String::new();
+        }
+        (0..self.width)
+            .map(|x| self.cells[y * self.width + x].ch)
+            .collect()
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RenderBatch {
+    pub ansi: String,
+    pub frame: Frame,
+    pub fast_path: bool,
+}
 
 #[derive(Clone, Debug)]
-pub struct Renderer { previous: Option<Frame>, theme: Theme }
+pub struct Renderer {
+    previous: Option<Buffer>,
+    diff_state: DiffState,
+    theme: Theme,
+}
 
 impl Renderer {
-    pub fn new(theme: Theme) -> Self { Self { previous: None, theme } }
-    pub fn theme(&self) -> Theme { self.theme }
-    pub fn render(&mut self, state: &TuiState, width: usize, height: usize) -> RenderBatch {
-        let frame = compose(state, width, height, self.theme);
-        let ansi = diff_ansi(self.previous.as_ref(), &frame);
-        let fast_path = self.previous.as_ref().is_some_and(|previous| frame.width == previous.width && frame.height == previous.height && changed_cells(previous, &frame) < width.max(1) / 2);
-        self.previous = Some(frame.clone());
-        RenderBatch { ansi, frame, fast_path }
+    pub fn new(theme: Theme) -> Self {
+        Self {
+            previous: None,
+            diff_state: DiffState::new(),
+            theme,
+        }
     }
-    pub fn append_stream(&mut self, state: &mut TuiState, chunk: &str, width: usize, height: usize) -> RenderBatch {
-        if let Some(row) = state.rows.last_mut() { if row.kind == RowKind::Assistant { row.text.push_str(chunk); } }
+    pub fn theme(&self) -> Theme {
+        self.theme
+    }
+    pub fn render(&mut self, state: &TuiState, width: usize, height: usize) -> RenderBatch {
+        let width = width.min(u16::MAX as usize);
+        let height = height.min(u16::MAX as usize);
+        let frame = compose(state, width, height, self.theme);
+        if width == 0 || height == 0 {
+            self.previous = None;
+            return RenderBatch {
+                ansi: String::new(),
+                frame,
+                fast_path: false,
+            };
+        }
+        let next = flywheel_buffer(&frame);
+        let dimensions_changed = self.previous.as_ref().is_some_and(|buffer| {
+            buffer.width() as usize != width || buffer.height() as usize != height
+        });
+        if dimensions_changed {
+            self.previous = None;
+            self.diff_state.reset();
+        }
+        let initial = self.previous.is_none();
+        let current = self
+            .previous
+            .as_ref()
+            .cloned()
+            .unwrap_or_else(|| Buffer::new(width as u16, height as u16));
+        let mut bytes = if initial {
+            b"\x1b[?25l".to_vec()
+        } else {
+            Vec::new()
+        };
+        let result = render_diff(&current, &next, &[], &mut bytes, &mut self.diff_state);
+        let fast_path = !initial && result.cells_changed < width.max(1) / 2;
+        self.previous = Some(next);
+        RenderBatch {
+            ansi: String::from_utf8_lossy(&bytes).into_owned(),
+            frame,
+            fast_path,
+        }
+    }
+    pub fn set_theme(&mut self, theme: Theme) {
+        if self.theme != theme {
+            self.theme = theme;
+            self.previous = None;
+            self.diff_state.reset();
+        }
+    }
+    pub fn append_stream(
+        &mut self,
+        state: &mut TuiState,
+        chunk: &str,
+        width: usize,
+        height: usize,
+    ) -> RenderBatch {
+        if let Some(row) = state.rows.last_mut()
+            && row.kind == RowKind::Assistant {
+                row.text.push_str(chunk);
+            }
         self.render(state, width, height)
     }
 }
 
 fn compose(state: &TuiState, width: usize, height: usize, theme: Theme) -> Frame {
     let mut frame = Frame::blank(width, height);
-    if width == 0 || height == 0 { return frame }
-    let header = format!(" lyra   {}   {}   {}   {}", state.project, state.branch, state.model, state.session);
+    if width == 0 || height == 0 {
+        return frame;
+    }
+    let header = format!(
+        " lyra   {}   {}   {}   {}",
+        state.project, state.branch, state.model, state.session
+    );
     put_wrapped(&mut frame, 0, 0, &header, width);
-    if height > 1 { put_wrapped(&mut frame, 0, 1, &"─".repeat(width), width); }
-    let footer_rows = if height >= 4 { 4 } else { height.saturating_sub(2) };
+    if height > 1 {
+        put_wrapped(&mut frame, 0, 1, &"─".repeat(width), width);
+    }
+    let footer_rows = if height >= 4 {
+        4
+    } else {
+        height.saturating_sub(2)
+    };
     let body_end = height.saturating_sub(footer_rows);
     let mut y = 2;
     for row in &state.rows {
-        if y >= body_end { break }
+        if y >= body_end {
+            break;
+        }
         let line = row_line(row);
         let prefix = if row.expanded { "  " } else { "  ▸ " };
-        for wrapped in wrap_text(&format!("{prefix}{line}"), width.saturating_sub(1)) { if y >= body_end { break } put_wrapped(&mut frame, 0, y, &wrapped, width); y += 1; }
+        for wrapped in wrap_text(&format!("{prefix}{line}"), width.saturating_sub(1)) {
+            if y >= body_end {
+                break;
+            }
+            put_wrapped(&mut frame, 0, y, &wrapped, width);
+            y += 1;
+        }
     }
-    if body_end < height { put_wrapped(&mut frame, 0, body_end, &"─".repeat(width), width); }
-    if footer_rows >= 3 && body_end + 1 < height { put_wrapped(&mut frame, 0, body_end + 1, &state.activity_line(), width); }
-    if footer_rows >= 2 && body_end + 2 < height { put_wrapped(&mut frame, 0, body_end + 2, &format!("  {}", state.composer), width); }
-    if body_end + 1 < height { let border = if state.streaming { theme.live_accent } else { theme.accent }; put_wrapped(&mut frame, 0, height - 1, &format!("  {}  {}k/{}k  ${:.2}  {:.1}s", if state.streaming { "┌" } else { "▸" }, state.footer.context_tokens / 1000, 200, state.footer.cost_cents as f64 / 100.0, state.footer.elapsed_ms as f64 / 1000.0), width); let _ = border; }
+    if body_end < height {
+        put_wrapped(&mut frame, 0, body_end, &"─".repeat(width), width);
+    }
+    if footer_rows >= 3 && body_end + 1 < height {
+        put_wrapped(&mut frame, 0, body_end + 1, &state.activity_line(), width);
+    }
+    if footer_rows >= 2 && body_end + 2 < height {
+        put_wrapped(
+            &mut frame,
+            0,
+            body_end + 2,
+            &format!("  {}", state.composer),
+            width,
+        );
+    }
+    if body_end + 1 < height {
+        let border = if state.streaming {
+            theme.live_accent
+        } else {
+            theme.accent
+        };
+        put_wrapped(
+            &mut frame,
+            0,
+            height - 1,
+            &if let Some(retry) = &state.footer.retry {
+                format!(
+                    "  retry {}/{} · {} · {:.1}s   {}k/{}k   ${:.2}",
+                    retry.attempt,
+                    retry.max_attempts,
+                    retry.reason,
+                    retry.remaining_ms as f64 / 1000.0,
+                    state.footer.context_tokens / 1000,
+                    state.footer.context_window / 1000,
+                    state.footer.cost_cents as f64 / 100.0
+                )
+            } else {
+                format!(
+                    "  {}  in:{}  {}k/{}k  ${:.2}  {:.1}s",
+                    if state.streaming { "┌" } else { "▸" },
+                    state.footer.input_tokens,
+                    state.footer.context_tokens / 1000,
+                    state.footer.context_window / 1000,
+                    state.footer.cost_cents as f64 / 100.0,
+                    state.footer.elapsed_ms as f64 / 1000.0
+                )
+            },
+            width,
+        );
+        let _ = border;
+    }
     frame
 }
 
@@ -173,38 +448,118 @@ fn row_line(row: &Row) -> String {
         RowKind::User => format!("you · {}", row.text),
         RowKind::Assistant => row.text.clone(),
         RowKind::Thinking => format!("thinking · {}", row.text),
-        RowKind::ToolCollapsed { name, path, added, removed } => if row.expanded && !row.text.is_empty() { format!("{name}  {path}  +{added} −{removed}\n{}", row.text) } else { format!("{name}  {path}  +{added} −{removed}") },
+        RowKind::ToolCollapsed {
+            name,
+            path,
+            added,
+            removed,
+        } => {
+            if row.expanded && !row.text.is_empty() {
+                format!(
+                    "{name}  {path}  +{added} −{removed}  [Tab/Enter collapse]\n{}",
+                    row.text
+                )
+            } else {
+                format!("{name}  {path}  +{added} −{removed}  [Tab/Enter expand]")
+            }
+        }
         RowKind::ToolExpanded => row.text.clone(),
         RowKind::Diff => format!("diff · {}", row.text),
         RowKind::Notice => format!("note · {}", row.text),
         RowKind::Boundary => format!("──── {}", row.text),
     }
 }
-fn put_wrapped(frame: &mut Frame, x: usize, y: usize, text: &str, width: usize) { for (index, ch) in text.chars().take(width.saturating_sub(x)).enumerate() { frame.set(x + index, y, ch); } }
-fn wrap_text(text: &str, width: usize) -> Vec<String> { if width == 0 { return vec![String::new()] } let chars: Vec<char> = text.chars().collect(); chars.chunks(width).map(|chunk| chunk.iter().collect()).collect() }
-fn changed_cells(before: &Frame, after: &Frame) -> usize { before.cells.iter().zip(&after.cells).filter(|(a, b)| a != b).count() }
-fn diff_ansi(before: Option<&Frame>, after: &Frame) -> String {
-    let mut output = String::new();
-    if before.is_none() { output.push_str("\x1b[?25l\x1b[H"); }
-    for y in 0..after.height { for x in 0..after.width { let changed = before.is_none_or(|frame| frame.width != after.width || frame.height != after.height || frame.cells[y * after.width + x] != after.cells[y * after.width + x]); if changed { let _ = write!(output, "\x1b[{};{}H{}", y + 1, x + 1, after.cells[y * after.width + x].ch); } } }
-    output
+fn put_wrapped(frame: &mut Frame, x: usize, y: usize, text: &str, width: usize) {
+    for (index, ch) in text.chars().take(width.saturating_sub(x)).enumerate() {
+        frame.set(x + index, y, ch);
+    }
+}
+fn wrap_text(text: &str, width: usize) -> Vec<String> {
+    if width == 0 {
+        return vec![String::new()];
+    }
+    let chars: Vec<char> = text.chars().collect();
+    chars
+        .chunks(width)
+        .map(|chunk| chunk.iter().collect())
+        .collect()
+}
+fn flywheel_buffer(frame: &Frame) -> Buffer {
+    let mut buffer = Buffer::new(frame.width as u16, frame.height as u16);
+    for y in 0..frame.height {
+        for x in 0..frame.width {
+            let cell = FlywheelCell::from_char(frame.cells[y * frame.width + x].ch);
+            let _ = buffer.set(x as u16, y as u16, cell);
+        }
+    }
+    buffer
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum InputEvent { Enter, CtrlEnter, Escape, CtrlC, Character(char) }
+pub enum InputEvent {
+    Enter,
+    CtrlEnter,
+    Escape,
+    CtrlC,
+    Character(char),
+}
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum InputAction { Steer(String), Queue(String), Cancel, Rewind, Exit, Edit }
+pub enum InputAction {
+    Steer(String),
+    Queue(String),
+    Cancel,
+    Rewind,
+    Exit,
+    Edit,
+}
 
 #[derive(Clone, Debug, Default)]
-pub struct InputController { escape_pending: bool, ctrl_c_count: u8 }
+pub struct InputController {
+    escape_pending: bool,
+    ctrl_c_count: u8,
+}
 impl InputController {
-    pub fn handle(&mut self, event: InputEvent, composer: &mut String, streaming: bool) -> Option<InputAction> {
+    pub fn handle(
+        &mut self,
+        event: InputEvent,
+        composer: &mut String,
+        streaming: bool,
+    ) -> Option<InputAction> {
         match event {
-            InputEvent::Enter if streaming => if composer.is_empty() { Some(InputAction::Steer(String::new())) } else { Some(InputAction::Steer(std::mem::take(composer))) },
-            InputEvent::CtrlEnter if streaming => Some(InputAction::Queue(std::mem::take(composer))),
-            InputEvent::Escape => if self.escape_pending { self.escape_pending = false; Some(InputAction::Rewind) } else { self.escape_pending = true; Some(InputAction::Cancel) },
-            InputEvent::CtrlC => { self.ctrl_c_count = self.ctrl_c_count.saturating_add(1); if self.ctrl_c_count >= 2 { self.ctrl_c_count = 0; Some(InputAction::Exit) } else { Some(InputAction::Cancel) } },
-            InputEvent::Character(ch) => { self.escape_pending = false; self.ctrl_c_count = 0; composer.push(ch); Some(InputAction::Edit) },
+            InputEvent::Enter if streaming => {
+                if composer.is_empty() {
+                    Some(InputAction::Steer(String::new()))
+                } else {
+                    Some(InputAction::Steer(std::mem::take(composer)))
+                }
+            }
+            InputEvent::CtrlEnter if streaming => {
+                Some(InputAction::Queue(std::mem::take(composer)))
+            }
+            InputEvent::Escape => {
+                if self.escape_pending {
+                    self.escape_pending = false;
+                    Some(InputAction::Rewind)
+                } else {
+                    self.escape_pending = true;
+                    Some(InputAction::Cancel)
+                }
+            }
+            InputEvent::CtrlC => {
+                self.ctrl_c_count = self.ctrl_c_count.saturating_add(1);
+                if self.ctrl_c_count >= 2 {
+                    self.ctrl_c_count = 0;
+                    Some(InputAction::Exit)
+                } else {
+                    Some(InputAction::Cancel)
+                }
+            }
+            InputEvent::Character(ch) => {
+                self.escape_pending = false;
+                self.ctrl_c_count = 0;
+                composer.push(ch);
+                Some(InputAction::Edit)
+            }
             _ => None,
         }
     }
@@ -243,12 +598,30 @@ mod tests {
     fn steering_and_interrupt_semantics_keep_queued_text_visible_to_caller() {
         let mut input = InputController::default();
         let mut composer = "fix the loop".to_string();
-        assert_eq!(input.handle(InputEvent::Enter, &mut composer, true), Some(InputAction::Steer("fix the loop".into())));
+        assert_eq!(
+            input.handle(InputEvent::Enter, &mut composer, true),
+            Some(InputAction::Steer("fix the loop".into()))
+        );
         composer = "after this turn".into();
-        assert_eq!(input.handle(InputEvent::CtrlEnter, &mut composer, true), Some(InputAction::Queue("after this turn".into())));
-        assert_eq!(input.handle(InputEvent::Escape, &mut composer, true), Some(InputAction::Cancel));
-        assert_eq!(input.handle(InputEvent::Escape, &mut composer, true), Some(InputAction::Rewind));
-        assert_eq!(input.handle(InputEvent::CtrlC, &mut composer, true), Some(InputAction::Cancel));
-        assert_eq!(input.handle(InputEvent::CtrlC, &mut composer, true), Some(InputAction::Exit));
+        assert_eq!(
+            input.handle(InputEvent::CtrlEnter, &mut composer, true),
+            Some(InputAction::Queue("after this turn".into()))
+        );
+        assert_eq!(
+            input.handle(InputEvent::Escape, &mut composer, true),
+            Some(InputAction::Cancel)
+        );
+        assert_eq!(
+            input.handle(InputEvent::Escape, &mut composer, true),
+            Some(InputAction::Rewind)
+        );
+        assert_eq!(
+            input.handle(InputEvent::CtrlC, &mut composer, true),
+            Some(InputAction::Cancel)
+        );
+        assert_eq!(
+            input.handle(InputEvent::CtrlC, &mut composer, true),
+            Some(InputAction::Exit)
+        );
     }
 }

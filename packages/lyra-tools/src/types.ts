@@ -10,11 +10,13 @@ export type { ToolDefinition, ToolExecutionContext, ToolExecutionResult };
 export interface ArtifactStore {
   put(content: string | Uint8Array, options?: { mimeType?: string; name?: string }): Promise<string>;
   read(id: string): Promise<Uint8Array>;
+  metadata?(id: string): Promise<{ bytes: number; mimeType: string; name?: string }>;
 }
 
 export interface LyraTool {
   readonly definition: ToolDefinition;
   execute(args: unknown, context: ToolExecutionContext): Promise<ToolExecutionResult>;
+  close?(): void | Promise<void>;
 }
 
 export interface ToolRuntimeContext extends ToolExecutionContext {
@@ -58,6 +60,7 @@ export class ToolRegistry implements CoreToolRegistry {
   get(name: string): LyraTool | undefined {
     return typeof name === "string" ? this.#tools.get(name) : undefined;
   }
+  async close(): Promise<void> { await Promise.all([...this.#tools.values()].map((tool) => tool.close?.())); }
 
   async execute(name: string, input: unknown, context: ToolExecutionContext): Promise<ToolExecutionResult> {
     let tool: LyraTool | undefined;

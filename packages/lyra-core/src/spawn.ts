@@ -10,7 +10,7 @@ import type {
 } from "./spawn-types.ts";
 
 export const DEFAULT_SPAWN_MAX_DEPTH = 2;
-export const DEFAULT_SPAWN_MAX_CONCURRENT = 4;
+export const DEFAULT_SPAWN_MAX_CONCURRENT = Number.MAX_SAFE_INTEGER; // Host pressure is governed by ProcessHost class semaphores.
 export const DEFAULT_SPAWN_WAIT_MS = 60 * 60 * 1000;
 
 /** A parent execution context used when a running child creates another child. */
@@ -106,6 +106,8 @@ interface SpawnJob {
   readonly tools: readonly string[];
   workspace: string;
   workspaceReady: boolean;
+  workspaceName?: string;
+  workspaceReleased: boolean;
   readonly handle: SpawnHandle;
   readonly controller: AbortController;
   readonly completion: Promise<SpawnResult>;
@@ -135,10 +137,13 @@ export class SpawnManager {
 
   private readonly executor: SpawnExecutor;
   private readonly createWorkspace: SpawnManagerOptions["createWorkspace"];
+  private readonly resolveNamedWorkspace: SpawnManagerOptions["resolveWorkspace"];
+  private readonly releaseWorkspace: SpawnManagerOptions["releaseWorkspace"];
   private readonly now: () => number;
   private readonly jobs = new Map<string, SpawnJob>();
   private readonly queue: SpawnJob[] = [];
   private readonly reportListeners = new Set<(report: SpawnReport) => void>();
+  private readonly executions = new Set<Promise<void>>();
   private nextId = 1;
   private active = 0;
   private closed = false;
@@ -160,6 +165,12 @@ export class SpawnManager {
     if (options.createWorkspace !== undefined && typeof options.createWorkspace !== "function") {
       throw new SpawnRequestError("createWorkspace must be a function when provided");
     }
+    if (options.resolveWorkspace !== undefined && typeof options.resolveWorkspace !== "function") {
+      throw new SpawnRequestError("resolveWorkspace must be a function when provided");
+    }
+    if (options.releaseWorkspace !== undefined && typeof options.releaseWorkspace !== "function") {
+      throw new SpawnRequestError("releaseWorkspace must be a function when provided");
+    }
     if (options.now !== undefined && typeof options.now !== "function") {
       throw new SpawnRequestError("now must be a function when provided");
     }
@@ -171,6 +182,8 @@ export class SpawnManager {
     this.availableTools = options.availableTools;
     this.executor = options.executor;
     this.createWorkspace = options.createWorkspace;
+    this.resolveNamedWorkspace = options.resolveWorkspace;
+    this.releaseWorkspace = options.releaseWorkspace;
     this.now = options.now ?? Date.now;
   }
 
@@ -266,15 +279,15 @@ export class SpawnManager {
     return true;
   }
 
-  /** Cancel queued and running work. Completed work is retained for inspection. */
-  close(reason = "Spawn manager closed"): void {
-    if (this.closed) return;
-    this.closed = true;
-    const error = new SpawnCancelledError("manager", reason);
-    for (const job of this.jobs.values()) {
-      if (!job.terminal) this.cancel(job.id, error);
+  /** Cancel queued and running work, then wait for every executor to unwind. */
+  async close(reason = "Spawn manager closed"): Promise<void> {
+    if (!this.closed) {
+      this.closed = true;
+      const error = new SpawnCancelledError("manager", reason);
+      for (const job of this.jobs.values()) if (!job.terminal) this.cancel(job.id, error);
+      this.queue.length = 0;
     }
-    this.queue.length = 0;
+    await Promise.allSettled([...this.executions]);
   }
 
   getHandle(id: string): SpawnHandle | undefined {
@@ -313,7 +326,8 @@ export class SpawnManager {
       ...(normalized.model === undefined ? {} : { model: normalized.model }),
       tools: normalized.tools,
       workspace: normalized.workspace,
-      workspaceReady: !normalized.isolated,
+      workspaceReady: normalized.workspaceReady,
+      workspaceReleased: false,
       handle,
       controller: new AbortController(),
       completion,
@@ -339,13 +353,15 @@ export class SpawnManager {
       job.handle.status = "running";
       job.handle.startedAt = this.now();
       this.active += 1;
-      void this.execute(job);
+      const execution = this.execute(job);
+      this.executions.add(execution);
+      void execution.then(() => this.executions.delete(execution), () => this.executions.delete(execution));
     }
   }
 
   private async execute(job: SpawnJob): Promise<void> {
     try {
-      if (job.request.isolated) await this.resolveWorkspace(job);
+      if (!job.workspaceReady) await this.resolveWorkspace(job);
       if (job.controller.signal.aborted) throw job.controller.signal.reason ?? new SpawnCancelledError(job.id);
       const executionRequest = withResolvedRequest(job.request, job.model, job.tools, job.workspace);
       const context = makeExecutorContext(job, this.emitReport.bind(this));
@@ -353,25 +369,34 @@ export class SpawnManager {
       if (job.controller.signal.aborted) throw job.controller.signal.reason ?? new SpawnCancelledError(job.id);
       const result = this.makeResult(job, output);
       const contractResult = this.applyOutputContract(job.request, result);
+      await this.releaseIsolatedWorkspace(job);
       this.finish(job, contractResult);
     } catch (error: unknown) {
+      try { await this.releaseIsolatedWorkspace(job); }
+      catch (cleanupError) { this.fail(job, cleanupError); return; }
       this.fail(job, error);
     }
   }
 
   private async resolveWorkspace(job: SpawnJob): Promise<void> {
     if (job.workspaceReady) return;
-    if (this.createWorkspace === undefined) {
-      throw new SpawnRequestError("isolated spawn requires createWorkspace", { id: job.id });
-    }
-    const created = await this.createWorkspace(job.request.workspace);
-    if (!created || typeof created.name !== "string" || created.name.trim().length === 0 ||
-      typeof created.path !== "string" || created.path.trim().length === 0) {
-      throw new SpawnRequestError("createWorkspace must return non-empty name and path", { id: job.id });
+    const requested = job.request.workspace;
+    const created = job.request.isolated
+      ? await this.createWorkspace?.(requested, job.request.task, job.controller.signal)
+      : requested === undefined ? undefined : await this.resolveNamedWorkspace?.(requested);
+    if (!created || typeof created.name !== "string" || created.name.trim().length === 0 || typeof created.path !== "string" || created.path.trim().length === 0) {
+      throw new SpawnRequestError(job.request.isolated ? "createWorkspace must return non-empty name and path" : "workspace must name an existing workspace", { id: job.id, workspace: requested });
     }
     job.workspace = created.path;
     job.handle.workspace = created.path;
+    if (job.request.isolated) job.workspaceName = created.name;
     job.workspaceReady = true;
+  }
+
+  private async releaseIsolatedWorkspace(job: SpawnJob): Promise<void> {
+    if (job.workspaceReleased || job.workspaceName === undefined || this.releaseWorkspace === undefined) return;
+    job.workspaceReleased = true;
+    await this.releaseWorkspace(job.workspaceName);
   }
 
   private makeResult(job: SpawnJob, output: unknown): SpawnResult {
@@ -447,12 +472,14 @@ export class SpawnManager {
     tools: readonly string[];
     workspace: string;
     isolated: boolean;
+    workspaceReady: boolean;
   } {
     if (!request || typeof request !== "object") throw new SpawnRequestError("spawn request is required");
     assertNonEmptyString(request.task, "task");
     if (request.context !== undefined && typeof request.context !== "string") {
       throw new SpawnRequestError("context must be a string when provided");
     }
+    if (request.acp !== undefined) assertNonEmptyString(request.acp, "acp");
     if (request.model !== undefined) assertNonEmptyString(request.model, "model");
     if (request.label !== undefined) assertNonEmptyString(request.label, "label");
     if (request.workspace !== undefined) assertNonEmptyString(request.workspace, "workspace");
@@ -486,7 +513,8 @@ export class SpawnManager {
     }
 
     const model = request.model ?? parent?.model ?? this.defaultModel;
-    const tools = request.tools ?? parent?.tools ?? this.availableTools ?? [];
+    const inheritedTools = request.tools ?? parent?.tools ?? this.availableTools ?? [];
+    const tools = depth >= this.maxDepth ? inheritedTools.filter((tool) => tool !== "spawn") : [...inheritedTools];
     if (this.availableTools !== undefined) {
       const allowed = new Set(this.availableTools);
       for (const tool of tools) {
@@ -502,12 +530,11 @@ export class SpawnManager {
       }
     }
 
-    const isolated = request.isolated ?? false;
-    if (isolated && this.createWorkspace === undefined) {
-      throw new SpawnRequestError("isolated spawn requires createWorkspace");
-    }
+    const isolated = request.isolated ?? (request.workspace === undefined && this.createWorkspace !== undefined);
+    if (isolated && this.createWorkspace === undefined) throw new SpawnRequestError("isolated spawn requires createWorkspace");
+    if (!isolated && request.workspace !== undefined && this.resolveNamedWorkspace === undefined) throw new SpawnRequestError("named workspace spawn requires resolveWorkspace");
     const workspace = request.workspace ?? parent?.workspace ?? this.defaultWorkspace;
-    const normalizedRequest = { ...request };
+    const normalizedRequest = { ...request, isolated };
     return {
       request: normalizedRequest,
       depth,
@@ -515,6 +542,7 @@ export class SpawnManager {
       tools,
       workspace,
       isolated,
+      workspaceReady: !isolated && request.workspace === undefined,
     };
   }
 
@@ -544,6 +572,7 @@ export class SpawnManager {
 function makeExecutorContext(job: SpawnJob, emit: (id: string, message: string) => void): SpawnExecutorContext {
   const parentId = job.parent?.id ?? job.parent?.parentId;
   return {
+    id: job.workspaceName ?? job.id,
     signal: job.controller.signal,
     ...(parentId === undefined ? {} : { parentId }),
     depth: job.depth,

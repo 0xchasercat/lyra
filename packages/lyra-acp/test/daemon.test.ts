@@ -34,8 +34,8 @@ describe("ACP stdio daemon", () => {
   test("recovers from malformed input, unknown methods, deadline, and client cancellation", async () => {
     const writer = new Writer();
     const handlers: AcpHandlers = {
-      "session/load": async () => await new Promise(() => {}),
-      "session/prompt": async (_params, context) => await new Promise((_resolve, reject) => context.signal.addEventListener("abort", () => reject(context.signal.reason), { once: true })),
+      "session/load": async (_params, context) => { const { promise, reject } = Promise.withResolvers<never>(); context.signal.addEventListener("abort", () => reject(context.signal.reason), { once: true }); return promise; },
+      "session/prompt": async (_params, context) => { const { promise, reject } = Promise.withResolvers<never>(); context.signal.addEventListener("abort", () => reject(context.signal.reason), { once: true }); return promise; },
     };
     const daemon = new AcpDaemon({ handlers, requestTimeoutMs: 20 });
     await daemon.handleLine("{bad", writer);
@@ -49,6 +49,19 @@ describe("ACP stdio daemon", () => {
     expect(messages.find((message) => message.id === 2)?.error).toMatchObject({ code: -32601 });
     expect(messages.find((message) => message.id === 3)?.error).toMatchObject({ code: -32001 });
     expect(messages.find((message) => message.id === 4)?.error).toMatchObject({ code: -32800 });
+    await daemon.close();
+  });
+
+  test("rejects oversized frames and caps concurrent state-changing requests", async () => {
+    const writer = new Writer();
+    const daemon = new AcpDaemon({ handlers: { "session/load": async (_params, context) => { const { promise, reject } = Promise.withResolvers<never>(); context.signal.addEventListener("abort", () => reject(context.signal.reason), { once: true }); return promise; } }, maxFrameBytes: 128, maxConcurrentRequests: 1 });
+    await daemon.handleLine("x".repeat(129), writer);
+    await daemon.handleLine(JSON.stringify({ jsonrpc: "2.0", id: 1, method: "session/load" }));
+    await daemon.handleLine(JSON.stringify({ jsonrpc: "2.0", id: 2, method: "session/load" }));
+    await daemon.handleLine(JSON.stringify({ jsonrpc: "2.0", method: "$/cancelRequest", params: { id: 1 } }));
+    await settle();
+    expect(writer.messages().find((message) => message.id === null)?.error).toMatchObject({ code: -32003 });
+    expect(writer.messages().find((message) => message.id === 2)?.error).toMatchObject({ code: -32002 });
     await daemon.close();
   });
 

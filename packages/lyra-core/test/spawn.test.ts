@@ -86,21 +86,42 @@ test("queues work at max concurrency and drains in order", async () => {
 
 test("creates isolated workspaces and passes resolved context", async () => {
   const calls: Array<string | undefined> = [];
+  const tasks: Array<string | undefined> = [];
+  const released: string[] = [];
+  let peer = "";
   const manager = track(new SpawnManager({
     defaultWorkspace: "/repo",
-    createWorkspace: async (name) => {
+    createWorkspace: async (name, task) => {
       calls.push(name);
+      tasks.push(task);
       return { name: "copy", path: "/repo-copy" };
     },
-    executor: async (_request, context) => context.workspace,
+    releaseWorkspace: async (name) => { released.push(name); },
+    executor: async (_request, context) => { peer = context.id; return context.workspace; },
   }));
 
-  const handle = manager.spawn({ task: "build", isolated: true, workspace: "requested-name" });
+  const handle = manager.spawn({ task: "build" });
   const result = await manager.wait(handle);
-  expect(calls).toEqual(["requested-name"]);
+  expect(calls).toEqual([undefined]);
   expect(handle.workspace).toBe("/repo-copy");
+  expect(tasks).toEqual(["build"]);
   expect(result.workspace).toBe("/repo-copy");
   expect(result.output).toBe("/repo-copy");
+  expect(released).toEqual(["copy"]);
+  expect(peer).toBe("copy");
+});
+
+test("resolves an explicit existing workspace without releasing it", async () => {
+  const released: string[] = [];
+  const manager = track(new SpawnManager({
+    defaultWorkspace: "/repo",
+    resolveWorkspace: async (name) => ({ name, path: `/repo/${name}` }),
+    releaseWorkspace: async (name) => { released.push(name); },
+    executor: async (_request, context) => context.workspace,
+  }));
+  const result = await manager.spawn({ task: "continue", workspace: "amber-arch", blocking: true });
+  expect(result).toMatchObject({ workspace: "/repo/amber-arch", output: "/repo/amber-arch" });
+  expect(released).toEqual([]);
 });
 
 test("strict schema rejects and permissive schema preserves output with diagnostics", async () => {
@@ -142,7 +163,7 @@ test("inherits model and tools from parent context", async () => {
   const seen: Array<{ model?: string; tools: readonly string[] }> = [];
   const manager = track(new SpawnManager({
     defaultWorkspace: "/repo",
-    availableTools: ["read", "write"],
+    availableTools: ["read", "write", "spawn"],
     defaultModel: "@default",
     executor: async (_request, context) => {
       seen.push({ model: context.model, tools: context.tools });
@@ -153,6 +174,8 @@ test("inherits model and tools from parent context", async () => {
   await manager.spawn({ task: "child", blocking: true }, { depth: 1, model: "@parent", tools: ["read"] });
   expect(seen).toEqual([{ model: "@parent", tools: ["read"] }]);
   expect(() => manager.spawn({ task: "widen", tools: ["write"] }, { depth: 1, model: "@parent", tools: ["read"] })).toThrow(/parent/);
+  await manager.spawn({ task: "depth cap", blocking: true }, { depth: 1, model: "@parent", tools: ["read", "spawn"] });
+  expect(seen.at(-1)).toEqual({ model: "@parent", tools: ["read"] });
 });
 
 function track(manager: SpawnManager): SpawnManager {

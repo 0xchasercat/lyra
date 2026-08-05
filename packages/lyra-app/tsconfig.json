@@ -1,0 +1,11 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": { "composite": true, "rootDir": "src", "outDir": "dist" },
+  "references": [
+    { "path": "../lyra-acp" }, { "path": "../lyra-core" }, { "path": "../lyra-git" },
+    { "path": "../lyra-host" }, { "path": "../lyra-lsp" }, { "path": "../lyra-mcp" },
+    { "path": "../lyra-provider" }, { "path": "../lyra-runtime" }, { "path": "../lyra-session" },
+    { "path": "../lyra-skills" }, { "path": "../lyra-tools" }
+  ],
+  "include": ["src/**/*.ts"]
+}

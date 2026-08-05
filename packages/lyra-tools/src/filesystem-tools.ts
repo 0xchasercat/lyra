@@ -187,8 +187,14 @@ export class ReadTool extends FileToolBase {
       const { store, budget } = this.runtime(context);
       if (isArtifactUri(pathValue)) {
         const bytes = await store.read(pathValue);
-        const mime = pathValue.toLowerCase().endsWith(".json") ? "application/octet-stream" : "application/octet-stream";
-        return ok(await boundText(new TextDecoder().decode(bytes), store, { budget, mimeType: mime, name: pathValue }));
+        const metadata = await store.metadata?.(pathValue);
+        const mime = metadata?.mimeType ?? "application/octet-stream";
+        if (mime.startsWith("image/")) return ok(await boundImage(bytes, mime, metadata?.name ?? pathValue, store, budget));
+        let text: string;
+        try { text = new TextDecoder("utf-8", { fatal: true }).decode(bytes); }
+        catch { return fail(`Artifact ${pathValue} is binary ${mime} data; use the artifact URI to retrieve its complete ${bytes.byteLength} bytes.`); }
+        if (bytes.includes(0)) return fail(`Artifact ${pathValue} is binary ${mime} data; use the artifact URI to retrieve its complete ${bytes.byteLength} bytes.`);
+        return ok(await boundText(text, store, { budget, mimeType: mime, name: metadata?.name ?? pathValue }));
       }
       if (/^https?:\/\//i.test(pathValue)) {
         const response = await fetch(pathValue, { signal: context?.signal });

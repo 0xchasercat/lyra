@@ -1,5 +1,6 @@
+import { ProcessHost } from "@lyra/host";
 import { describe, expect, test } from "bun:test";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -13,7 +14,6 @@ import {
   ReadTool,
   WriteTool,
   createDefaultToolRegistry,
-  bashJobs,
 } from "../src/index.ts";
 
 async function command(args: string[], cwd?: string): Promise<number> {
@@ -75,6 +75,11 @@ describe("core tool behavior", () => {
       const artifactContent = new TextDecoder().decode(await store.read(artifact!));
       expect(artifactContent).toContain("[a.txt");
       expect(artifactContent.length).toBeGreaterThan(32);
+      const binaryArtifact = await store.put(new Uint8Array([0xff, 0x00, 0x41]), { mimeType: "application/octet-stream", name: "payload.bin" });
+      const binaryRead = await new ReadTool({ root, artifactStore: store }).execute({ path: binaryArtifact }, context);
+      expect(binaryRead.isError).toBe(true);
+      expect(binaryRead.content.toString()).toContain(binaryArtifact);
+      expect([...await store.read(binaryArtifact)]).toEqual([0xff, 0x00, 0x41]);
       const escape = await new ReadTool({ root, artifactStore: store }).execute({ path: "../outside.txt" }, context);
       expect(escape.isError).toBe(true);
       const invalid = await new GrepTool({ root, artifactStore: store }).execute({ path: ".", pattern: "[" }, context);
@@ -89,8 +94,9 @@ describe("core tool behavior", () => {
   test("bash and git preserve status, errors, and destructive activity", async () => {
     const { root, store, context } = await fixture();
     const events: unknown[] = [];
+    const processes = new ProcessHost();
+    const bash = new BashTool({ root, artifactStore: store, processHost: processes, activity: (event) => events.push(event) });
     try {
-      const bash = new BashTool({ root, artifactStore: store, activity: (event) => events.push(event) });
       const ok = await bash.execute({ command: "printf 'hello'" }, context);
       expect(ok.isError).not.toBe(true);
       expect(ok.content.toString()).toContain("hello");
@@ -100,8 +106,8 @@ describe("core tool behavior", () => {
       const heavy = await bash.execute({ command: "sleep 0.01" }, context);
       expect(heavy.metadata).toMatchObject({ heavy: true });
       const jobId = String(heavy.metadata?.jobId);
-      expect(jobId).toStartWith("bash-");
-      await bashJobs.get(jobId)?.promise;
+      expect(jobId).toStartWith("job-");
+      await processes.wait(jobId);
       await command(["git", "init", "-q", root]);
       await writeFile(join(root, "tracked.txt"), "tracked\n");
       const git = new GitTool({ root, artifactStore: store, activity: (event) => events.push(event) });
@@ -112,7 +118,19 @@ describe("core tool behavior", () => {
       expect(invalid.isError).toBe(true);
       const activity = events as Array<{ type?: string }>;
       expect(activity.some((event) => event.type === "git_started")).toBe(true);
-    } finally { await dispose(root); }
+    } finally { await processes.close(); await dispose(root); }
+  });
+
+  test("git refuses an in-workspace cwd symlink targeting another repository", async () => {
+    const { root, store, context } = await fixture();
+    const outside = await mkdtemp(join(tmpdir(), "lyra-tools-outside-"));
+    try {
+      await command(["git", "init", "-q", outside]);
+      await symlink(outside, join(root, "external-repo"), "dir");
+      const result = await new GitTool({ root, artifactStore: store }).execute({ args: ["status"], cwd: "external-repo" }, context);
+      expect(result.isError).toBe(true);
+      expect(result.content.toString()).toContain("escapes the workspace");
+    } finally { await Promise.all([dispose(root), dispose(outside)]); }
   });
 
   test("default registry never throws for malformed inputs", async () => {

@@ -16,6 +16,23 @@
         "@lyra/core": "workspace:*",
       },
     },
+    "packages/lyra-app": {
+      "name": "@lyra/app",
+      "version": "0.1.0",
+      "dependencies": {
+        "@lyra/acp": "workspace:*",
+        "@lyra/core": "workspace:*",
+        "@lyra/git": "workspace:*",
+        "@lyra/host": "workspace:*",
+        "@lyra/lsp": "workspace:*",
+        "@lyra/mcp": "workspace:*",
+        "@lyra/provider": "workspace:*",
+        "@lyra/runtime": "workspace:*",
+        "@lyra/session": "workspace:*",
+        "@lyra/skills": "workspace:*",
+        "@lyra/tools": "workspace:*",
+      },
+    },
     "packages/lyra-core": {
       "name": "@lyra/core",
       "version": "0.1.0",
@@ -100,12 +117,15 @@
       "dependencies": {
         "@lyra/core": "workspace:*",
         "@lyra/edit": "workspace:*",
+        "@lyra/host": "workspace:*",
         "@lyra/provider": "workspace:*",
       },
     },
   },
   "packages": {
     "@lyra/acp": ["@lyra/acp@workspace:packages/lyra-acp"],
+
+    "@lyra/app": ["@lyra/app@workspace:packages/lyra-app"],
 
     "@lyra/core": ["@lyra/core@workspace:packages/lyra-core"],
 

@@ -20,6 +20,8 @@ export class RuntimeManager {
   readonly #requestTimeoutMs: number;
   readonly #runTimeoutMs: number;
   #sequence = 0;
+  readonly #children = new Set<Bun.Subprocess>();
+  #closed = false;
 
   constructor(options: RuntimeManagerOptions) {
     if (!options || typeof options !== "object") throw new TypeError("Runtime manager options are required.");
@@ -73,6 +75,7 @@ export class RuntimeManager {
   }
 
   async run(name: string, input: unknown = null): Promise<RuntimeRunResult> {
+    if (this.#closed) throw new Error("Runtime manager is closed.");
     const scriptPath = this.scriptPath(name);
     await stat(scriptPath).catch((error: unknown) => { throw new Error(`Runtime script ${name} does not exist: ${message(error)}.`); });
     const checkpoint = await this.checkpoints.load(name);
@@ -82,6 +85,7 @@ export class RuntimeManager {
     const wrapper = `try {\n  const module = await import(${JSON.stringify(scriptPath)});\n  const envelope = JSON.parse(await Bun.stdin.text());\n  const output = typeof module.default === "function" ? await module.default(envelope.input, { checkpoint: envelope.checkpoint }) : (module.default ?? null);\n  process.stdout.write(JSON.stringify({ ok: true, output }) + "\\n");\n} catch (error) {\n  process.stdout.write(JSON.stringify({ ok: false, error: error instanceof Error ? error.stack ?? error.message : String(error) }) + "\\n");\n  process.exitCode = 1;\n}\n`;
     await writeFile(runnerPath, wrapper, { flag: "wx", mode: 0o600 });
     let server: ReturnType<typeof Bun.serve> | undefined;
+    let child: Bun.Subprocess<"pipe", "pipe", "pipe"> | undefined;
     try {
       const result = await Bun.build({
         entrypoints: [runnerPath],
@@ -98,17 +102,16 @@ export class RuntimeManager {
         port: 0,
         fetch: async (request) => this.handleBridge(request, token, name),
       });
-      const child = Bun.spawn([process.execPath, result.outputs[0]!.path], {
+      child = Bun.spawn([process.execPath, result.outputs[0]!.path], {
         cwd: this.origin,
         env: { ...process.env, LYRA_RUNTIME_URL: `http://127.0.0.1:${server.port}/`, LYRA_RUNTIME_TOKEN: token },
-        stdin: "pipe",
-        stdout: "pipe",
-        stderr: "pipe",
+        stdin: "pipe", stdout: "pipe", stderr: "pipe", detached: true,
       });
+      this.#children.add(child);
       child.stdin.write(JSON.stringify({ input: jsonClone(input), checkpoint }));
       child.stdin.end();
       let timedOut = false;
-      const timer = setTimeout(() => { timedOut = true; child.kill(); }, this.#runTimeoutMs);
+      const timer = setTimeout(() => { timedOut = true; killTree(child!, "SIGTERM"); }, this.#runTimeoutMs);
       const [stdout, stderr, exitCode] = await Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited]).finally(() => clearTimeout(timer));
       if (timedOut) return { ok: false, stderr, exitCode, checkpoint: await this.checkpoints.load(name), error: `Runtime ${name} exceeded ${this.#runTimeoutMs}ms and was cancelled.` };
       const lines = stdout.trim().split("\n").filter(Boolean);
@@ -120,10 +123,13 @@ export class RuntimeManager {
       if ((envelope as { ok: boolean }).ok) return { ok: exitCode === 0, output: (envelope as { output?: unknown }).output, stderr, exitCode, ...(saved === undefined ? {} : { checkpoint: saved }), ...(exitCode === 0 ? {} : { error: `Runtime ${name} exited with code ${exitCode}.` }) };
       return { ok: false, stderr, exitCode, ...(saved === undefined ? {} : { checkpoint: saved }), error: String((envelope as { error?: unknown }).error ?? `Runtime ${name} failed.`) };
     } finally {
+      if (child) { await reapTree(child); this.#children.delete(child); }
       server?.stop(true);
       await Promise.allSettled([rm(runnerPath, { force: true }), rm(buildDirectory, { recursive: true, force: true })]);
     }
   }
+
+  async close(): Promise<void> { this.#closed = true; const children = [...this.#children]; for (const child of children) killTree(child, "SIGTERM"); await Promise.allSettled(children.map((child) => child.exited)); }
 
   scriptPath(name: string): string { validateRuntimeName(name); return join(this.directory, `${name}.ts`); }
 
@@ -134,24 +140,24 @@ export class RuntimeManager {
       if (!body || typeof body !== "object" || typeof (body as { method?: unknown }).method !== "string") throw new TypeError("Runtime bridge request needs a method string.");
       const method = (body as { method: string }).method;
       const args = (body as { args?: unknown }).args;
-      const result = await deadline(this.dispatch(method, args, runtimeName), this.#requestTimeoutMs, method);
+      const result = await deadline((signal) => this.dispatch(method, args, runtimeName, signal), this.#requestTimeoutMs, method);
       return Response.json({ ok: true, result });
     } catch (error) { return Response.json({ ok: false, error: message(error) }, { status: 400 }); }
   }
 
-  private async dispatch(method: string, args: unknown, runtimeName: string): Promise<unknown> {
-    if (method === "spawn") return this.#adapters.spawn(args);
+  private async dispatch(method: string, args: unknown, runtimeName: string, signal: AbortSignal): Promise<unknown> {
+    if (method === "spawn") return this.#adapters.spawn(args, signal);
     if (method === "exec") {
       if (!args || typeof args !== "object" || typeof (args as { command?: unknown }).command !== "string") throw new TypeError("exec requires a command string.");
-      return this.#adapters.exec((args as { command: string }).command, (args as { options?: unknown }).options);
+      return this.#adapters.exec((args as { command: string }).command, (args as { options?: unknown }).options, signal);
     }
-    if (method.startsWith("tool.") && TOOL_METHODS.has(method.slice(5) as never)) return this.#adapters.tool(method.slice(5) as "read" | "write" | "edit" | "glob" | "grep", args);
-    if (method.startsWith("irc.") && IRC_METHODS.has(method.slice(4) as never)) return this.#adapters.irc(method.slice(4) as "send" | "publish" | "wait", args);
-    if (method.startsWith("git.") && GIT_METHODS.has(method.slice(4) as never)) return this.#adapters.git(method.slice(4) as "preview" | "apply" | "rollback", args);
-    if (method.startsWith("workspace.") && WORKSPACE_METHODS.has(method.slice(10) as never)) return this.#adapters.workspace(method.slice(10) as "create" | "list" | "drop", args);
+    if (method.startsWith("tool.") && TOOL_METHODS.has(method.slice(5) as never)) return this.#adapters.tool(method.slice(5) as "read" | "write" | "edit" | "glob" | "grep", args, signal);
+    if (method.startsWith("irc.") && IRC_METHODS.has(method.slice(4) as never)) return this.#adapters.irc(method.slice(4) as "send" | "publish" | "wait", args, signal);
+    if (method.startsWith("git.") && GIT_METHODS.has(method.slice(4) as never)) return this.#adapters.git(method.slice(4) as "preview" | "apply" | "rollback", args, signal);
+    if (method.startsWith("workspace.") && WORKSPACE_METHODS.has(method.slice(10) as never)) return this.#adapters.workspace(method.slice(10) as "create" | "list" | "drop", args, signal);
     if (method === "report") {
       if (!args || typeof args !== "object" || typeof (args as { message?: unknown }).message !== "string") throw new TypeError("report requires a message string.");
-      await this.#adapters.report((args as { message: string }).message); return null;
+      await this.#adapters.report((args as { message: string }).message, signal); return null;
     }
     if (method === "checkpoint") {
       if (!args || typeof args !== "object" || !("state" in args)) throw new TypeError("checkpoint requires state.");
@@ -164,8 +170,11 @@ export class RuntimeManager {
 function positive(value: number, label: string): number { if (!Number.isSafeInteger(value) || value < 1) throw new RangeError(`${label} must be a positive integer.`); return value; }
 function message(error: unknown): string { return error instanceof Error ? error.message : String(error); }
 function jsonClone<T>(value: T): T { try { return JSON.parse(JSON.stringify(value)) as T; } catch { throw new TypeError("Runtime input must be JSON-serializable."); } }
-async function deadline<T>(promise: Promise<T>, timeoutMs: number, method: string): Promise<T> {
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  const timeout = new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error(`Runtime method ${method} exceeded ${timeoutMs}ms.`)), timeoutMs); });
-  try { return await Promise.race([promise, timeout]); } finally { if (timer !== undefined) clearTimeout(timer); }
+async function deadline<T>(work: (signal: AbortSignal) => Promise<T>, timeoutMs: number, method: string): Promise<T> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(new Error(`Runtime method ${method} exceeded ${timeoutMs}ms.`)), timeoutMs);
+  try { return await Promise.race([work(controller.signal), abortPromise(controller.signal)]); } finally { clearTimeout(timer); }
 }
+function abortPromise(signal: AbortSignal): Promise<never> { if (signal.aborted) return Promise.reject(signal.reason); const { promise, reject } = Promise.withResolvers<never>(); signal.addEventListener("abort", () => reject(signal.reason), { once: true }); return promise; }
+function killTree(child: Bun.Subprocess, signal: "SIGTERM" | "SIGKILL"): void { if (typeof child.pid === "number" && child.pid > 1) { try { process.kill(-child.pid, signal); } catch {} } try { child.kill(signal); } catch {} }
+async function reapTree(child: Bun.Subprocess): Promise<void> { if (typeof child.pid !== "number" || child.pid <= 1) return; try { process.kill(-child.pid, 0); } catch { return; } killTree(child, "SIGTERM"); await Bun.sleep(150); try { process.kill(-child.pid, 0); killTree(child, "SIGKILL"); } catch {} }

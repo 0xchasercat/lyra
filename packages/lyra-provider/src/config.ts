@@ -30,18 +30,18 @@ export interface ResolvedProvider extends HttpTransportConfig {
   models: string[];
 }
 
-export async function loadProviderConfig(path?: string): Promise<ProviderFileConfig> {
-  const defaults = defaultProviderConfig();
-  if (path === undefined) return defaults;
-  const file = Bun.file(resolve(path));
-  if (!(await file.exists())) return defaults;
-  let parsed: unknown;
-  try {
-    parsed = Bun.TOML.parse(await file.text());
-  } catch (cause) {
-    throw new Error(`Invalid Lyra TOML at ${path}: ${messageFrom(cause)}`, { cause });
+export async function loadProviderConfig(path?: string | readonly string[]): Promise<ProviderFileConfig> {
+  let output = defaultProviderConfig();
+  const paths = path === undefined ? [] : typeof path === "string" ? [path] : path;
+  for (const candidate of paths) {
+    const file = Bun.file(resolve(candidate));
+    if (!(await file.exists())) continue;
+    let parsed: unknown;
+    try { parsed = Bun.TOML.parse(await file.text()); }
+    catch (cause) { throw new Error(`Invalid Lyra TOML at ${candidate}: ${messageFrom(cause)}`, { cause }); }
+    output = mergeProviderConfig(output, parsed);
   }
-  return mergeProviderConfig(defaults, parsed);
+  return output;
 }
 
 export function defaultProviderConfig(): ProviderFileConfig {
@@ -158,6 +158,7 @@ function parseAuth(provider: string, value: unknown): AuthConfig {
   if (value.type === "none") return { type: "none" };
   if (value.type === "env" && typeof value.var === "string") return { type: "env", var: value.var };
   if (value.type === "plugin" && typeof value.plugin === "string") {
+    if (!/^[a-z][a-z0-9-]{0,63}$/.test(value.plugin)) throw new Error(`Provider ${provider} auth plugin id is invalid`);
     return { type: "plugin", plugin: value.plugin };
   }
   throw new Error(`Provider ${provider} has invalid auth configuration for type ${value.type}`);
