@@ -348,9 +348,10 @@ impl Renderer {
         height: usize,
     ) -> RenderBatch {
         if let Some(row) = state.rows.last_mut()
-            && row.kind == RowKind::Assistant {
-                row.text.push_str(chunk);
-            }
+            && row.kind == RowKind::Assistant
+        {
+            row.text.push_str(chunk);
+        }
         self.render(state, width, height)
     }
 }

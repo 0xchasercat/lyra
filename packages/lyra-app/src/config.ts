@@ -14,7 +14,7 @@ const DEFAULT_VALUES: LyraConfig = { roles: {}, exec: { heavy: Math.min(navigato
 export const DEFAULT_CONFIG: LyraConfig = Object.freeze(DEFAULT_VALUES);
 export async function loadConfig(workspace: string, home = homedir()): Promise<LyraConfig> {
   let output = structuredClone(DEFAULT_CONFIG);
-  for (const path of [join(resolve(home), ".lyra", "config.toml"), join(resolve(workspace), ".lyra", "config.toml")]) {
+  for (const path of [join(resolve(home), ".lyra", "config.toml"), join(resolve(home), ".lyra", "providers.toml"), join(resolve(workspace), ".lyra", "config.toml")]) {
     try { output = applyConfig(output, parseToml(await readFile(path, "utf8"), path), path); }
     catch (error) { if (!(error instanceof Error && "code" in error && error.code === "ENOENT")) throw error; }
   }

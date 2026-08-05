@@ -1,3 +1,4 @@
+import { existsSync, realpathSync } from "node:fs";
 import { copyFile, mkdir, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -5,7 +6,11 @@ import { randomBytes } from "node:crypto";
 import { CheckpointStore, validateRuntimeName } from "./checkpoint.ts";
 import type { RuntimeAdapters, RuntimeManagerOptions, RuntimeRunResult, RuntimeScriptRecord } from "./types.ts";
 
-const CLIENT_PATH = fileURLToPath(new URL("./runtime-client.ts", import.meta.url));
+const EXECUTABLE_ROOT = dirname(realpathSync(process.execPath));
+const PACKAGED_CLIENT = join(EXECUTABLE_ROOT, "runtime-client.ts");
+const PACKAGED_RUNNER = join(EXECUTABLE_ROOT, process.platform === "win32" ? "lyra-jit-runner.exe" : "lyra-jit-runner");
+const CLIENT_PATH = process.env.LYRA_RUNTIME_CLIENT ?? (existsSync(PACKAGED_CLIENT) ? PACKAGED_CLIENT : fileURLToPath(new URL("./runtime-client.ts", import.meta.url)));
+const JIT_RUNNER = process.env.LYRA_JIT_RUNNER ?? (existsSync(PACKAGED_RUNNER) ? PACKAGED_RUNNER : process.execPath);
 const TOOL_METHODS = new Set(["read", "write", "edit", "glob", "grep"] as const);
 const IRC_METHODS = new Set(["send", "publish", "wait"] as const);
 const GIT_METHODS = new Set(["preview", "apply", "rollback"] as const);
@@ -102,7 +107,7 @@ export class RuntimeManager {
         port: 0,
         fetch: async (request) => this.handleBridge(request, token, name),
       });
-      child = Bun.spawn([process.execPath, result.outputs[0]!.path], {
+      child = Bun.spawn([JIT_RUNNER, result.outputs[0]!.path], {
         cwd: this.origin,
         env: { ...process.env, LYRA_RUNTIME_URL: `http://127.0.0.1:${server.port}/`, LYRA_RUNTIME_TOKEN: token },
         stdin: "pipe", stdout: "pipe", stderr: "pipe", detached: true,

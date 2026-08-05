@@ -10,6 +10,7 @@ export async function createEnvironmentProvider(options: EnvironmentProviderOpti
 }
 
 export function createConfiguredProvider(config: ProviderFileConfig, options: Omit<EnvironmentProviderOptions, "configPath" | "configPaths"> = {}): EnvironmentProvider {
+  if (options.model === undefined && config.roles.default === undefined) throw new Error("No default provider is configured. Run `lyra` in an interactive terminal for setup, export OPENAI_API_KEY or ANTHROPIC_API_KEY, or add a provider and [roles].default to Lyra TOML.");
   const reference = resolveModelRole(options.model ?? "@default", config.roles);
   const separator = reference.indexOf("/");
   if (separator <= 0 || separator === reference.length - 1) throw new Error(`Model ${reference} must use provider/model form.`);

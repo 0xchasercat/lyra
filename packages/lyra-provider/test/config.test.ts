@@ -11,6 +11,7 @@ import {
 import { discoverModels } from "../src/models.ts";
 import { PluginAuth } from "../src/plugin-auth.ts";
 import { StaticAuth } from "../src/auth.ts";
+import { KeychainAuth, storeKeychainCredential } from "../src/credentials.ts";
 
 const temporaryPaths: string[] = [];
 const servers: Bun.Server<unknown>[] = [];
@@ -77,6 +78,26 @@ fast = "local/local-model"
 
     expect(resolved.authHeader).toBe("x-api-key");
     expect(resolved.headers?.["anthropic-version"]).toBe("2023-06-01");
+  });
+
+  test("parses keychain and explicit plaintext auth when chosen", async () => {
+    const directory = await temporaryDirectory();
+    const path = join(directory, "providers.toml");
+    await Bun.write(path, `[providers.secure]\nbase_url = "https://secure.example/v1"\napi_type = "openai_completions"\nauth = { type = "keychain", service = "dev.lyra.secure", account = "operator" }\n[providers.explicit]\nbase_url = "https://explicit.example/v1"\napi_type = "openai_completions"\nauth = { type = "static", token = "chosen-plaintext" }\n`);
+    const config = await loadProviderConfig(path);
+    expect(config.providers.secure?.auth).toEqual({ type: "keychain", service: "dev.lyra.secure", account: "operator" });
+    expect(config.providers.explicit?.auth).toEqual({ type: "static", token: "chosen-plaintext" });
+    expect((await resolveProvider("explicit", config.providers.explicit!).auth?.getToken()).token).toBe("chosen-plaintext");
+  });
+
+  test("reads and writes OS keychain credentials through the command boundary", async () => {
+    const calls: Array<{ command: string; args: readonly string[] }> = [];
+    const run = async (command: string, args: readonly string[]) => { calls.push({ command, args }); return { exitCode: 0, stdout: "keychain-token\n", stderr: "" }; };
+    const auth = new KeychainAuth({ service: "dev.lyra.fixture", account: "operator", platform: "darwin", run });
+    expect((await auth.getToken()).token).toBe("keychain-token");
+    await storeKeychainCredential({ service: "dev.lyra.fixture", account: "operator" }, "stored-token", { platform: "darwin", run });
+    expect(calls[0]).toMatchObject({ command: "/usr/bin/security", args: ["find-generic-password", "-w", "-s", "dev.lyra.fixture", "-a", "operator"] });
+    expect(calls[1]?.args).toContain("stored-token");
   });
 });
 

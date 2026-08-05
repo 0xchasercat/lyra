@@ -22,6 +22,7 @@ import { createIntegratedToolRegistry } from "./integrated-tools.ts";
 import { parseLoopSpec, SoakRunner } from "./soak.ts";
 import { runExternalAcpAgent } from "./external-acp.ts";
 import { durationMs, loadConfig } from "./config.ts";
+import { providerConfigPaths } from "./provider-setup.ts";
 export interface LyraRuntimeOptions {
   origin?: string;
   session?: string;
@@ -43,7 +44,7 @@ export class LyraRuntime {
     const origin = resolve(options.origin ?? process.cwd());
     const sessionName = validName(options.session ?? `session-${Date.now().toString(36)}-${crypto.randomUUID().slice(0, 8)}`);
     const runtimeConfig = await loadConfig(origin, options.home);
-    let currentEnvironment = options.environment ?? await createEnvironmentProvider({ configPaths: [join(resolve(options.home ?? homedir()), ".lyra", "config.toml"), join(origin, ".lyra", "config.toml")], maxAttempts: runtimeConfig.reliability.max_retries, streamStallTimeoutMs: durationMs(runtimeConfig.reliability.stream_stall_timeout), turnTimeoutMs: durationMs(runtimeConfig.reliability.turn_timeout), ...(options.model === undefined ? {} : { model: options.model }) });
+    let currentEnvironment = options.environment ?? await createEnvironmentProvider({ configPaths: providerConfigPaths(origin, options.home), maxAttempts: runtimeConfig.reliability.max_retries, streamStallTimeoutMs: durationMs(runtimeConfig.reliability.stream_stall_timeout), turnTimeoutMs: durationMs(runtimeConfig.reliability.turn_timeout), ...(options.model === undefined ? {} : { model: options.model }) });
     let app: LyraApplication | undefined;
     let main: MainSession | undefined;
     const emitEvent = async (event: AgentEvent): Promise<void> => { const stats = event.type === "usage" ? await main?.stats().catch(() => undefined) : undefined; if (app) await app.acp.notify("session/update", { event, ...(stats === undefined ? {} : { stats }) }).catch(() => undefined); await options.onEvent?.(event); };

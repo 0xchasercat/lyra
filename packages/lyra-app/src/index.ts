@@ -6,4 +6,5 @@ export * from "./app.ts";
 export * from "./soak.ts";
 export * from "./provider.ts";
 export * from "./agent-executor.ts";
+export * from "./provider-setup.ts";
 export * from "./runtime.ts";

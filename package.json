@@ -8,6 +8,8 @@
     "test": "bun test",
     "typecheck": "tsc -b",
     "check": "bun run typecheck && bun test",
+    "build": "bun scripts/package.ts",
+    "install:local": "bun scripts/package.ts --install",
     "lyra": "bun packages/lyra-app/src/cli.ts"
   },
   "devDependencies": {

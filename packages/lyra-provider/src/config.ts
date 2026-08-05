@@ -1,6 +1,7 @@
 import { resolve } from "node:path";
 import type { AuthSource, HttpTransportConfig } from "./auth.ts";
-import { EnvironmentAuth, NoAuth } from "./auth.ts";
+import { EnvironmentAuth, NoAuth, StaticAuth } from "./auth.ts";
+import { KeychainAuth } from "./credentials.ts";
 import type { ProviderApiType } from "./types.ts";
 import { PluginAuth } from "./plugin-auth.ts";
 
@@ -9,6 +10,8 @@ export type WebSocketPreference = "auto" | "on" | "off";
 export type AuthConfig =
   | { type: "env"; var: string }
   | { type: "none" }
+  | { type: "static"; token: string }
+  | { type: "keychain"; service: string; account: string }
   | { type: "plugin"; plugin: string };
 
 export interface ProviderDefinition {
@@ -153,10 +156,12 @@ function parseDefinition(name: string, value: unknown): ProviderDefinition {
 
 function parseAuth(provider: string, value: unknown): AuthConfig {
   if (!isRecord(value) || typeof value.type !== "string") {
-    throw new Error(`Provider ${provider} requires auth = { type = "env" | "none" | "plugin", ... }`);
+    throw new Error(`Provider ${provider} requires auth = { type = "env" | "keychain" | "static" | "none" | "plugin", ... }`);
   }
   if (value.type === "none") return { type: "none" };
   if (value.type === "env" && typeof value.var === "string") return { type: "env", var: value.var };
+  if (value.type === "static" && typeof value.token === "string" && value.token.length > 0) return { type: "static", token: value.token };
+  if (value.type === "keychain" && typeof value.service === "string" && value.service.length > 0 && typeof value.account === "string" && value.account.length > 0) return { type: "keychain", service: value.service, account: value.account };
   if (value.type === "plugin" && typeof value.plugin === "string") {
     if (!/^[a-z][a-z0-9-]{0,63}$/.test(value.plugin)) throw new Error(`Provider ${provider} auth plugin id is invalid`);
     return { type: "plugin", plugin: value.plugin };
@@ -166,6 +171,8 @@ function parseAuth(provider: string, value: unknown): AuthConfig {
 
 function authSource(config: AuthConfig): AuthSource | undefined {
   if (config.type === "env") return new EnvironmentAuth(config.var);
+  if (config.type === "static") return new StaticAuth(config.token);
+  if (config.type === "keychain") return new KeychainAuth(config);
   if (config.type === "plugin") return new PluginAuth(config.plugin);
   return new NoAuth();
 }

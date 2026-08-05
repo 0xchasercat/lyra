@@ -1,9 +1,12 @@
 #!/usr/bin/env bun
+import { realpathSync } from "node:fs";
 import { access, readFile } from "node:fs/promises";
-import { basename, join, resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import { emitKeypressEvents } from "node:readline";
 import type { AcpDaemon } from "@lyra/acp";
 import type { AgentEvent, AgentTurnResult } from "@lyra/core";
+import { supportsOsKeychain } from "@lyra/provider";
+import { needsProviderSetup, ProviderSetupWizard, saveProviderSetup, type SavedProviderSetup } from "./provider-setup.ts";
 import { LyraRuntime } from "./runtime.ts";
 
 interface CliOptions { origin: string; session?: string; model?: string; prompt?: string; acp: boolean; help: boolean; allowAutoGit: boolean; }
@@ -11,35 +14,88 @@ interface UiRow { kind: "user" | "assistant" | "tool" | "notice" | "boundary"; t
 interface FrameRequest { project: string; branch: string; model: string; session: string; theme: string; accent: string; width: number; height: number; rows: UiRow[]; agents: string[]; queued: number; composer: string; streaming: boolean; input_tokens: number; context_tokens: number; context_window: number; cost_cents: number; elapsed_ms: number; retry?: { attempt: number; max_attempts: number; reason: string; remaining_ms: number }; }
 interface SessionStats { inputTokens: number; contextTokens: number; contextWindow: number; costCents: number; }
 
-const options = parseArgs(process.argv.slice(2));
-if (options.help) { process.stdout.write(helpText()); process.exit(0); }
-const runtimeOptions = { ...options, confirmAuto: async () => options.allowAutoGit };
-
-if (options.acp) {
-  const runtime = await LyraRuntime.create(runtimeOptions);
-  try { await runtime.app.acp.serve(Bun.stdin.stream(), { write: (data) => { process.stdout.write(data); } }); }
-  finally { await runtime.close(); }
-} else if (options.prompt !== undefined || !process.stdin.isTTY || !process.stdout.isTTY) {
-  let streamed = false;
-  const runtime = await LyraRuntime.create({ ...runtimeOptions, onReport: (message) => { process.stderr.write(`[report] ${message}\n`); }, onEvent: (event) => { if (event.type === "text_delta") { streamed = true; process.stdout.write(event.text); } } });
+async function main(): Promise<void> {
+  const options = parseArgs(process.argv.slice(2));
+  if (options.help) { process.stdout.write(helpText()); return; }
+  const runtimeOptions = { ...options, confirmAuto: async () => options.allowAutoGit };
+  if (options.acp) {
+    const runtime = await LyraRuntime.create(runtimeOptions);
+    try { await runtime.app.acp.serve(Bun.stdin.stream(), { write: (data) => { process.stdout.write(data); } }); }
+    finally { await runtime.close(); }
+  } else if (options.prompt !== undefined || !process.stdin.isTTY || !process.stdout.isTTY) {
+    let streamed = false;
+    const runtime = await LyraRuntime.create({ ...runtimeOptions, onReport: (message) => { process.stderr.write(`[report] ${message}\n`); }, onEvent: (event) => { if (event.type === "text_delta") { streamed = true; process.stdout.write(event.text); } } });
+    try { const prompt = options.prompt ?? await new Response(Bun.stdin.stream()).text(); const result = await runtime.prompt(prompt.trim()); if (!streamed) process.stdout.write(assistantText(result)); process.stdout.write("\n"); }
+    finally { await runtime.close(); }
+  } else await runInteractive(runtimeOptions);
+}
+async function runInteractive(cli: CliOptions & { confirmAuto(): Promise<boolean> }): Promise<void> {
+  const bridge = await TuiBridge.start();
+  let runtime: LyraRuntime | undefined;
   try {
-    const prompt = options.prompt ?? await new Response(Bun.stdin.stream()).text();
-    const result = await runtime.prompt(prompt.trim());
-    if (!streamed) process.stdout.write(assistantText(result));
-    process.stdout.write("\n");
-  } finally { await runtime.close(); }
-} else {
-  await runInteractive(runtimeOptions);
+    if (await needsProviderSetup(cli.origin, cli.model)) {
+      const configured = await new ProviderSetupUi(bridge, cli).run();
+      if (!configured) return;
+    }
+    runtime = await LyraRuntime.create(cli);
+    const client = await InProcessAcpClient.connect(runtime.app.acp);
+    const ui = new InteractiveUi(client, bridge, { project: basename(cli.origin), branch: await branchName(cli.origin), model: runtime.session.environment.model, session: runtime.session.descriptor.name, theme: runtime.app.config.tui.theme, accent: runtime.app.config.tui.accent });
+    client.onNotification((method, params) => { if (method === "session/update") void ui.update(params); });
+    await ui.run();
+  } finally { await bridge.close(); await runtime?.close(); process.stdout.write("\x1b[0m\x1b[?25h\n"); }
 }
 
-async function runInteractive(cli: CliOptions & { confirmAuto(): Promise<boolean> }): Promise<void> {
-  const runtime = await LyraRuntime.create(cli);
-  const client = await InProcessAcpClient.connect(runtime.app.acp);
-  const bridge = await TuiBridge.start();
-  const ui = new InteractiveUi(client, bridge, { project: basename(cli.origin), branch: await branchName(cli.origin), model: runtime.session.environment.model, session: runtime.session.descriptor.name, theme: runtime.app.config.tui.theme, accent: runtime.app.config.tui.accent });
-  client.onNotification((method, params) => { if (method === "session/update") void ui.update(params); });
-  try { await ui.run(); }
-  finally { await bridge.close(); await runtime.close(); process.stdout.write("\x1b[0m\x1b[?25h\n"); }
+class ProviderSetupUi {
+  readonly #wizard = new ProviderSetupWizard();
+  readonly #done = Promise.withResolvers<boolean>();
+  #composer = "";
+  #error = "";
+  #saved: SavedProviderSetup | undefined;
+  #tail: Promise<void> = Promise.resolve();
+  constructor(private readonly bridge: TuiBridge, private readonly cli: CliOptions) {}
+  async run(): Promise<boolean> {
+    emitKeypressEvents(process.stdin);
+    process.stdin.setRawMode?.(true);
+    process.stdin.resume();
+    process.stdin.on("keypress", this.#onKeypress);
+    process.stdout.on("resize", this.#onResize);
+    await this.render();
+    const result = await this.#done.promise;
+    process.stdin.off("keypress", this.#onKeypress);
+    process.stdout.off("resize", this.#onResize);
+    process.stdin.setRawMode?.(false);
+    return result;
+  }
+  readonly #onResize = (): void => { void this.render(); };
+  readonly #onKeypress = (text: string, key: { name?: string; ctrl?: boolean; meta?: boolean }): void => {
+    this.#tail = this.#tail.then(async () => {
+      if ((key.ctrl && key.name === "c") || key.name === "escape") { this.#done.resolve(false); return; }
+      if (key.name === "backspace") this.#composer = [...this.#composer].slice(0, -1).join("");
+      else if (key.name === "return") await this.submit();
+      else if (!key.ctrl && !key.meta && text && text >= " ") this.#composer += text;
+      await this.render();
+    }).catch((error) => { this.#error = error instanceof Error ? error.message : String(error); return this.render(); });
+  };
+  async submit(): Promise<void> {
+    this.#error = "";
+    if (this.#saved) { this.#done.resolve(true); return; }
+    const prompt = this.#wizard.current();
+    if (prompt.title === "Credential source" && this.#composer.trim() === "1" && !supportsOsKeychain()) throw new Error("No supported OS keychain is available. Choose environment or plaintext storage.");
+    if (!this.#wizard.complete) { this.#wizard.submit(this.#composer); this.#composer = ""; }
+    if (this.#wizard.complete) this.#saved = await saveProviderSetup(this.#wizard.result());
+  }
+  render(): Promise<void> {
+    const prompt = this.#wizard.current();
+    const rows: UiRow[] = [
+      { kind: "user", text: "First run · provider setup" },
+      ...this.#wizard.answers.map((answer) => ({ kind: "notice" as const, text: answer })),
+      { kind: "assistant", text: `${prompt.title}\n${prompt.detail}${prompt.options ? `\n\n${prompt.options.join("\n")}` : ""}${prompt.defaultValue ? `\n\nDefault · ${prompt.defaultValue}` : ""}` },
+      ...(this.#error ? [{ kind: "notice" as const, text: `Setup error · ${this.#error}` }] : []),
+      ...(this.#saved ? [{ kind: "notice" as const, text: `Saved · ${this.#saved.path}\nAuth · ${this.#saved.auth}\nPress Enter to start.` }] : []),
+    ];
+    const composer = prompt.secret ? "•".repeat([...this.#composer].length) : this.#composer;
+    return this.bridge.render({ project: basename(this.cli.origin), branch: "setup", model: this.#saved ? `${this.#saved.provider}/${this.#saved.model}` : "provider required", session: "first-run", theme: "graphite", accent: "#7aa2f7", width: process.stdout.columns ?? 80, height: process.stdout.rows ?? 24, rows, agents: [], queued: 0, composer, streaming: false, input_tokens: 0, context_tokens: 0, context_window: 0, cost_cents: 0, elapsed_ms: 0 }).then((frame) => { process.stdout.write(frame); });
+  }
 }
 
 class InteractiveUi {
@@ -186,11 +242,13 @@ class TuiBridge {
   #buffer = "";
   private constructor(process: Bun.Subprocess<"pipe", "pipe", "inherit">) { this.#process = process; this.#reader = this.read(); }
   static async start(): Promise<TuiBridge> {
-    const root = resolve(import.meta.dir, "../../..");
-    const packaged = join(import.meta.dir, "../../lyra-tui", "native", `${process.platform}-${process.arch}`, "lyra-tui");
-    const binary = process.env.LYRA_TUI_BIN ? resolve(process.env.LYRA_TUI_BIN) : packaged;
-    try { await access(binary); } catch { throw new Error(`Native Flywheel TUI is unavailable for ${process.platform}-${process.arch}. Reinstall Lyra with the matching platform package.`); }
-    const child = Bun.spawn([binary], { cwd: root, stdin: "pipe", stdout: "pipe", stderr: "inherit" });
+    const name = process.platform === "win32" ? "lyra-tui.exe" : "lyra-tui";
+    const sibling = join(dirname(realpathSync(process.execPath)), name);
+    const source = join(import.meta.dir, "../../lyra-tui", "native", `${process.platform}-${process.arch}`, name);
+    const candidates = process.env.LYRA_TUI_BIN ? [resolve(process.env.LYRA_TUI_BIN)] : [sibling, source];
+    const binary = await firstAccessible(candidates);
+    if (!binary) throw new Error(`Native Flywheel TUI is unavailable for ${process.platform}-${process.arch}. Reinstall Lyra with the matching platform bundle.`);
+    const child = Bun.spawn([binary], { cwd: process.cwd(), stdin: "pipe", stdout: "pipe", stderr: "inherit" });
     return new TuiBridge(child);
   }
   async render(frame: FrameRequest): Promise<string> { const deferred = Promise.withResolvers<string>(); this.#pending.push(deferred); await this.#process.stdin.write(`${JSON.stringify(frame)}\n`); return deferred.promise; }
@@ -203,4 +261,7 @@ function assistantText(result: AgentTurnResult): string { return result.assistan
 function extractAssistant(result: unknown): string { if (!result || typeof result !== "object" || !("assistant" in result)) return ""; const assistant = (result as { assistant?: { content?: Array<{ type?: string; text?: string }> } }).assistant; return assistant?.content?.flatMap((block) => block.type === "text" && typeof block.text === "string" ? [block.text] : []).join("") ?? ""; }
 function formatOutput(value: unknown): string { return typeof value === "string" ? value : JSON.stringify(value, null, 2); }
 async function branchName(origin: string): Promise<string> { try { const head = (await readFile(join(origin, ".git", "HEAD"), "utf8")).trim(); return head.startsWith("ref: refs/heads/") ? head.slice(16) : head.slice(0, 8); } catch { return "no-git"; } }
-function helpText(): string { return `Lyra — autonomous coding agent\n\nUsage: lyra [--origin PATH] [--session NAME] [--model PROVIDER/MODEL] [--prompt TEXT] [--acp] [--yes-auto-git]\n\nInteractive controls:\n  Enter       send or steer the active turn\n  Ctrl+Enter  queue a follow-up while streaming\n  Escape      cancel the active turn; exit when idle\n  Ctrl+C      cancel the active turn; exit when idle\n\nConfiguration: ~/.lyra/config.toml and <origin>/.lyra/config.toml\n`; }
+async function firstAccessible(paths: readonly string[]): Promise<string | undefined> { for (const path of paths) { try { await access(path); return path; } catch {} } return undefined; }
+function helpText(): string { return `Lyra — autonomous coding agent\n\nUsage: lyra [--origin PATH] [--session NAME] [--model PROVIDER/MODEL] [--prompt TEXT] [--acp] [--yes-auto-git]\n\nFirst interactive launch opens provider setup in the TUI. Credentials may use the OS keychain, an existing environment variable, or explicitly chosen plaintext TOML.\n\nInteractive controls:\n  Enter       send or steer the active turn\n  Ctrl+Enter  queue a follow-up while streaming\n  Escape      cancel the active turn; exit when idle\n  Ctrl+C      cancel the active turn; exit when idle\n\nConfiguration: ~/.lyra/config.toml, ~/.lyra/providers.toml, and <origin>/.lyra/config.toml\n`; }
+
+await main();
