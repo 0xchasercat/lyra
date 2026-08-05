@@ -10,6 +10,7 @@
     { "path": "./packages/lyra-host" },
     { "path": "./packages/lyra-runtime" },
     { "path": "./packages/lyra-git" },
-    { "path": "./packages/lyra-mcp" }
+    { "path": "./packages/lyra-mcp" },
+    { "path": "./packages/lyra-skills" }
   ]
 }

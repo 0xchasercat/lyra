@@ -79,6 +79,14 @@
         "@lyra/provider": "workspace:*",
       },
     },
+    "packages/lyra-skills": {
+      "name": "@lyra/skills",
+      "version": "0.1.0",
+      "dependencies": {
+        "@lyra/core": "workspace:*",
+        "@lyra/provider": "workspace:*",
+      },
+    },
     "packages/lyra-tools": {
       "name": "@lyra/tools",
       "version": "0.1.0",
@@ -107,6 +115,8 @@
     "@lyra/runtime": ["@lyra/runtime@workspace:packages/lyra-runtime"],
 
     "@lyra/session": ["@lyra/session@workspace:packages/lyra-session"],
+
+    "@lyra/skills": ["@lyra/skills@workspace:packages/lyra-skills"],
 
     "@lyra/tools": ["@lyra/tools@workspace:packages/lyra-tools"],
 

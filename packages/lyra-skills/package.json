@@ -1,0 +1,8 @@
+{
+  "name": "@lyra/skills",
+  "version": "0.1.0",
+  "type": "module",
+  "private": true,
+  "exports": { ".": "./src/index.ts" },
+  "dependencies": { "@lyra/core": "workspace:*", "@lyra/provider": "workspace:*" }
+}
