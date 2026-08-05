@@ -3,6 +3,7 @@
   "references": [
     { "path": "./packages/lyra-provider" },
     { "path": "./packages/lyra-session" },
-    { "path": "./packages/lyra-core" }
+    { "path": "./packages/lyra-core" },
+    { "path": "./packages/lyra-edit" }
   ]
 }
