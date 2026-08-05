@@ -9,6 +9,13 @@
         "typescript": "^5.9.3",
       },
     },
+    "packages/lyra-acp": {
+      "name": "@lyra/acp",
+      "version": "0.1.0",
+      "dependencies": {
+        "@lyra/core": "workspace:*",
+      },
+    },
     "packages/lyra-core": {
       "name": "@lyra/core",
       "version": "0.1.0",
@@ -98,6 +105,8 @@
     },
   },
   "packages": {
+    "@lyra/acp": ["@lyra/acp@workspace:packages/lyra-acp"],
+
     "@lyra/core": ["@lyra/core@workspace:packages/lyra-core"],
 
     "@lyra/edit": ["@lyra/edit@workspace:packages/lyra-edit"],
