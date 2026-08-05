@@ -28,6 +28,14 @@
         "tree-sitter-typescript": "^0.23.2",
       },
     },
+    "packages/lyra-lsp": {
+      "name": "@lyra/lsp",
+      "version": "0.1.0",
+      "dependencies": {
+        "@lyra/core": "workspace:*",
+        "@lyra/tools": "workspace:*",
+      },
+    },
     "packages/lyra-provider": {
       "name": "@lyra/provider",
       "version": "0.1.0",
@@ -53,6 +61,8 @@
     "@lyra/core": ["@lyra/core@workspace:packages/lyra-core"],
 
     "@lyra/edit": ["@lyra/edit@workspace:packages/lyra-edit"],
+
+    "@lyra/lsp": ["@lyra/lsp@workspace:packages/lyra-lsp"],
 
     "@lyra/provider": ["@lyra/provider@workspace:packages/lyra-provider"],
 

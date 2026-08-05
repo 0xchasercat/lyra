@@ -5,6 +5,7 @@
     { "path": "./packages/lyra-session" },
     { "path": "./packages/lyra-core" },
     { "path": "./packages/lyra-edit" },
-    { "path": "./packages/lyra-tools" }
+    { "path": "./packages/lyra-tools" },
+    { "path": "./packages/lyra-lsp" }
   ]
 }
