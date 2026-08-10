@@ -1,6 +1,10 @@
-import { ACP_METHODS, type AcpCapabilities, type AcpDaemonOptions, type AcpHandlerContext, type AcpMethod, type AcpWriter, type JsonRpcId } from "./types.ts";
+import { ACP_DEFAULT_TURN_TIMEOUT_MS, ACP_METHODS, ACP_TURN_METHODS, type AcpCapabilities, type AcpDaemonOptions, type AcpHandlerContext, type AcpMethod, type AcpWriter, type JsonRpcId } from "./types.ts";
 
 const DEFAULT_TIMEOUT_MS = 60_000;
+// setTimeout keeps its delay in a signed 32-bit integer; a larger delay fires immediately and turns
+// a deadline into a no-op. This is the only bound on a configured timeout, and it is explicit: a
+// timeout above it is rejected rather than silently shortened (§3.4 — every deadline has a defined expiry).
+const MAX_TIMEOUT_MS = 2_147_483_647;
 const DEFAULT_MAX_FRAME_BYTES = 4 * 1024 * 1024;
 const DEFAULT_MAX_CONCURRENT = 32;
 interface PendingClient { resolve(value: unknown): void; reject(error: unknown): void; timer: ReturnType<typeof setTimeout>; }
@@ -10,8 +14,8 @@ export class AcpError extends Error { readonly code: number; readonly data: unkn
 
 export class AcpDaemon {
   readonly capabilities: AcpCapabilities = Object.freeze({ methods: ACP_METHODS, bidirectional: true, cancellation: true, transport: "stdio" });
-  readonly #options: Required<Pick<AcpDaemonOptions, "requestTimeoutMs" | "maxFrameBytes" | "maxConcurrentRequests" | "serverName" | "serverVersion">> & AcpDaemonOptions;
-  readonly #active = new Map<JsonRpcId, AbortController>();
+  readonly #options: Required<Pick<AcpDaemonOptions, "requestTimeoutMs" | "turnTimeoutMs" | "maxFrameBytes" | "maxConcurrentRequests" | "serverName" | "serverVersion">> & AcpDaemonOptions;
+  readonly #active = new Map<JsonRpcId | symbol, AbortController>();
   readonly #operations = new Set<Promise<void>>();
   readonly #clientPending = new Map<JsonRpcId, PendingClient>();
   #writer: AcpWriter | undefined;
@@ -23,12 +27,26 @@ export class AcpDaemon {
   constructor(options: AcpDaemonOptions) {
     if (!options || typeof options !== "object" || !options.handlers || typeof options.handlers !== "object") throw new TypeError("ACP handlers are required.");
     const timeout = options.requestTimeoutMs ?? DEFAULT_TIMEOUT_MS;
+    const turnTimeout = options.turnTimeoutMs ?? ACP_DEFAULT_TURN_TIMEOUT_MS;
     const maxFrameBytes = options.maxFrameBytes ?? DEFAULT_MAX_FRAME_BYTES;
     const maxConcurrentRequests = options.maxConcurrentRequests ?? DEFAULT_MAX_CONCURRENT;
-    if (!Number.isSafeInteger(timeout) || timeout < 1) throw new RangeError("ACP requestTimeoutMs must be a positive integer.");
+    if (!Number.isSafeInteger(timeout) || timeout < 1 || timeout > MAX_TIMEOUT_MS) throw new RangeError(`ACP requestTimeoutMs must be a positive integer no greater than ${MAX_TIMEOUT_MS}.`);
+    if (!Number.isSafeInteger(turnTimeout) || turnTimeout < 1 || turnTimeout > MAX_TIMEOUT_MS) throw new RangeError(`ACP turnTimeoutMs must be a positive integer no greater than ${MAX_TIMEOUT_MS}.`);
     if (!Number.isSafeInteger(maxFrameBytes) || maxFrameBytes < 1) throw new RangeError("ACP maxFrameBytes must be a positive integer.");
     if (!Number.isSafeInteger(maxConcurrentRequests) || maxConcurrentRequests < 1) throw new RangeError("ACP maxConcurrentRequests must be a positive integer.");
-    this.#options = { requestTimeoutMs: timeout, maxFrameBytes, maxConcurrentRequests, serverName: options.serverName ?? "lyra", serverVersion: options.serverVersion ?? "0.1.0", ...options };
+    this.#options = { requestTimeoutMs: timeout, turnTimeoutMs: turnTimeout, maxFrameBytes, maxConcurrentRequests, serverName: options.serverName ?? "lyra", serverVersion: options.serverVersion ?? "0.1.0", ...options };
+  }
+
+  /**
+   * The deadline one method gets, from the class it belongs to.
+   *
+   * A turn is a 30-minute operation by §3.4 and a question is a 60-second one; one number
+   * for both meant the shorter of the two won, and `session/prompt` died mid-turn at 60s.
+   * The deadline still *exists* either way — §3.4's rule is that nothing blocks forever,
+   * not that everything blocks for the same length of time.
+   */
+  private deadlineFor(method: string): number {
+    return (ACP_TURN_METHODS as readonly string[]).includes(method) ? this.#options.turnTimeoutMs : this.#options.requestTimeoutMs;
   }
 
   async serve(input: AsyncIterable<Uint8Array | string>, writer: AcpWriter): Promise<void> {
@@ -68,13 +86,15 @@ export class AcpDaemon {
   async requestClient(method: string, params?: unknown, timeoutMs = this.#options.requestTimeoutMs): Promise<unknown> {
     this.assertOpen();
     if (typeof method !== "string" || method.length === 0) throw new AcpError(-32600, "Client request method must be non-empty.");
-    if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1) throw new AcpError(-32600, "Client request timeout must be positive.");
+    if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > MAX_TIMEOUT_MS) throw new AcpError(-32600, `Client request timeout must be a positive integer no greater than ${MAX_TIMEOUT_MS}ms.`);
     const id = `server-${++this.#clientSequence}`;
     const result = new Promise<unknown>((resolve, reject) => {
-      const timer = setTimeout(() => { this.#clientPending.delete(id); reject(new AcpError(-32001, `ACP client request ${method} exceeded ${timeoutMs}ms.`)); }, Math.min(timeoutMs, DEFAULT_TIMEOUT_MS));
+      const timer = setTimeout(() => { this.#clientPending.delete(id); reject(new AcpError(-32001, `ACP client request ${method} exceeded ${timeoutMs}ms.`)); }, timeoutMs);
       this.#clientPending.set(id, { resolve, reject, timer });
     });
-    await this.write({ jsonrpc: "2.0", id, method, ...(params === undefined ? {} : { params }) });
+    // A failed write must settle this request through the pending entry, so the caller observes it
+    // exactly once via the returned promise and the timer can never reject an unobserved promise.
+    await this.write({ jsonrpc: "2.0", id, method, ...(params === undefined ? {} : { params }) }).catch((error: unknown) => this.settleClientRequest(id, error instanceof AcpError ? error : new AcpError(-32000, `ACP client request ${method} could not be written: ${error instanceof Error ? error.message : String(error)}`)));
     return result;
   }
 
@@ -104,7 +124,8 @@ export class AcpDaemon {
     if (this.#active.size >= this.#options.maxConcurrentRequests) { await this.writeError(id, { code: -32002, message: `ACP concurrency limit ${this.#options.maxConcurrentRequests} reached.` }); return; }
     const controller = new AbortController();
     this.#active.set(id, controller);
-    const timeout = setTimeout(() => controller.abort(new AcpError(-32001, `ACP request ${method} exceeded ${this.#options.requestTimeoutMs}ms.`)), this.#options.requestTimeoutMs);
+    const deadlineMs = this.deadlineFor(method);
+    const timeout = setTimeout(() => controller.abort(new AcpError(-32001, `ACP request ${method} exceeded ${deadlineMs}ms.`)), deadlineMs);
     const invocation = Promise.resolve(this.invoke(method, params, id, controller.signal));
     try {
       const result = await Promise.race([invocation, abortPromise(controller.signal)]);
@@ -115,12 +136,16 @@ export class AcpDaemon {
 
   private async dispatchNotification(method: string, params: unknown): Promise<void> {
     if (this.#active.size >= this.#options.maxConcurrentRequests) return;
-    const id = `notification-${++this.#notificationSequence}`;
-    const controller = new AbortController(); this.#active.set(id, controller);
-    const timeout = setTimeout(() => controller.abort(new AcpError(-32001, `ACP notification ${method} exceeded ${this.#options.requestTimeoutMs}ms.`)), this.#options.requestTimeoutMs);
-    const invocation = Promise.resolve(this.invoke(method, params, id, controller.signal));
+    const label = `notification-${++this.#notificationSequence}`;
+    // Notifications have no client-visible id, so they occupy the concurrency map under a unique
+    // symbol: a client is free to send a request whose literal id is "notification-1".
+    const key = Symbol(label);
+    const controller = new AbortController(); this.#active.set(key, controller);
+    const deadlineMs = this.deadlineFor(method);
+    const timeout = setTimeout(() => controller.abort(new AcpError(-32001, `ACP notification ${method} exceeded ${deadlineMs}ms.`)), deadlineMs);
+    const invocation = Promise.resolve(this.invoke(method, params, label, controller.signal));
     try { await Promise.race([invocation, abortPromise(controller.signal)]); } catch { /* notifications have no response channel */ }
-    finally { clearTimeout(timeout); await invocation.catch(() => undefined); this.#active.delete(id); }
+    finally { clearTimeout(timeout); await invocation.catch(() => undefined); this.#active.delete(key); }
   }
 
   private launch(operation: Promise<void>): void { this.#operations.add(operation); void operation.then(() => this.#operations.delete(operation), () => this.#operations.delete(operation)); }
@@ -149,7 +174,15 @@ export class AcpDaemon {
     else pending.reject(new AcpError(-32600, "Client response lacks result or error."));
   }
 
-  private async write(value: unknown): Promise<void> { if (!this.#writer) throw new AcpError(-32000, "ACP writer is not attached."); const line = `${JSON.stringify(value)}\n`; this.#writeTail = this.#writeTail.then(async () => { await this.#writer!.write(line); }); return this.#writeTail; }
+  private settleClientRequest(id: JsonRpcId, error: unknown): void {
+    const pending = this.#clientPending.get(id);
+    if (!pending) return;
+    this.#clientPending.delete(id); clearTimeout(pending.timer); pending.reject(error);
+  }
+
+  // One failed write rejects that write for its caller only: the tail carries the recovered promise
+  // so every later frame on this connection is still attempted in order.
+  private async write(value: unknown): Promise<void> { if (!this.#writer) throw new AcpError(-32000, "ACP writer is not attached."); const line = `${JSON.stringify(value)}\n`; const attempt = this.#writeTail.then(async () => { await this.#writer!.write(line); }); this.#writeTail = attempt.catch(() => undefined); return attempt; }
   private writeError(id: JsonRpcId | null, error: RpcError): Promise<void> { return this.write({ jsonrpc: "2.0", id, error }); }
   private assertOpen(): void { if (this.#closed) throw new AcpError(-32000, "ACP daemon is closed."); if (!this.#writer) throw new AcpError(-32000, "ACP writer is not attached."); }
 }

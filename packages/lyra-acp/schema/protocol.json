@@ -1,0 +1,1563 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://lyra.sh/schema/acp/protocol.json",
+  "title": "Lyra ACP protocol",
+  "description": "Canonical, single-source definition of every ACP method, result, and notification Lyra's daemon speaks. There is no hand-mirrored copy of this anywhere: TUI types are generated or validated from this file, and a drifted field is a build failure rather than a runtime surprise. Design rules encoded here: streaming arrives as semantic deltas keyed by (messageId, partId, field); every measurement crosses the wire as a raw number, never a percentage; a limit that has not been verified is omitted entirely rather than guessed; every pause bracket a client opens is closed by an explicit turn_resume.",
+  "$defs": {
+    "jsonRpcVersion": { "const": "2.0" },
+    "sessionId": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Stable identifier of the transcript this event belongs to."
+    },
+    "entryId": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Transcript entry identifier, as persisted in the session JSONL."
+    },
+    "turnId": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Identifies one user turn, including every model round, tool round, and steering injection inside it."
+    },
+    "messageId": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Identifies one assistant message within a turn. A turn with tool rounds has several."
+    },
+    "partId": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Identifies one content part inside a message. Deltas address a part, never the whole message."
+    },
+    "toolCallId": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Provider-assigned tool-call identifier, stable from tool_call_start through tool_call_end."
+    },
+    "timestampMs": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Absolute wall-clock instant in milliseconds since the Unix epoch."
+    },
+    "durationMs": { "type": "integer", "minimum": 0 },
+    "tokenCount": { "type": "integer", "minimum": 0 },
+
+    "providerClassification": {
+      "type": "string",
+      "enum": [
+        "transient",
+        "context_overflow",
+        "content_shape",
+        "auth",
+        "quota",
+        "model_unavailable",
+        "bad_request",
+        "refusal"
+      ]
+    },
+    "stopReason": {
+      "type": "string",
+      "enum": ["end_turn", "tool_use", "max_tokens", "refusal", "cancelled"]
+    },
+    "apiType": {
+      "type": "string",
+      "enum": ["openai_completions", "openai_responses", "openai_websocket", "anthropic_messages"]
+    },
+    "configurableApiType": {
+      "type": "string",
+      "enum": ["openai_completions", "openai_responses", "anthropic_messages"],
+      "description": "The protocols a provider can be *configured* to speak. Narrower than #/$defs/apiType on purpose: `openai_websocket` is a transport Lyra negotiates for an `openai_responses` provider, never something a user declares, so it cannot be written into a provider definition."
+    },
+    "partKind": {
+      "type": "string",
+      "enum": ["text", "thinking", "reasoning", "tool_call"]
+    },
+    "deltaField": {
+      "type": "string",
+      "enum": ["text", "thinking", "signature", "arguments"],
+      "description": "Which field of the addressed part the delta appends to."
+    },
+    "toolStatus": {
+      "type": "string",
+      "enum": ["ok", "error", "denied"],
+      "description": "Terminal disposition of a tool call. 'denied' is reserved for a permission refusal."
+    },
+    "turnStatus": {
+      "type": "string",
+      "enum": ["completed", "cancelled", "truncated", "refusal", "error"],
+      "description": "Terminal disposition of a turn. 'truncated' means the provider hit its output-token limit and the partial response was retained."
+    },
+    "steerBoundary": {
+      "type": "string",
+      "enum": ["tool_boundary", "turn_boundary"],
+      "description": "Where a steering message was injected. Steering always lands as its own synthetic user turn; this says which drain point delivered it."
+    },
+    "pauseKind": {
+      "type": "string",
+      "enum": ["retry", "compaction", "context_repair", "steer", "transport_fallback"],
+      "description": "The pause bracket that a turn_resume closes."
+    },
+
+    "providerError": {
+      "type": "object",
+      "required": ["classification", "message"],
+      "additionalProperties": false,
+      "properties": {
+        "classification": { "$ref": "#/$defs/providerClassification" },
+        "message": { "type": "string" },
+        "code": { "type": "string" },
+        "status": { "type": "integer", "minimum": 0 }
+      }
+    },
+
+    "contextRepair": {
+      "type": "object",
+      "required": ["code", "detail"],
+      "additionalProperties": true,
+      "properties": {
+        "code": {
+          "type": "string",
+          "enum": [
+            "missing_tool_result",
+            "orphan_tool_result",
+            "adjacent_role_merge",
+            "empty_content",
+            "thinking_reordered",
+            "thinking_signature_dropped",
+            "provider_reasoning_dropped",
+            "image_dropped",
+            "boundary_applied"
+          ]
+        },
+        "detail": { "type": "string" },
+        "entryId": { "$ref": "#/$defs/entryId" },
+        "tokenEstimate": { "$ref": "#/$defs/tokenCount" }
+      }
+    },
+
+    "loopWarning": {
+      "type": "object",
+      "required": ["type"],
+      "additionalProperties": true,
+      "properties": {
+        "type": { "type": "string", "enum": ["identical_tool_call", "no_progress", "oscillation"] },
+        "tool": { "type": "string" },
+        "count": { "type": "integer", "minimum": 0 },
+        "turns": { "type": "integer", "minimum": 0 },
+        "path": { "type": "string" },
+        "hash": { "type": "string" }
+      }
+    },
+
+    "toolProgress": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "filesRead": { "type": "array", "items": { "type": "string" } },
+        "filesModified": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["path"],
+            "additionalProperties": true,
+            "properties": {
+              "path": { "type": "string" },
+              "beforeHash": { "type": "string" },
+              "afterHash": { "type": "string" }
+            }
+          }
+        },
+        "commandExitCode": { "type": "integer" }
+      }
+    },
+
+    "turnUsage": {
+      "description": "Token counts for the single provider call that just finished.",
+      "type": "object",
+      "required": ["inputTokens", "outputTokens"],
+      "additionalProperties": false,
+      "properties": {
+        "inputTokens": { "$ref": "#/$defs/tokenCount" },
+        "outputTokens": { "$ref": "#/$defs/tokenCount" },
+        "cacheReadTokens": { "$ref": "#/$defs/tokenCount" },
+        "cacheWriteTokens": { "$ref": "#/$defs/tokenCount" }
+      }
+    },
+
+    "sessionUsage": {
+      "description": "Cumulative token counts for the whole session. costMicroUsd is present only when the active model has known pricing — never estimated.",
+      "type": "object",
+      "required": ["inputTokens", "outputTokens"],
+      "additionalProperties": false,
+      "properties": {
+        "inputTokens": { "$ref": "#/$defs/tokenCount" },
+        "outputTokens": { "$ref": "#/$defs/tokenCount" },
+        "costMicroUsd": { "type": "integer", "minimum": 0 }
+      }
+    },
+
+    "sessionDescriptor": {
+      "type": "object",
+      "required": ["sessionId", "name", "path", "headId", "createdAt"],
+      "additionalProperties": true,
+      "properties": {
+        "sessionId": { "$ref": "#/$defs/sessionId" },
+        "name": { "type": "string", "minLength": 1 },
+        "path": { "type": "string", "minLength": 1 },
+        "headId": { "$ref": "#/$defs/entryId" },
+        "createdAt": { "type": "string", "minLength": 1 }
+      }
+    },
+
+    "modelInfo": {
+      "type": "object",
+      "required": ["id"],
+      "additionalProperties": true,
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "ownedBy": { "type": "string" },
+        "contextWindow": { "$ref": "#/$defs/tokenCount" },
+        "inputPricePerMillion": { "type": "number", "minimum": 0 },
+        "outputPricePerMillion": { "type": "number", "minimum": 0 }
+      }
+    },
+
+    "completionKind": {
+      "type": "string",
+      "minLength": 1,
+      "description": "What a completion request is completing. Deliberately an open string rather than a closed enum: a client that asks for a kind this daemon does not implement gets an error naming the kinds it does, and a new kind is added without a protocol break. 'file' is implemented today."
+    },
+    "completionItem": {
+      "description": "One candidate, already ranked. `value` is what the client inserts verbatim — for kind 'file' it is a workspace-relative path with forward slashes. `label` and `detail` are display sugar only; a client that ignores them still inserts the right text.",
+      "type": "object",
+      "required": ["value"],
+      "additionalProperties": false,
+      "properties": {
+        "value": { "type": "string", "minLength": 1 },
+        "label": { "type": "string" },
+        "detail": { "type": "string" }
+      }
+    },
+    "completionResult": {
+      "description": "Ranking is the server's job and the order here is final: the client renders `items` top to bottom and must not re-sort, because it cannot see the signals (gitignore state, modification times, the full candidate set) the ranking used.",
+      "type": "object",
+      "required": ["items", "truncated"],
+      "additionalProperties": false,
+      "properties": {
+        "items": { "type": "array", "items": { "$ref": "#/$defs/completionItem" } },
+        "truncated": {
+          "type": "boolean",
+          "description": "True when more candidates matched than `limit` allowed through. The dropped ones ranked lower than every item returned."
+        }
+      }
+    },
+
+    "commandResultKind": {
+      "description": "Names the shape of a command's `output`, so a client picks a renderer without sniffing the payload. Every kind K other than 'report' means `output` validates against #/$defs/KResult; 'report' means #/$defs/reportResult.",
+      "type": "string",
+      "enum": ["models", "sessions", "workspaces", "agents", "health", "context", "skills", "mcp", "report"]
+    },
+    "commandDescriptor": {
+      "description": "One slash command the daemon routes today. `usage` is present only when the command takes arguments — an absent usage means the bare name is the whole invocation.",
+      "type": "object",
+      "required": ["name", "description", "resultKind"],
+      "additionalProperties": false,
+      "properties": {
+        "name": { "type": "string", "minLength": 1 },
+        "description": { "type": "string", "minLength": 1 },
+        "usage": { "type": "string", "minLength": 1 },
+        "resultKind": { "$ref": "#/$defs/commandResultKind" }
+      }
+    },
+    "commandsResult": {
+      "type": "object",
+      "required": ["commands"],
+      "additionalProperties": false,
+      "properties": { "commands": { "type": "array", "items": { "$ref": "#/$defs/commandDescriptor" } } }
+    },
+    "commandResult": {
+      "description": "The result of session/command. Exactly one of `output` and `error` is present: `output` on success, in the shape `resultKind` names, `error` on failure. `command` is the parsed command name, and is empty when the input could not be parsed into one.",
+      "type": "object",
+      "required": ["command", "resultKind"],
+      "additionalProperties": false,
+      "properties": {
+        "command": { "type": "string" },
+        "resultKind": { "$ref": "#/$defs/commandResultKind" },
+        "output": { "description": "Validates against the $def named by resultKind." },
+        "error": { "type": "string", "minLength": 1 }
+      }
+    },
+    "reportResult": {
+      "description": "The shape every free-form command returns. `report` is one human-readable line the client can print as-is; the command's raw payload, when it has one, travels beside it under `detail` rather than being flattened into prose. Deliberately open: this is the shape for output that has no declared structure.",
+      "type": "object",
+      "required": ["report"],
+      "additionalProperties": true,
+      "properties": { "report": { "type": "string" }, "detail": {} }
+    },
+
+    "providerModels": {
+      "description": "One configured provider and every model it offers: what its endpoint listed, unioned with what its `models` array declares. A provider whose discovery failed still appears, carrying its declared models — an empty list means 'this provider offers nothing we could learn', never 'this provider is gone'.",
+      "type": "object",
+      "required": ["provider", "models"],
+      "additionalProperties": false,
+      "properties": {
+        "provider": { "type": "string", "minLength": 1 },
+        "models": { "type": "array", "items": { "$ref": "#/$defs/modelInfo" } }
+      }
+    },
+    "modelsResult": {
+      "description": "The model surface across EVERY configured provider, not just the active one: `/model` is the single switching surface in Lyra's provider UX and it switches provider and model together, so the listing it renders has to span providers too. `current` is a full `provider/model` reference and is absent exactly when nothing is configured. `refreshed` is true only when discovery was actually re-run rather than served from cache.",
+      "type": "object",
+      "required": ["providers"],
+      "additionalProperties": false,
+      "properties": {
+        "current": { "type": "string", "minLength": 1 },
+        "providers": { "type": "array", "items": { "$ref": "#/$defs/providerModels" } },
+        "roles": {
+          "description": "Configured role aliases (@default, @fast, @merge) mapped to provider/model references.",
+          "type": "object",
+          "additionalProperties": { "type": "string" }
+        },
+        "refreshed": { "type": "boolean" }
+      }
+    },
+    "sessionListing": {
+      "description": "One transcript on disk. The three preview fields are optional and independently absent: a row a picker cannot preview still loads, and an absent field means \"not measured\" rather than zero — a client renders nothing for it instead of a wrong number.",
+      "type": "object",
+      "required": ["sessionId", "name", "path", "active"],
+      "additionalProperties": false,
+      "properties": {
+        "sessionId": { "$ref": "#/$defs/sessionId" },
+        "name": { "type": "string", "minLength": 1 },
+        "path": { "type": "string", "minLength": 1 },
+        "active": { "type": "boolean" },
+        "firstPrompt": {
+          "type": "string",
+          "description": "The first real user prompt of the transcript, whitespace-collapsed and truncated server-side to ~100 characters with a trailing ellipsis. Absent when the session has no user message yet, or when the transcript was too large to scan.",
+          "maxLength": 101
+        },
+        "updatedAtMs": {
+          "$ref": "#/$defs/timestampMs",
+          "description": "The transcript file's modification time, raw, so the client derives \"2h ago\" itself."
+        },
+        "messages": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "How many message entries the transcript holds. Absent when the file exceeded the listing's per-file scan budget: an unknown count is reported as unknown, never as a partial one."
+        }
+      }
+    },
+    "sessionsResult": {
+      "type": "object",
+      "required": ["sessions"],
+      "additionalProperties": false,
+      "properties": { "sessions": { "type": "array", "items": { "$ref": "#/$defs/sessionListing" } } }
+    },
+    "workspaceRecord": {
+      "description": "One agent workspace. `degradedReason` is present only when the workspace had to fall back to a shared-ref worktree, and `task` only when the workspace was created for a child agent's task contract.",
+      "type": "object",
+      "required": ["name", "path", "origin", "state", "mode", "createdAt", "updatedAt"],
+      "additionalProperties": false,
+      "properties": {
+        "name": { "type": "string", "minLength": 1 },
+        "path": { "type": "string", "minLength": 1 },
+        "origin": { "type": "string", "minLength": 1 },
+        "state": { "type": "string", "enum": ["created", "active", "paused", "resumed", "archived", "dropped"] },
+        "mode": { "type": "string", "enum": ["clone", "worktree"] },
+        "degradedReason": { "type": "string" },
+        "task": { "type": "string" },
+        "createdAt": { "type": "string", "minLength": 1 },
+        "updatedAt": { "type": "string", "minLength": 1 }
+      }
+    },
+    "workspacesResult": {
+      "description": "Returned by /workspaces (every workspace) and by /cleanup (only the ones it dropped).",
+      "type": "object",
+      "required": ["workspaces"],
+      "additionalProperties": false,
+      "properties": { "workspaces": { "type": "array", "items": { "$ref": "#/$defs/workspaceRecord" } } }
+    },
+    "agentHandle": {
+      "type": "object",
+      "required": ["id", "workspace", "status", "startedAt"],
+      "additionalProperties": false,
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "workspace": { "type": "string", "minLength": 1 },
+        "label": { "type": "string" },
+        "status": { "type": "string", "enum": ["queued", "running", "completed", "failed", "cancelled"] },
+        "startedAt": { "$ref": "#/$defs/timestampMs" }
+      }
+    },
+    "agentsResult": {
+      "type": "object",
+      "required": ["agents"],
+      "additionalProperties": false,
+      "properties": { "agents": { "type": "array", "items": { "$ref": "#/$defs/agentHandle" } } }
+    },
+    "healthResult": {
+      "description": "Durable metrics, as raw counts and latencies. `processes` and `workspaces` are live gauges and are present only when the caller measured them. Rates are the one exception to raw-measurements-only: firstCallSuccessRate is a ratio because its denominator (first calls) is not otherwise reported.",
+      "type": "object",
+      "required": ["turns", "successfulTurns", "turnLatencyMs", "retries", "compactions", "contextRepairs", "tools", "malformedMetrics"],
+      "additionalProperties": false,
+      "properties": {
+        "turns": { "type": "integer", "minimum": 0 },
+        "successfulTurns": { "type": "integer", "minimum": 0 },
+        "turnLatencyMs": {
+          "type": "object",
+          "required": ["p50", "p95", "p99"],
+          "additionalProperties": false,
+          "properties": {
+            "p50": { "$ref": "#/$defs/durationMs" },
+            "p95": { "$ref": "#/$defs/durationMs" },
+            "p99": { "$ref": "#/$defs/durationMs" }
+          }
+        },
+        "retries": {
+          "description": "Retry counts keyed by provider classification.",
+          "type": "object",
+          "additionalProperties": { "type": "integer", "minimum": 0 }
+        },
+        "compactions": { "type": "integer", "minimum": 0 },
+        "contextRepairs": { "type": "integer", "minimum": 0 },
+        "tools": {
+          "description": "Per-tool reliability, keyed by tool name.",
+          "type": "object",
+          "additionalProperties": {
+            "type": "object",
+            "required": ["calls", "successes", "firstCallSuccessRate", "latencyP95Ms"],
+            "additionalProperties": false,
+            "properties": {
+              "calls": { "type": "integer", "minimum": 0 },
+              "successes": { "type": "integer", "minimum": 0 },
+              "firstCallSuccessRate": { "type": "number", "minimum": 0, "maximum": 1 },
+              "latencyP95Ms": { "$ref": "#/$defs/durationMs" }
+            }
+          }
+        },
+        "malformedMetrics": { "type": "integer", "minimum": 0 },
+        "processes": { "type": "integer", "minimum": 0 },
+        "workspaces": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "contextSection": {
+      "type": "object",
+      "required": ["name", "tokens"],
+      "additionalProperties": false,
+      "properties": { "name": { "type": "string", "minLength": 1 }, "tokens": { "$ref": "#/$defs/tokenCount" } }
+    },
+    "contextLossMarker": {
+      "type": "object",
+      "required": ["messageId", "reason", "detail"],
+      "additionalProperties": false,
+      "properties": {
+        "messageId": { "$ref": "#/$defs/entryId" },
+        "reason": { "type": "string" },
+        "detail": { "type": "string" }
+      }
+    },
+    "contextResult": {
+      "description": "A breakdown of the payload the next provider call would send. The payload itself is deliberately absent: it is megabytes, the client renders the breakdown, and `context/inspect` still returns the whole thing for a caller that needs it.",
+      "type": "object",
+      "required": ["tokenEstimate", "contextWindow", "sections", "repairs", "lossMarkers", "cacheBreakpoints", "sourceEntryIds"],
+      "additionalProperties": false,
+      "properties": {
+        "tokenEstimate": { "$ref": "#/$defs/tokenCount" },
+        "contextWindow": { "$ref": "#/$defs/tokenCount" },
+        "sections": { "type": "array", "items": { "$ref": "#/$defs/contextSection" } },
+        "repairs": { "type": "array", "items": { "$ref": "#/$defs/contextRepair" } },
+        "lossMarkers": { "type": "array", "items": { "$ref": "#/$defs/contextLossMarker" } },
+        "cacheBreakpoints": { "type": "array", "items": { "type": "string" } },
+        "sourceEntryIds": { "type": "array", "items": { "$ref": "#/$defs/entryId" } }
+      }
+    },
+    "skillRecord": {
+      "type": "object",
+      "required": ["name", "description", "origin", "path"],
+      "additionalProperties": false,
+      "properties": {
+        "name": { "type": "string", "minLength": 1 },
+        "description": { "type": "string" },
+        "origin": { "type": "string", "enum": ["project", "user", "bundled"] },
+        "path": { "type": "string", "minLength": 1 }
+      }
+    },
+    "skillsResult": {
+      "type": "object",
+      "required": ["skills"],
+      "additionalProperties": false,
+      "properties": { "skills": { "type": "array", "items": { "$ref": "#/$defs/skillRecord" } } }
+    },
+    "mcpToolSummary": {
+      "type": "object",
+      "required": ["server", "name", "description"],
+      "additionalProperties": false,
+      "properties": {
+        "server": { "type": "string", "minLength": 1 },
+        "name": { "type": "string", "minLength": 1 },
+        "description": { "type": "string" }
+      }
+    },
+    "mcpResult": {
+      "description": "Every tool the configured MCP servers advertise, as of this indexing pass.",
+      "type": "object",
+      "required": ["tools"],
+      "additionalProperties": false,
+      "properties": { "tools": { "type": "array", "items": { "$ref": "#/$defs/mcpToolSummary" } } }
+    },
+
+    "providerPersist": {
+      "type": "string",
+      "enum": ["keychain", "plaintext", "env", "none", "keep"],
+      "description": "Where the credential lives once setup finishes. 'keychain' stores the token in the OS keychain and writes only a reference into the config; 'plaintext' writes the token itself into ~/.lyra/providers.toml (mode 0600); 'env' stores no token anywhere and names a variable the daemon's process already exports; 'none' is a local endpoint that wants no credential at all. 'keep' is the edit case: reuse the provider's existing auth block byte for byte, for a form whose key field was left empty because the key is not being rotated — it requires the provider to already exist, and rejects apiKey and authEnvVar, which would have nowhere to go.",
+      "$comment": "Deliberately not the same vocabulary as the on-disk `auth.type`: this is the user's *choice*, and 'plaintext' says what it costs where 'static' does not."
+    },
+    "providerAuthType": {
+      "type": "string",
+      "enum": ["keychain", "env", "static", "none", "plugin"],
+      "description": "The credential source backing a configured provider, as written on disk. 'plugin' can only arrive from a hand-written config; nothing in the setup surface creates one, but `provider/get` still has to describe one honestly rather than mislabel it."
+    },
+    "providerPreset": {
+      "description": "One row of the setup wizard's catalog. Everything past `id`/`label`/`custom`/`needsKey` is a pre-fill for the same form a custom entry uses, so a client renders one form either way instead of two. The row with `custom: true` pre-fills nothing.",
+      "type": "object",
+      "required": ["id", "label", "custom", "needsKey"],
+      "additionalProperties": false,
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "label": { "type": "string", "minLength": 1 },
+        "detail": { "type": "string" },
+        "provider": { "type": "string", "minLength": 1 },
+        "baseUrl": { "type": "string", "minLength": 1 },
+        "apiType": { "$ref": "#/$defs/configurableApiType" },
+        "model": { "type": "string", "minLength": 1 },
+        "fastModel": { "type": "string", "minLength": 1 },
+        "mergeModel": { "type": "string", "minLength": 1 },
+        "websocket": { "type": "string", "enum": ["auto", "on", "off"] },
+        "authEnvVar": {
+          "type": "string",
+          "minLength": 1,
+          "description": "The environment variable this provider is conventionally read from. A *name*, never a value — the wizard offers it as the default for persist:'env' and nothing here ever carries the variable's contents."
+        },
+        "needsKey": { "type": "boolean" },
+        "envVarSet": {
+          "type": "boolean",
+          "description": "Whether `authEnvVar` is already exported in the daemon's process. The client uses it to default the persistence choice to 'env'; it says only that the variable is non-empty, never what is in it."
+        },
+        "configured": { "type": "boolean", "description": "True when a provider by this id already exists, so setup would replace it." },
+        "custom": { "type": "boolean" }
+      }
+    },
+    "providerPersistOption": {
+      "type": "object",
+      "required": ["id", "label", "available"],
+      "additionalProperties": false,
+      "properties": {
+        "id": { "$ref": "#/$defs/providerPersist" },
+        "label": { "type": "string", "minLength": 1 },
+        "detail": { "type": "string" },
+        "available": {
+          "type": "boolean",
+          "description": "False when this machine cannot offer it — an OS keychain with no backing store. A client renders it disabled with its detail rather than hiding it, so the absence is explained rather than mysterious."
+        }
+      }
+    },
+    "providerApiTypeOption": {
+      "type": "object",
+      "required": ["id", "label"],
+      "additionalProperties": false,
+      "properties": {
+        "id": { "$ref": "#/$defs/configurableApiType" },
+        "label": { "type": "string", "minLength": 1 },
+        "detail": { "type": "string" }
+      }
+    },
+    "providerSetupOptionsResult": {
+      "description": "Everything the provider-setup wizard needs for its first screen without inventing any of it: the presets it offers, the persistence choices this machine can actually honour, the protocols a provider may speak, the file the answer will be written to, and what is configured already.",
+      "type": "object",
+      "required": ["presets", "persist", "apiTypes", "path", "configured"],
+      "additionalProperties": false,
+      "properties": {
+        "presets": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/providerPreset" } },
+        "persist": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/providerPersistOption" } },
+        "apiTypes": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/providerApiTypeOption" } },
+        "path": { "type": "string", "minLength": 1 },
+        "configured": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "addProviderResult": {
+      "description": "What was written — never what it was written with. The credential is not echoed back in any form, so a transcript, a log, or a replay of this session cannot contain it; `auth` names only the *source* that now backs the provider. `warnings` carries what the user should know about the choice they made (a token now sitting in a file, a keychain that had to be declined).",
+      "type": "object",
+      "required": ["ok", "provider", "auth", "path"],
+      "additionalProperties": false,
+      "properties": {
+        "ok": { "const": true },
+        "provider": { "type": "string", "minLength": 1 },
+        "model": { "type": "string", "minLength": 1 },
+        "auth": { "$ref": "#/$defs/providerAuthType" },
+        "path": { "type": "string", "minLength": 1 },
+        "warnings": { "type": "array", "items": { "type": "string" } },
+        "modelsDiscovered": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "How many models the newly added provider turned out to have, when asking was possible. ABSENT means not known — no `/models` route, no answer within the deadline, or a refused credential — and is deliberately distinct from 0, which means the endpoint answered with an empty catalogue. Discovery never decides whether the add succeeded: the provider is saved either way."
+        }
+      }
+    },
+    "detectProviderResult": {
+      "description": "What an endpoint was shown to speak, from probes that write nothing and cache nothing. `apiTypes` is ordered most-capable-first and is EMPTY for an endpoint that could not be reached or could not be recognised — which is an answer, not a failure. `openai_responses` appears only when the `/responses` route was confirmed by the shape of its answer rather than by its status; an OpenAI-family endpoint that was not confirmed is reported as `openai_completions`. Detection is a suggestion for the setup form; `provider/verify` is still the check that the chosen protocol and credential actually work.",
+      "type": "object",
+      "required": ["apiTypes"],
+      "additionalProperties": false,
+      "properties": {
+        "apiTypes": { "type": "array", "items": { "$ref": "#/$defs/configurableApiType" } },
+        "suggestedName": {
+          "type": "string",
+          "minLength": 1,
+          "description": "A provider id derived from the host (api.anthropic.com→anthropic, localhost→local, otherwise the first meaningful host label), offered as the form's default. Present whenever the URL parsed, even when nothing answered."
+        },
+        "authRequired": {
+          "type": "boolean",
+          "description": "True when a probe was refused for want of a credential but still identified the family. False when a probe succeeded with no credential supplied. ABSENT when neither was established — a credential was supplied and accepted, so whether one was needed was never tested."
+        },
+        "normalizedBaseUrl": {
+          "type": "string",
+          "minLength": 1,
+          "description": "The base URL to save, in Lyra's canonical form: the exact prefix routes hang off, version segment included — `https://api.openai.com/v1`, `https://api.anthropic.com/v1`, `https://host/api/v1`, `http://localhost:4100/v1`. It is MEASURED whenever a probe answered: detection asks both `{base}/models` and `{base}/v1/models`, and this is the one that replied, so it names the shape this deployment actually serves rather than a convention guessed from the api_type. When nothing answered it is the canonical rewrite of what was given (trailing slash and a pasted route removed, a bare origin given `/v1`). Absent only when the URL did not parse. A client should send it back as `provider/add`'s `baseUrl`."
+        }
+      }
+    },
+    "getProviderResult": {
+      "description": "One configured provider, in the shape an edit form needs it. `authDetail` is the credential's *address* — a variable name, a keychain service/account pair, a plugin id — and NEVER the credential: nothing on this method's result can carry one, which is what lets an edit form be opened without a permission prompt. `models` is what the provider *declares* in its config, not what its endpoint lists; `session/models` is the surface for discovery.",
+      "type": "object",
+      "required": ["provider", "baseUrl", "apiType", "authType", "models", "inUse"],
+      "additionalProperties": false,
+      "properties": {
+        "provider": { "type": "string", "minLength": 1 },
+        "baseUrl": { "type": "string", "minLength": 1 },
+        "apiType": { "$ref": "#/$defs/configurableApiType" },
+        "websocket": { "type": "string", "enum": ["auto", "on", "off"] },
+        "authType": { "$ref": "#/$defs/providerAuthType" },
+        "authDetail": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Where the credential is read from, in words a user can act on: `OPENAI_API_KEY`, `dev.lyra.provider.gateway/operator`, or a plugin id. Absent for authType 'none', and for 'static' — a token in the config file has no address to name, and naming its contents is the one thing this method must never do."
+        },
+        "models": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+        "inUse": {
+          "type": "boolean",
+          "description": "True when the live session is running on this provider. `provider/remove` refuses while it is true, so a client checks this before offering delete."
+        }
+      }
+    },
+    "removeProviderResult": {
+      "description": "What was deleted. The declaration always; the stored credential only when `removeCredential` asked for it, and `credentialRemoved` says whether there turned out to be one. Roles are deliberately NOT rewritten — a role is a user's choice about what @default means, and silently repointing it would be a bigger surprise than a dangling one — so any that still name the removed provider come back in `danglingRoles` for the client to surface.",
+      "type": "object",
+      "required": ["ok", "provider", "path"],
+      "additionalProperties": false,
+      "properties": {
+        "ok": { "const": true },
+        "provider": { "type": "string", "minLength": 1 },
+        "path": { "type": "string", "minLength": 1 },
+        "credentialRemoved": {
+          "type": "boolean",
+          "description": "Present only when `removeCredential` was true. False means the keychain had nothing under that service/account — the end state asked for, reached without deleting anything."
+        },
+        "danglingRoles": { "type": "array", "items": { "type": "string", "minLength": 1 } }
+      }
+    },
+    "addModelResult": {
+      "type": "object",
+      "required": ["ok", "provider", "model"],
+      "additionalProperties": false,
+      "properties": {
+        "ok": { "const": true },
+        "provider": { "type": "string", "minLength": 1 },
+        "model": { "type": "string", "minLength": 1 }
+      }
+    },
+    "verifyProviderResult": {
+      "description": "The outcome of one cheap liveness check. A provider that cannot be reached answers `ok: false` with the classification rather than failing the request: the wizard's next move is to let the user fix a typo or save anyway, and a JSON-RPC error would make 'unreachable' indistinguishable from 'the daemon is broken'.",
+      "type": "object",
+      "required": ["ok"],
+      "additionalProperties": false,
+      "properties": {
+        "ok": { "type": "boolean" },
+        "models": { "type": "integer", "minimum": 0 },
+        "sample": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "A few model ids the endpoint listed, so the wizard can show that it reached the right provider and not merely *a* server."
+        },
+        "error": { "$ref": "#/$defs/providerError" }
+      }
+    },
+
+    "update": {
+      "description": "One semantic event. The `sessionUpdate` tag discriminates the variant; every variant is closed (additionalProperties:false) so an undeclared field fails validation instead of being silently ignored by a client.",
+      "type": "object",
+      "required": ["sessionUpdate"],
+      "oneOf": [
+        {
+          "title": "turn_start",
+          "type": "object",
+          "required": ["sessionUpdate", "turnId", "source", "startedAtMs"],
+          "additionalProperties": false,
+          "properties": {
+            "sessionUpdate": { "const": "turn_start" },
+            "turnId": { "$ref": "#/$defs/turnId" },
+            "promptEntryId": { "$ref": "#/$defs/entryId" },
+            "source": { "type": "string", "enum": ["user", "steer", "loop", "command"] },
+            "startedAtMs": { "$ref": "#/$defs/timestampMs" }
+          }
+        },
+        {
+          "title": "turn_resume",
+          "description": "Closes a pause bracket. Emitted for every pause a client could have opened, so a paused indicator can never be left hanging.",
+          "type": "object",
+          "required": ["sessionUpdate", "turnId", "after", "pausedMs"],
+          "additionalProperties": false,
+          "properties": {
+            "sessionUpdate": { "const": "turn_resume" },
+            "turnId": { "$ref": "#/$defs/turnId" },
+            "after": { "$ref": "#/$defs/pauseKind" },
+            "pausedMs": { "$ref": "#/$defs/durationMs" }
+          }
+        },
+        {
+          "title": "turn_end",
+          "type": "object",
+          "required": ["sessionUpdate", "turnId", "status", "durationMs", "partialRetained"],
+          "additionalProperties": false,
+          "properties": {
+            "sessionUpdate": { "const": "turn_end" },
+            "turnId": { "$ref": "#/$defs/turnId" },
+            "status": { "$ref": "#/$defs/turnStatus" },
+            "stopReason": { "$ref": "#/$defs/stopReason" },
+            "durationMs": { "$ref": "#/$defs/durationMs" },
+            "partialRetained": {
+              "type": "boolean",
+              "description": "True when a cancelled or truncated turn kept assistant output in the transcript."
+            },
+            "promptTrimmed": {
+              "type": "boolean",
+              "description": "True when a zero-output cancelled turn had its prompt trimmed from history because the client rewound it into the composer."
+            },
+            "hardStopRequested": { "type": "boolean" },
+            "error": { "$ref": "#/$defs/providerError" }
+          }
+        },
+        {
+          "title": "message_start",
+          "type": "object",
+          "required": ["sessionUpdate", "turnId", "messageId", "role"],
+          "additionalProperties": false,
+          "properties": {
+            "sessionUpdate": { "const": "message_start" },
+            "turnId": { "$ref": "#/$defs/turnId" },
+            "messageId": { "$ref": "#/$defs/messageId" },
+            "role": {
+              "type": "string",
+              "enum": ["assistant"],
+              "description": "Always 'assistant'. A user turn never emits message_start: the user's text is already in the client's composer when it sends it, and the daemon acknowledges it as the result of session/prompt or session/steer (and, for a steer, as the `steer` update). The single-value enum is deliberate — it leaves room for a future role without making today's clients branch on one."
+            }
+          }
+        },
+        {
+          "title": "part_start",
+          "type": "object",
+          "required": ["sessionUpdate", "messageId", "partId", "kind"],
+          "additionalProperties": false,
+          "properties": {
+            "sessionUpdate": { "const": "part_start" },
+            "messageId": { "$ref": "#/$defs/messageId" },
+            "partId": { "$ref": "#/$defs/partId" },
+            "kind": { "$ref": "#/$defs/partKind" },
+            "toolCallId": { "$ref": "#/$defs/toolCallId" }
+          }
+        },
+        {
+          "title": "delta",
+          "description": "The only shape streamed content ever takes. `delta` is an append to (messageId, partId, field) — never a resend of accumulated content.",
+          "type": "object",
+          "required": ["sessionUpdate", "messageId", "partId", "field", "delta"],
+          "additionalProperties": false,
+          "properties": {
+            "sessionUpdate": { "const": "delta" },
+            "messageId": { "$ref": "#/$defs/messageId" },
+            "partId": { "$ref": "#/$defs/partId" },
+            "field": { "$ref": "#/$defs/deltaField" },
+            "delta": { "type": "string" }
+          }
+        },
+        {
+          "title": "part_end",
+          "type": "object",
+          "required": ["sessionUpdate", "messageId", "partId"],
+          "additionalProperties": false,
+          "properties": {
+            "sessionUpdate": { "const": "part_end" },
+            "messageId": { "$ref": "#/$defs/messageId" },
+            "partId": { "$ref": "#/$defs/partId" }
+          }
+        },
+        {
+          "title": "reasoning_item",
+          "description": "Opaque provider reasoning that arrives whole rather than as a delta. Carried raw; a client renders it or ignores it, but never reinterprets it.",
+          "type": "object",
+          "required": ["sessionUpdate", "messageId", "partId", "provider", "item"],
+          "additionalProperties": false,
+          "properties": {
+            "sessionUpdate": { "const": "reasoning_item" },
+            "messageId": { "$ref": "#/$defs/messageId" },
+            "partId": { "$ref": "#/$defs/partId" },
+            "provider": { "type": "string", "minLength": 1 },
+            "item": { "type": "object" }
+          }
+        },
+        {
+          "title": "message_end",
+          "type": "object",
+          "required": ["sessionUpdate", "messageId", "stopReason"],
+          "additionalProperties": false,
+          "properties": {
+            "sessionUpdate": { "const": "message_end" },
+            "messageId": { "$ref": "#/$defs/messageId" },
+            "stopReason": { "$ref": "#/$defs/stopReason" }
+          }
+        },
+        {
+          "title": "tool_call_start",
+          "description": "A tool call appeared. messageId/partId are always present — a provider that never streamed the call gets a part minted for it by the encoder, so a client never has to invent a home for the row.",
+          "type": "object",
+          "required": ["sessionUpdate", "toolCallId", "messageId", "partId", "tool"],
+          "additionalProperties": false,
+          "properties": {
+            "sessionUpdate": { "const": "tool_call_start" },
+            "toolCallId": { "$ref": "#/$defs/toolCallId" },
+            "messageId": { "$ref": "#/$defs/messageId" },
+            "partId": { "$ref": "#/$defs/partId" },
+            "tool": { "type": "string", "minLength": 1 },
+            "argsSummary": {
+              "type": "string",
+              "description": "One-line human summary of the arguments known at start. Absent while arguments are still streaming."
+            }
+          }
+        },
+        {
+          "title": "tool_call_update",
+          "type": "object",
+          "required": ["sessionUpdate", "toolCallId", "status"],
+          "additionalProperties": false,
+          "properties": {
+            "sessionUpdate": { "const": "tool_call_update" },
+            "toolCallId": { "$ref": "#/$defs/toolCallId" },
+            "status": { "type": "string", "enum": ["pending", "running"] },
+            "tool": { "type": "string", "minLength": 1 },
+            "argsSummary": { "type": "string" },
+            "args": { "description": "Full parsed arguments, once the model finished streaming them." },
+            "startedAtMs": { "$ref": "#/$defs/timestampMs" }
+          }
+        },
+        {
+          "title": "tool_call_end",
+          "type": "object",
+          "required": ["sessionUpdate", "toolCallId", "status", "durationMs"],
+          "additionalProperties": false,
+          "properties": {
+            "sessionUpdate": { "const": "tool_call_end" },
+            "toolCallId": { "$ref": "#/$defs/toolCallId" },
+            "tool": { "type": "string", "minLength": 1 },
+            "status": { "$ref": "#/$defs/toolStatus" },
+            "resultSummary": { "type": "string" },
+            "durationMs": { "$ref": "#/$defs/durationMs" },
+            "interrupted": {
+              "type": "boolean",
+              "description": "True when a wait-class tool was cut short by steering rather than finishing on its own."
+            },
+            "progress": { "$ref": "#/$defs/toolProgress" }
+          }
+        },
+        {
+          "title": "retry",
+          "description": "Raw retry facts. The client composes its own copy and runs its own countdown from retryAtMs; the daemon never ships a pre-rendered sentence as the contract.",
+          "type": "object",
+          "required": [
+            "sessionUpdate",
+            "attempt",
+            "maxAttempts",
+            "classification",
+            "providerMessage",
+            "delayMs",
+            "retryAtMs",
+            "resetsPartialOutput"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "sessionUpdate": { "const": "retry" },
+            "attempt": { "type": "integer", "minimum": 1 },
+            "maxAttempts": { "type": "integer", "minimum": 1 },
+            "classification": { "$ref": "#/$defs/providerClassification" },
+            "providerMessage": { "type": "string" },
+            "delayMs": { "$ref": "#/$defs/durationMs" },
+            "retryAtMs": { "$ref": "#/$defs/timestampMs" },
+            "resetsPartialOutput": {
+              "type": "boolean",
+              "description": "True when the retry discarded partial assistant output the client has already rendered."
+            }
+          }
+        },
+        {
+          "title": "compaction",
+          "type": "object",
+          "required": ["sessionUpdate", "boundaryId", "tokensBefore", "tokensAfter", "firstKeptEntry"],
+          "additionalProperties": false,
+          "properties": {
+            "sessionUpdate": { "const": "compaction" },
+            "boundaryId": { "$ref": "#/$defs/entryId" },
+            "tokensBefore": { "$ref": "#/$defs/tokenCount" },
+            "tokensAfter": { "$ref": "#/$defs/tokenCount" },
+            "firstKeptEntry": {
+              "type": ["string", "null"],
+              "description": "First transcript entry surviving the boundary; null when everything before it was cleared."
+            }
+          }
+        },
+        {
+          "title": "context_repair",
+          "type": "object",
+          "required": ["sessionUpdate", "repairs"],
+          "additionalProperties": false,
+          "properties": {
+            "sessionUpdate": { "const": "context_repair" },
+            "repairs": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/contextRepair" } }
+          }
+        },
+        {
+          "title": "context",
+          "description": "Measured size of the payload about to be sent. contextWindow is present only when a verified limit is known for the active model; an unverified limit is omitted so the client renders nothing rather than a wrong percentage.",
+          "type": "object",
+          "required": ["sessionUpdate", "tokenEstimate", "sourceEntryCount"],
+          "additionalProperties": false,
+          "properties": {
+            "sessionUpdate": { "const": "context" },
+            "tokenEstimate": { "$ref": "#/$defs/tokenCount" },
+            "sourceEntryCount": { "type": "integer", "minimum": 0 },
+            "contextWindow": { "$ref": "#/$defs/tokenCount" }
+          }
+        },
+        {
+          "title": "usage",
+          "description": "Raw token counts only, split by scope so the two can never be confused: `turn` is the provider call that just finished, `session` is the running total. costMicroUsd is present only when the active model has known pricing.",
+          "type": "object",
+          "required": ["sessionUpdate", "turn", "session"],
+          "additionalProperties": false,
+          "properties": {
+            "sessionUpdate": { "const": "usage" },
+            "turn": { "$ref": "#/$defs/turnUsage" },
+            "session": { "$ref": "#/$defs/sessionUsage" }
+          }
+        },
+        {
+          "title": "steer",
+          "description": "A steering message landed as its own synthetic user turn. It is never appended to a tool result, so compaction, replay, and /context attribute it to the user.",
+          "type": "object",
+          "required": ["sessionUpdate", "entryId", "text", "at"],
+          "additionalProperties": false,
+          "properties": {
+            "sessionUpdate": { "const": "steer" },
+            "entryId": { "$ref": "#/$defs/entryId" },
+            "text": { "type": "string", "minLength": 1 },
+            "at": { "$ref": "#/$defs/steerBoundary" }
+          }
+        },
+        {
+          "title": "loop_warning",
+          "type": "object",
+          "required": ["sessionUpdate", "warning", "hardStopRequested"],
+          "additionalProperties": false,
+          "properties": {
+            "sessionUpdate": { "const": "loop_warning" },
+            "warning": { "$ref": "#/$defs/loopWarning" },
+            "hardStopRequested": { "type": "boolean" }
+          }
+        },
+        {
+          "title": "transport_fallback",
+          "type": "object",
+          "required": ["sessionUpdate", "from", "to", "reason", "resetsPartialOutput"],
+          "additionalProperties": false,
+          "properties": {
+            "sessionUpdate": { "const": "transport_fallback" },
+            "from": { "$ref": "#/$defs/apiType" },
+            "to": { "$ref": "#/$defs/apiType" },
+            "reason": { "type": "string" },
+            "resetsPartialOutput": { "type": "boolean" }
+          }
+        },
+        {
+          "title": "error",
+          "type": "object",
+          "required": ["sessionUpdate", "error"],
+          "additionalProperties": false,
+          "properties": {
+            "sessionUpdate": { "const": "error" },
+            "error": { "$ref": "#/$defs/providerError" }
+          }
+        },
+        {
+          "title": "report",
+          "description": "An audit line from a background subsystem (git pipeline, merge resolver, workspace lifecycle).",
+          "type": "object",
+          "required": ["sessionUpdate", "message"],
+          "additionalProperties": false,
+          "properties": {
+            "sessionUpdate": { "const": "report" },
+            "message": { "type": "string" }
+          }
+        },
+        {
+          "title": "model_changed",
+          "type": "object",
+          "required": ["sessionUpdate", "provider", "model"],
+          "additionalProperties": false,
+          "properties": {
+            "sessionUpdate": { "const": "model_changed" },
+            "provider": { "type": "string", "minLength": 1 },
+            "model": { "type": "string", "minLength": 1 },
+            "apiType": { "$ref": "#/$defs/apiType" }
+          }
+        },
+        {
+          "title": "session_changed",
+          "description": "The active transcript was replaced (new, load, or fork). A client discards its store and re-hydrates via session/snapshot.",
+          "type": "object",
+          "required": ["sessionUpdate", "descriptor", "reason"],
+          "additionalProperties": false,
+          "properties": {
+            "sessionUpdate": { "const": "session_changed" },
+            "descriptor": { "$ref": "#/$defs/sessionDescriptor" },
+            "reason": { "type": "string", "enum": ["new", "load", "fork", "rewind"] }
+          }
+        }
+      ]
+    },
+
+    "canonicalUpdateParams": {
+      "description": "The shape every new client reads. One notification carries exactly one semantic update.",
+      "type": "object",
+      "required": ["sessionId", "update"],
+      "additionalProperties": false,
+      "properties": {
+        "sessionId": { "$ref": "#/$defs/sessionId" },
+        "update": { "$ref": "#/$defs/update" }
+      }
+    },
+
+    "sessionUpdateParams": { "$ref": "#/$defs/canonicalUpdateParams" },
+
+    "notification": {
+      "description": "Every daemon-to-client notification. session/update is the only one: everything the client needs is a variant of the update union.",
+      "type": "object",
+      "required": ["jsonrpc", "method", "params"],
+      "additionalProperties": false,
+      "properties": {
+        "jsonrpc": { "$ref": "#/$defs/jsonRpcVersion" },
+        "method": { "const": "session/update" },
+        "params": { "$ref": "#/$defs/sessionUpdateParams" }
+      }
+    },
+
+    "requests": {
+      "$comment": "Client-to-daemon methods, as a plain map from method name to its params/result schemas. Not itself a schema: address a member as #/$defs/requests/<method with / escaped as ~1>/params.",
+      "initialize": {
+          "params": { "type": "object" },
+          "result": {
+            "type": "object",
+            "required": ["protocolVersion", "serverInfo", "capabilities"],
+            "additionalProperties": true,
+            "properties": {
+              "protocolVersion": { "type": "string" },
+              "serverInfo": {
+                "type": "object",
+                "required": ["name", "version"],
+                "additionalProperties": true,
+                "properties": { "name": { "type": "string" }, "version": { "type": "string" } }
+              },
+              "capabilities": {
+                "type": "object",
+                "required": ["methods", "bidirectional", "cancellation", "transport"],
+                "additionalProperties": true,
+                "properties": {
+                  "methods": { "type": "array", "items": { "type": "string" } },
+                  "bidirectional": { "type": "boolean" },
+                  "cancellation": { "type": "boolean" },
+                  "transport": { "type": "string", "enum": ["stdio"] }
+                }
+              }
+            }
+          }
+        },
+
+        "session/new": {
+          "params": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": { "name": { "type": "string", "minLength": 1 } }
+          },
+          "result": { "$ref": "#/$defs/sessionDescriptor" }
+        },
+        "session/load": {
+          "params": {
+            "type": "object",
+            "required": ["name"],
+            "additionalProperties": false,
+            "properties": { "name": { "type": "string", "minLength": 1 } }
+          },
+          "result": { "$ref": "#/$defs/sessionDescriptor" }
+        },
+        "session/list": {
+          "description": "Every transcript on disk. Each row carries the sessionId that `session/update` frames are tagged with, so a listing entry can be correlated with live traffic; `name` is only a filename.",
+          "params": { "type": "object", "additionalProperties": false, "properties": {} },
+          "result": { "type": "array", "items": { "$ref": "#/$defs/sessionListing" } }
+        },
+        "session/snapshot": {
+          "description": "Full hydration payload. A client fetches this once at attach and then applies live updates on top; a live update that arrives during the fetch wins.",
+          "params": { "type": "object", "additionalProperties": false, "properties": {} },
+          "result": {
+            "type": "object",
+            "required": ["descriptor", "entries", "provider", "model", "usage"],
+            "additionalProperties": true,
+            "properties": {
+              "descriptor": { "$ref": "#/$defs/sessionDescriptor" },
+              "entries": { "type": "array", "items": { "type": "object" } },
+              "provider": { "type": "string" },
+              "model": { "type": "string" },
+              "apiType": { "$ref": "#/$defs/apiType" },
+              "workspace": { "type": "string" },
+              "turnActive": { "type": "boolean" },
+              "pendingSteer": { "type": "integer", "minimum": 0 },
+              "providerConfigured": {
+                "type": "boolean",
+                "description": "False when the daemon booted with no provider configured. The session is real and every non-provider method works, but a prompt will be refused with an actionable error until `provider/add` runs. A client that sees `false` opens setup instead of a composer. Absent is read as true, so a daemon that predates the field is not mistaken for an unconfigured one. `provider`, `model` and `apiType` are empty or absent while it is false: an unconfigured daemon has no honest value for them."
+              },
+              "usage": {
+                "description": "`session` is the same cumulative shape the `usage` update carries, so a hydrating client and a streaming client read one vocabulary.",
+                "type": "object",
+                "required": ["session"],
+                "additionalProperties": false,
+                "properties": {
+                  "session": { "$ref": "#/$defs/sessionUsage" },
+                  "contextTokens": { "$ref": "#/$defs/tokenCount" },
+                  "contextWindow": { "$ref": "#/$defs/tokenCount" }
+                }
+              }
+            }
+          }
+        },
+        "session/prompt": {
+          "params": {
+            "type": "object",
+            "required": ["prompt"],
+            "additionalProperties": false,
+            "properties": { "prompt": { "type": "string", "minLength": 1 } }
+          },
+          "result": {
+            "type": "object",
+            "required": ["stopReason"],
+            "additionalProperties": true,
+            "properties": { "stopReason": { "$ref": "#/$defs/stopReason" } }
+          }
+        },
+        "session/steer": {
+          "description": "Injects text into the running turn at the next tool boundary as a STANDALONE SYNTHETIC USER TURN. Aborts an interruptible wait-class tool, which returns 'Wait interrupted: the user sent a message.' to the model. With no turn running this is an ordinary prompt.",
+          "params": {
+            "type": "object",
+            "required": ["prompt"],
+            "additionalProperties": false,
+            "properties": { "prompt": { "type": "string", "minLength": 1 } }
+          },
+          "result": {
+            "type": "object",
+            "required": ["delivery"],
+            "additionalProperties": false,
+            "properties": {
+              "delivery": {
+                "type": "string",
+                "enum": ["steered", "prompted"],
+                "description": "'steered' means it was queued into the running turn; 'prompted' means no turn was running and it started one."
+              },
+              "pending": {
+                "type": "integer",
+                "minimum": 0,
+                "description": "Steering messages queued but not yet drained."
+              }
+            }
+          }
+        },
+        "session/cancel": {
+          "description": "Cancels the running turn. Partial output is kept and marked. A zero-output turn's prompt is trimmed from history ONLY when rewoundToComposer is true — that is the client asserting it has put the text back in the composer, which is what prevents the send+cancel double-prompt bug.",
+          "params": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "rewoundToComposer": {
+                "type": "boolean",
+                "description": "The client has restored the prompt text into its composer and takes ownership of it."
+              }
+            }
+          },
+          "result": {
+            "type": "object",
+            "required": ["cancelled"],
+            "additionalProperties": false,
+            "properties": {
+              "cancelled": { "type": "boolean" },
+              "promptTrimmed": { "type": "boolean" }
+            }
+          }
+        },
+        "session/fork": {
+          "params": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": { "entryId": { "$ref": "#/$defs/entryId" } }
+          },
+          "result": {
+            "type": "object",
+            "required": ["descriptor"],
+            "additionalProperties": true,
+            "properties": { "descriptor": { "$ref": "#/$defs/sessionDescriptor" } }
+          }
+        },
+        "session/command": {
+          "description": "Runs one slash command. The result names its own shape through `resultKind`, so a client dispatches to a renderer instead of guessing from the payload.",
+          "params": {
+            "type": "object",
+            "required": ["command"],
+            "additionalProperties": false,
+            "properties": { "command": { "type": "string", "minLength": 1 } }
+          },
+          "result": { "$ref": "#/$defs/commandResult" }
+        },
+        "session/commands": {
+          "description": "The slash-command surface this daemon routes, for the client's `/` completion popup and command palette. It is generated from the router's own table rather than restated, so a command that exists is listed and a listed command exists.",
+          "params": { "type": "object", "additionalProperties": false, "properties": {} },
+          "result": { "$ref": "#/$defs/commandsResult" }
+        },
+        "session/complete": {
+          "description": "Ranked completion candidates for a composer popup. The server ranks; the client renders the order it is given. `limit` defaults to 10 and is capped at 50 — a popup shows a handful of rows, and a larger page would cost latency nobody sees.",
+          "params": {
+            "type": "object",
+            "required": ["sessionId", "kind", "query"],
+            "additionalProperties": false,
+            "properties": {
+              "sessionId": { "$ref": "#/$defs/sessionId" },
+              "kind": { "$ref": "#/$defs/completionKind" },
+              "query": {
+                "type": "string",
+                "description": "What the user has typed after the trigger character. Empty is a valid query and asks for the default ranking."
+              },
+              "limit": { "type": "integer", "minimum": 1, "maximum": 50 }
+            }
+          },
+          "result": { "$ref": "#/$defs/completionResult" }
+        },
+        "session/models": {
+          "description": "Every configured provider's models, in one answer. Each provider's discovery is bounded and independent: one unreachable endpoint costs that provider its discovered rows, never the call. `refresh: true` re-runs discovery instead of serving the cache.",
+          "params": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": { "refresh": { "type": "boolean" } }
+          },
+          "result": { "$ref": "#/$defs/modelsResult" }
+        },
+        "session/select_model": {
+          "description": "Switches the session's model, and its provider with it. `model` is either a full `provider/model` reference — which changes both in one validated step — a bare model id, which is read against the provider in use, or an `@role` alias. There is no separate 'select the provider first' step: this is the switching surface.",
+          "params": {
+            "type": "object",
+            "required": ["model"],
+            "additionalProperties": false,
+            "properties": { "model": { "type": "string", "minLength": 1 } }
+          },
+          "result": {
+            "type": "object",
+            "required": ["provider", "model"],
+            "additionalProperties": false,
+            "properties": { "provider": { "type": "string" }, "model": { "type": "string" } }
+          }
+        },
+        "session/providers": {
+          "params": { "type": "object", "additionalProperties": false, "properties": {} },
+          "result": {
+            "type": "object",
+            "required": ["current", "available"],
+            "additionalProperties": false,
+            "properties": {
+              "current": { "type": "string" },
+              "available": { "type": "array", "items": { "type": "string" } }
+            }
+          }
+        },
+        "session/select_provider": {
+          "params": {
+            "type": "object",
+            "required": ["provider"],
+            "additionalProperties": false,
+            "properties": {
+              "provider": { "type": "string", "minLength": 1 },
+              "model": { "type": "string", "minLength": 1 }
+            }
+          },
+          "result": {
+            "type": "object",
+            "required": ["provider", "model"],
+            "additionalProperties": false,
+            "properties": { "provider": { "type": "string" }, "model": { "type": "string" } }
+          }
+        },
+
+        "provider/setup_options": {
+          "description": "The provider-setup wizard's catalog. Read-only and side-effect free: it is a question about this machine, so a client may ask it before any provider exists — which is the only time it matters.",
+          "params": { "type": "object", "additionalProperties": false, "properties": {} },
+          "result": { "$ref": "#/$defs/providerSetupOptionsResult" }
+        },
+        "provider/detect": {
+          "description": "Ask an endpoint what it speaks, and where, before anything is saved. Bounded probes run concurrently, each against BOTH path shapes — the base exactly as given, and the base with its `/v1` added or removed — because that is the difference users cannot see and cannot guess: a `/models` fetch with a Bearer credential (an OpenAI-shaped list identifies the OpenAI family), the same with `x-api-key` and `anthropic-version` (an Anthropic-shaped list identifies the Messages API), and a minimal POST to `/responses` alongside the same POST to a route that certainly does not exist. `openai_responses` is reported only when the Responses route is CONFIRMED — a Response-shaped 2xx body, a validation error naming a parameter only that API defines, or an answer that differs from the one the nonexistent route gets. A status alone is not confirmation: a proxy that hands every unknown path to one handler answers a generic 400, and an unconfirmed OpenAI-family endpoint is reported as `openai_completions`, which every endpoint in that family speaks. A 401 that still carries a recognisable error envelope identifies the family and sets `authRequired`. Whichever shape answered is reported as `normalizedBaseUrl`, which is what makes the protocol and the URL a single answer instead of two guesses.\n\nNothing is cached and nothing is written: this is a question about a URL, so it is answerable before any provider exists. An endpoint that cannot be reached answers `apiTypes: []` rather than failing — a typo in a base URL is a form to correct, not a broken daemon.\n\nSECRET TRANSPORT. `apiKey` is a credential in flight under exactly the terms `provider/verify` states: used for the probes, never persisted, never logged, never echoed.",
+          "params": {
+            "type": "object",
+            "required": ["baseUrl"],
+            "additionalProperties": false,
+            "properties": {
+              "baseUrl": { "type": "string", "minLength": 1 },
+              "apiKey": { "type": "string", "minLength": 1, "description": "SECRET — see this method's description. Optional: detection works without one, and reports `authRequired` instead." }
+            }
+          },
+          "result": { "$ref": "#/$defs/detectProviderResult" }
+        },
+        "provider/verify": {
+          "description": "One cheap liveness check against a provider that has not been saved yet: list the endpoint's models with a deadline, and answer what happened. Optional — nothing requires it before `provider/add` — and never blocking: `timeoutMs` bounds it, and an unreachable endpoint is a result, not a failure.\n\nSECRET TRANSPORT. `apiKey` is a credential in flight. It crosses this pipe because the pipe is stdio between a client and the daemon it was spawned by — one trust domain, no network hop — and it goes no further: it is never persisted by this method, never written to a log, never echoed in the result, and never carried by any `session/update` notification. A client must keep it out of its transcript for the same reason.",
+          "params": {
+            "type": "object",
+            "required": ["baseUrl", "apiType"],
+            "additionalProperties": false,
+            "properties": {
+              "provider": { "type": "string", "minLength": 1, "description": "The id this provider will be saved under, when one has been chosen. Used only to shape the request the way that provider expects." },
+              "baseUrl": { "type": "string", "minLength": 1 },
+              "apiType": { "$ref": "#/$defs/configurableApiType" },
+              "apiKey": { "type": "string", "minLength": 1, "description": "SECRET — see this method's description. The credential to authenticate the probe with, for a provider that is not saved yet." },
+              "authEnvVar": { "type": "string", "minLength": 1, "description": "The name of an environment variable to read the credential from instead. A name, never a value." },
+              "timeoutMs": { "type": "integer", "minimum": 250, "maximum": 30000 }
+            }
+          },
+          "result": { "$ref": "#/$defs/verifyProviderResult" }
+        },
+        "provider/add": {
+          "description": "Persist a provider and its roles, then reload the daemon's provider configuration so the new one is immediately selectable. It does **not** switch to it, ever: adding is pure addition, `session/select_model` is the one switching surface, and keeping the two apart is what lets a client add a provider it does not want to use yet. After the save, model discovery is attempted once for the new provider and reported as `modelsDiscovered`; it is best-effort and can never fail the add.\n\nAn existing provider id UPDATES that provider, which is how editing works: there is no separate update method. Pair it with persist:'keep' to edit everything but the credential, and with `provider/get` to fill the form.\n\nAn update is FIELD-WISE: what the request carries replaces, what it omits survives. A form with no model rows on it must not be able to delete a provider's declared `models` — including ids registered through `model/add` for an endpoint that cannot list its own — so an omitted `model`, `fastModel`, `mergeModel` or `websocket` leaves the stored value alone, and a carried model id is added to the declared list rather than replacing it. Creating a provider is the same call with a name nothing has claimed.\n\n`baseUrl` is stored in canonical form — the exact prefix Lyra joins routes onto, version segment included (`https://api.openai.com/v1`, `https://api.anthropic.com/v1`, `https://host/api/v1`), with a trailing slash or a pasted full route trimmed off. Send `provider/detect`'s `normalizedBaseUrl` and it is stored unchanged.\n\nSECRET TRANSPORT. `apiKey` is a credential in flight, under exactly the terms `provider/verify` states. Where it comes to rest is `persist`'s decision, and only 'plaintext' puts it in a file — 'keychain' hands it to the OS keychain and writes a reference, 'env' and 'none' never receive one at all. The result names the auth *source* and never the credential.",
+          "params": {
+            "type": "object",
+            "required": ["provider", "baseUrl", "apiType", "persist"],
+            "additionalProperties": false,
+            "properties": {
+              "provider": { "type": "string", "minLength": 1, "description": "Lowercase id: letters, digits and hyphens. It is the left half of every `provider/model` reference." },
+              "baseUrl": { "type": "string", "minLength": 1 },
+              "apiType": { "$ref": "#/$defs/configurableApiType" },
+              "model": { "type": "string", "minLength": 1 },
+              "fastModel": { "type": "string", "minLength": 1 },
+              "mergeModel": { "type": "string", "minLength": 1 },
+              "websocket": { "type": "string", "enum": ["auto", "on", "off"] },
+              "persist": { "$ref": "#/$defs/providerPersist" },
+              "apiKey": { "type": "string", "minLength": 1, "description": "SECRET — see this method's description. Required by persist 'keychain' and 'plaintext'; rejected by 'env' and 'none', which have nowhere to put it." },
+              "authEnvVar": { "type": "string", "minLength": 1, "description": "Required by persist 'env': the name of a variable this daemon's process already exports. A name, never a value." }
+            }
+          },
+          "result": { "$ref": "#/$defs/addProviderResult" }
+        },
+        "provider/get": {
+          "description": "One configured provider, read back for an edit form. Read-only and side-effect free, and it never carries a credential — only where the credential comes from. The configuration is re-read first, so a provider added or hand-edited since boot is visible. A name that is not configured is an error listing the ones that are.",
+          "params": {
+            "type": "object",
+            "required": ["provider"],
+            "additionalProperties": false,
+            "properties": { "provider": { "type": "string", "minLength": 1 } }
+          },
+          "result": { "$ref": "#/$defs/getProviderResult" }
+        },
+        "provider/remove": {
+          "description": "Delete a provider from ~/.lyra/providers.toml through the same non-destructive merge `provider/add` writes with: every other provider, role, and section survives, and an unparseable file is never rewritten. The configuration is re-read afterwards, so the provider disappears from `session/models` and `session/providers` without a restart.\n\nIt REFUSES when the provider is the one the live session is running on: removing the ground you are standing on would leave a session that can neither prompt nor switch back. The client switches first with `session/select_model`, then removes.\n\nRoles that named the provider are left exactly as they were and reported in `danglingRoles`. The stored credential is left alone unless `removeCredential` asks for it; only OS-keychain entries can be deleted, since an environment variable and a plaintext token are the user's own to manage — the plaintext one goes with the declaration it lived in.",
+          "params": {
+            "type": "object",
+            "required": ["provider"],
+            "additionalProperties": false,
+            "properties": {
+              "provider": { "type": "string", "minLength": 1 },
+              "removeCredential": {
+                "type": "boolean",
+                "description": "Also delete this provider's OS-keychain entry. Ignored for every other auth type — there is nothing Lyra owns to delete. Defaults to false: a credential can back more than one thing, and destroying one that was not asked about is unrecoverable."
+              }
+            }
+          },
+          "result": { "$ref": "#/$defs/removeProviderResult" }
+        },
+        "model/add": {
+          "description": "Declare a model id for a provider whose endpoint cannot list its own — a gateway with no `/models` route, or one that lists a subset. The id is appended to that provider's `models` array in ~/.lyra/providers.toml through the same non-destructive merge `provider/add` uses (every other provider, role and section survives), and the configuration is re-read so the model is immediately selectable. A provider that is not configured is an error naming the ones that are; adding the same id twice is idempotent, not accumulative. Declaring a model does not switch to it.",
+          "params": {
+            "type": "object",
+            "required": ["provider", "model"],
+            "additionalProperties": false,
+            "properties": {
+              "provider": { "type": "string", "minLength": 1, "description": "An already-configured provider id. This method never creates one — `provider/add` does." },
+              "model": { "type": "string", "minLength": 1, "description": "The exact model id to send to that provider." }
+            }
+          },
+          "result": { "$ref": "#/$defs/addModelResult" }
+        },
+
+        "context/inspect": {
+          "params": { "type": "object", "additionalProperties": false, "properties": {} },
+          "result": {
+            "type": "object",
+            "required": ["tokenEstimate"],
+            "additionalProperties": true,
+            "properties": { "tokenEstimate": { "$ref": "#/$defs/tokenCount" } }
+          }
+        },
+
+        "workspace/list": { "params": { "type": "object" }, "result": { "type": "array", "items": { "type": "object" } } },
+        "workspace/create": {
+          "params": {
+            "type": "object",
+            "additionalProperties": true,
+            "properties": { "name": { "type": "string" }, "task": { "type": "string" } }
+          },
+          "result": { "type": "object" }
+        },
+        "workspace/drop": {
+          "params": {
+            "type": "object",
+            "required": ["name"],
+            "additionalProperties": true,
+            "properties": { "name": { "type": "string", "minLength": 1 } }
+          },
+          "result": { "type": "object" }
+        },
+
+        "agent/list": { "params": { "type": "object" }, "result": { "type": "array", "items": { "type": "object" } } },
+        "agent/spawn": {
+          "params": {
+            "type": "object",
+            "required": ["task"],
+            "additionalProperties": true,
+            "properties": {
+              "task": { "type": "string", "minLength": 1 },
+              "model": { "type": "string" },
+              "tools": { "type": "array", "items": { "type": "string" } },
+              "context": { "type": "string" },
+              "label": { "type": "string" },
+              "isolated": { "type": "boolean" },
+              "workspace": { "type": "string" },
+              "acp": { "type": "string" }
+            }
+          },
+          "result": {}
+        },
+        "agent/cancel": {
+          "params": {
+            "type": "object",
+            "required": ["id"],
+            "additionalProperties": true,
+            "properties": { "id": { "type": "string", "minLength": 1 } }
+          },
+          "result": {}
+        },
+        "agent/message": {
+          "params": {
+            "type": "object",
+            "required": ["to"],
+            "additionalProperties": true,
+            "properties": {
+              "to": { "type": "string", "minLength": 1 },
+              "message": { "type": "string" },
+              "data": {}
+            }
+          },
+          "result": {}
+        },
+
+        "git/preview": { "params": { "type": "object" }, "result": {} },
+        "git/apply": {
+          "params": {
+            "type": "object",
+            "required": ["preview"],
+            "additionalProperties": true,
+            "properties": { "preview": { "type": "string", "minLength": 1 } }
+          },
+          "result": {}
+        },
+        "git/rollback": {
+          "params": {
+            "type": "object",
+            "additionalProperties": true,
+            "properties": { "snapshot": { "type": "string" } }
+          },
+          "result": {}
+        },
+        "git/snapshot": {
+          "params": {
+            "type": "object",
+            "additionalProperties": true,
+            "properties": { "name": { "type": "string" } }
+          },
+          "result": {}
+        },
+
+        "settings/get": { "params": { "type": "object" }, "result": { "type": "object" } },
+        "settings/set": {
+          "params": {
+            "type": "object",
+            "required": ["args"],
+            "additionalProperties": false,
+            "properties": { "args": { "type": "array", "items": { "type": "string" } } }
+          },
+          "result": {}
+        }
+    },
+
+    "clientRequests": {
+      "$comment": "Daemon-to-client requests. These are the only places the daemon blocks on a human.",
+      "session/request_permission": {
+          "params": {
+            "type": "object",
+            "required": ["sessionId", "kind", "title", "options"],
+            "additionalProperties": false,
+            "properties": {
+              "sessionId": { "$ref": "#/$defs/sessionId" },
+              "kind": { "type": "string", "enum": ["git_auto_mode"] },
+              "title": { "type": "string", "minLength": 1 },
+              "detail": { "type": "string" },
+              "options": {
+                "type": "array",
+                "minItems": 1,
+                "items": {
+                  "type": "object",
+                  "required": ["optionId", "label", "kind"],
+                  "additionalProperties": false,
+                  "properties": {
+                    "optionId": { "type": "string", "minLength": 1 },
+                    "label": { "type": "string", "minLength": 1 },
+                    "kind": { "type": "string", "enum": ["allow_once", "allow_always", "reject"] }
+                  }
+                }
+              }
+            }
+          },
+          "result": {
+            "type": "object",
+            "required": ["optionId"],
+            "additionalProperties": false,
+            "properties": { "optionId": { "type": "string", "minLength": 1 } }
+          }
+      }
+    }
+  }
+}

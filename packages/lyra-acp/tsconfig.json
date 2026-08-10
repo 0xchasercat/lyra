@@ -1,6 +1,7 @@
 {
   "extends": "../../tsconfig.base.json",
-  "compilerOptions": { "composite": true, "rootDir": "src", "outDir": "dist" },
+  "comment": "rootDir is the package root, not src/, because schema/protocol.json is imported as a module: that is what makes the canonical schema travel inside `bun build --compile` output instead of being read from a path that does not exist there.",
+  "compilerOptions": { "composite": true, "rootDir": ".", "outDir": "dist", "resolveJsonModule": true },
   "references": [{ "path": "../lyra-core" }],
-  "include": ["src/**/*.ts"]
+  "include": ["src/**/*.ts", "schema/*.json"]
 }
