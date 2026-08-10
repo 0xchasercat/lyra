@@ -89,9 +89,9 @@ Windows-conditional code.
 7. [Delegation: one primitive](#7-delegation-one-primitive)
 8. [JIT runtime](#8-jit-runtime)
 9. [IRC bus](#9-irc-bus)
-10. [Workspaces](#10-workspaces)
+10. [Where work happens](#10-where-work-happens) · [10.2 Checkpoints](#102-checkpoints)
 11. [Process execution](#11-process-execution)
-12. [Git pipeline](#12-git-pipeline)
+12. [Integration is the model's job](#12-integration-is-the-models-job)
 13. [Context discipline](#13-context-discipline)
 14. [System prompt](#14-system-prompt)
 15. [Tools](#15-tools)
@@ -188,9 +188,10 @@ expected to complete the product.
 
 `lyra` in a git repo with one API key in the environment, no config file:
 
-- CoW workspace created, named, ready
+- Working directly in the directory you launched from, with a checkpoint before every
+  state-changing tool call; `/checkpoints` and `/rollback` are live from the first turn
 - `spawn` live, IRC bus live, exec semaphore sized to the host
-- Git pipeline armed in `observe` mode; preview / apply / rollback available
+- CoW workspaces available the moment a child asks for `isolated`
 - ACP daemon on stdio
 - Bundled skills discovered and indexed
 - **LSP running for every detected language.** `Cargo.toml` present means rust-analyzer is
@@ -838,9 +839,14 @@ spawn({
 
   isolated?: boolean,             // own CoW workspace (§10)
   workspace?: string,             // or an existing one by name
+  writeScope?: string[],          // declared partition of a shared tree
 
-  blocking?: boolean,             // default false — returns a job handle
+  blocking?: boolean,             // default false — returns { id, peer, status }
   label?: string,
+
+  id?: string,                    // an existing child, by spawn id or peer name
+  op?: 'status' | 'cancel' | 'list',
+  timeoutMs?: number,             // how long a collect waits before it reports instead
 })
 ```
 
@@ -849,8 +855,46 @@ deliverable machine-checkable; absence makes it prose. The unification is only r
 the field exists — a `spawn` whose task is a bare string has renamed subagents, not unified
 anything.
 
-Non-blocking by default. Returns a handle immediately; the child's name is its workspace
-name (§10), so `/agents` and IRC read in English.
+Non-blocking by default. Returns `{ id, peer, status }` immediately. `peer` is the name the
+child answers to on the bus — its label when that is a usable single word, its `spawn-N` id
+otherwise — and it is authoritative: `hub send to:` takes exactly that string. A child is
+addressable by either spelling everywhere.
+
+### The loop
+
+Starting a child was never the hard part. Watching one was, and for a while it was
+impossible: a real session spawned a child non-blocking and then found `hub wait` returned
+`[]`, `hub list` showed only the main session, and no status, result, or cancel existed. It
+gave up and did the child's work itself, in the same files the child was writing, with no
+way to see the race. The delegation surface is now a loop rather than a launcher.
+
+```typescript
+spawn({ task, label })                    // → { id: 'spawn-1', peer: 'reviewer', status }
+spawn({ id: 'reviewer', op: 'status' })   // → state, tool calls, files, last output
+hub({ op: 'send', to: 'reviewer', ... })  // → folds into its next tool boundary
+hub({ op: 'wait', channel: 'agents' })    // → every child's lifecycle, as it happens
+spawn({ id: 'reviewer' })                 // → the result, with filesModified
+spawn({ id: 'reviewer', op: 'cancel' })   // → stop it
+```
+
+**The state vocabulary.** `queued` · `starting` · `running` · `awaiting_tool` · `completed` ·
+`failed` · `timed_out` · `cancelled`. `timed_out` and `cancelled` are deliberately separate:
+a deadline says "give it less to do or more time", a cancel says "you stopped it". A
+completed child's result stays collectable — `spawn { id }` returns it again — for as long
+as the child is retained.
+
+**Deadlines are the observer's, never the job's.** A collect that expires answers with a
+*diagnosis*, not a cancel: the child's state, its tool-call count, how long since it last
+did anything, whatever it has said so far, and the id to keep waiting on or stop. "Was the
+model unavailable? did it start? was there partial output?" all have answers now. The child
+keeps running. §3.4 gives a delegated turn 60 minutes, and the tool-dispatch layer honours
+that rather than the generic 120-second tool deadline.
+
+**`writeScope`.** Optional, for shared-tree children: a list of paths or globs the child may
+write. Its `write` and `edit` refuse anything outside and say which paths it *does* own; the
+parent sees the declaration and any refusal in `spawn status`, `hub list`, and the child's
+result. It is a declared partition, not a lock — no lease, no expiry, nothing to deadlock on,
+and nothing pretending to guarantee what a shell command could still do.
 
 **Model selection.** Inherit unless told otherwise. The model picks from the live model list
 when it has reason to — cheap tier for mechanical work, top tier for design. `@`-roles keep
@@ -922,7 +966,7 @@ lyra.spawn(opts)                 // → { output, workspace, id }
 lyra.exec(cmd, opts?)            // semaphore-gated (§11)
 lyra.read/write/edit/glob/grep   // same engines as the tools
 lyra.irc.send/publish/wait       // §9
-lyra.git.preview/apply/rollback  // §12
+lyra.git.preview/apply/rollback  // §12; rollback restores a checkpoint (§10.2)
 lyra.workspace.create/list/drop  // §10
 lyra.report(msg)                 // ← the only thing that reaches main context
 lyra.checkpoint(state)           // resumable across restart
@@ -946,46 +990,84 @@ lyra.checkpoint(state)           // resumable across restart
 Process-global mailbox bus. Named peers, direct messages, and channels.
 
 ```typescript
-hub({ op: 'send',      to: 'purple-falcon', message: '...' })
-hub({ op: 'send',      to: 'purple-falcon', message: '...', await: true })
-hub({ op: 'publish',   channel: 'build-results', data: {...} })
-hub({ op: 'subscribe', channel: 'build-results' })
-hub({ op: 'wait',      channel: 'build-results', timeoutMs: 60_000 })
+hub({ op: 'send',        to: 'reviewer', message: '...' })
+hub({ op: 'send',        to: 'reviewer', message: '...', await: true })
+hub({ op: 'publish',     channel: 'build-results', data: {...} })
+hub({ op: 'subscribe',   channel: 'build-results' })
+hub({ op: 'unsubscribe', channel: 'build-results' })
+hub({ op: 'wait',        channel: 'build-results', timeoutMs: 60_000 })
 hub({ op: 'inbox' })
 hub({ op: 'list' })
 ```
 
-- **Names are workspace names** (§10), never UUIDs. `/agents` and message logs stay legible.
+There is no `from`. An agent sends as itself, under the peer name its own spawn result
+reported; the field only ever let one agent send under another's name, and produced
+`Unknown sender peer: root` when the name was invented.
+
+- **Names are legible**, never UUIDs: a child's label when it is a single usable word, its
+  `spawn-N` id otherwise, and its workspace name is reported beside it. The name is minted
+  at `spawn` — before anything can be addressed to it — and never changes, not when an
+  isolated workspace is created later and not across a revival.
 - **Channels, not only point-to-point.** Fan-out/fan-in needs a bus, and OMP's peer-only
   model forces N sends.
-- **Delivery to a running agent is a non-interrupting aside**, folded into its next turn.
-  Replies are real turns.
+- **Delivery to a running agent is a non-interrupting aside**, folded in at its next tool
+  boundary as its own synthetic user turn, marked with the sender's name so `/context`,
+  compaction and replay attribute it and the model never mistakes another agent for the
+  user. It does *not* cut short a blocked wait — only the user gets to do that (§0.2). A
+  message the agent has already read for itself through `hub` is not delivered twice.
+  Replies are real turns and reach the sender the same way.
 - **A message revives a parked agent.** The only resume primitive; there is no separate
-  resume call.
+  resume call. A child parks on *every* terminal state, including failure — unregistering it
+  would leave nothing to send the message to — and revival re-runs the same child, same id,
+  same peer, same transcript, with the message as its next instruction. The message becomes
+  the prompt rather than also sitting in the inbox: an agent restarted with "fix the failing
+  test" must not then read "fix the failing test" out of its own mailbox.
+- **Channel `agents` carries every child's lifecycle** — spawned, started, completed, failed,
+  timed_out, cancelled, revived — so `hub { op: 'wait', channel: 'agents' }` is the parent's
+  event stream and nobody has to poll. A terminal transition is also addressed directly to
+  the agent that spawned the child, so a parent waiting on its own mailbox mid-conversation
+  is woken by a child that died rather than sitting until its deadline.
+- **`hub list` reports state, not just names.** The bus knows whether a mailbox is live; the
+  spawn manager knows what the agent is doing. Both are in the answer, because "parked" and
+  "failed" are different facts.
 - **Every wait has a deadline** (§3.4) and returns empty rather than hanging.
 - **ACP-exposed** (§21), so external harnesses join the same bus. Two agents needing a
   protocol richer than prose write one at runtime (§8) and hand over the endpoint.
 
 ---
 
-## 10. Workspaces
+## 10. Where work happens
 
-### The problem, from the field
+### The main session runs in the launch directory
 
-Bun's rewrite hit all four within minutes of scaling up:
+`lyra` works in the directory you started it in. No clone, no copy, no redirection. The
+path in the footer is the path you typed, `pwd` inside a `bash` call is that same path, and
+a file the model writes is on disk where you expected it.
 
-1. **Shared state.** *"one Claude ran `git stash` before committing. Another ran `git stash
-   pop`. And then `git reset HEAD --hard`. They were stepping on each other."*
-2. **Isolation cost.** *"if I put each Claude into a separate worktree, I would run out of
-   disk space."*
-3. **Host starvation.** 64 concurrent builds.
-4. **The orchestration trap.** Their fix was prompt-engineering: *"never run `git stash` or
-   `git reset`… No `cargo` either. No slow commands at all."* Tokens spent, autonomy lost,
-   and a rule the model can violate.
+This is a reversal. The main session used to run in a copy-on-write clone under
+`.lyra/workspaces/<name>/`, and the cost was constant and everywhere:
 
-Filesystem isolation is the correct layer. Then no rule is needed.
+- Models `cd`-ed into the clone path, or reported edits at paths that did not exist for the
+  user. Every path the model saw was true but useless.
+- The footer showed `…/.lyra/workspaces/amber-forge`, which nobody recognises as their
+  project.
+- Anything that graded or observed the working tree — the benchmark harness above all — had
+  to turn workspaces off to see the edits at all.
+- The one thing it bought was reversibility, and §10.2 buys that without moving anything.
 
-### Mechanism
+### Isolation is the model's decision
+
+`spawn` still takes `isolated`. Without it a child runs in the parent's directory and edits
+the same files the parent can see; with it the child gets its own copy-on-write workspace.
+The default is *share*, because most children are helping with the work in front of the
+parent, and the `#TAG` guard (§6) is the collision protection when two of them touch one
+file. Bun-style swarms — dozens of agents that must not step on each other — opt in.
+
+That is a change of default, not of mechanism: isolation used to be inferred for any child
+that did not name a workspace, which meant most children's edits landed somewhere the parent
+could not see and had to be merged back.
+
+### Workspaces, for the children that ask
 
 ```
 <project>/.lyra/workspaces/purple-falcon/
@@ -1003,38 +1085,140 @@ worktree already shares `.git/objects` and copies only the working tree. Degrade
 broken.
 
 **Names are memorable.** `purple-falcon`, `hollow-peak`, `amber-forge` — adjective + noun
-from curated lists, ~1M combinations. You will be reading this directory a lot; UUIDs make
-that miserable.
+from curated lists. You will be reading this directory a lot; UUIDs make that miserable.
 
 **Never `/tmp`.** Persistent and crash-recoverable: if the host dies or context drops, the
 work is on disk and reproducible.
 
-### The clone is an independent repository
+**The clone is an independent repository.** A `clonefile()` of the project copies `.git`
+too, so each workspace is a complete independent repo rather than a worktree. Agents run
+`commit`, `reset --hard`, `stash`, `rebase`, `bisect` with total freedom, and assembly is
+`git fetch <workspace-path> HEAD:agent/<name>` — cheap, and it never touches the main
+working tree. Worktree mode has the opposite semantics (shared refs) and is documented as
+degraded; the TUI says so when it is active.
 
-A `clonefile()` of the project copies `.git` too. So each CoW workspace is a *complete
-independent repo*, not a worktree. This is the property that makes it work:
+**Lifecycle.** `created → active → paused → resumed → archived → dropped`. `paused` matters:
+the agent's context is gone but the workspace is intact, so work is recoverable and
+resumable. An abandoned, interrupted, or broken child leaves its workspace in place and
+listed — `/workspaces` and `/review` show it with the commands that integrate it — because a
+child that died mid-task is exactly the one whose work you most want to find. `dropped` is
+explicit or age-based via `/cleanup`.
 
-- Agents run `commit`, `reset --hard`, `stash`, `rebase`, `bisect` with total freedom. No
-  prompt rule, no coordination, no possible collision.
-- Refs diverge from origin by design. Assembly is therefore
-  `git fetch <workspace-path> HEAD:agent/<name>` — cheap, and it never touches the main
-  working tree.
+### One session per directory
 
-**Worktree mode has the opposite semantics** — shared refs, so `reset --hard` and same-branch
-checkout are constrained. Independent-repo is canonical; worktree mode is documented as
-degraded, and the TUI says so when active.
+Two Lyra sessions in one directory share a working tree, a `.lyra/sessions` folder, and a
+checkpoint history. That is detected at boot and reported by name and pid — a `/rollback` in
+one can revert the other's edits, and the checkpoint engine will not have attributed them —
+but it is not refused, because a second session is sometimes exactly what you want. The
+checkpoint index retries a contended lock rather than losing a snapshot to it.
 
-### Lifecycle
-
-```
-created → active → paused → resumed → archived → dropped
-```
-
-`paused` matters: the agent's context is gone but the workspace is intact, so work is
-recoverable and resumable. `archived` keeps completed work for review. `dropped` is explicit
-or age-based via `/cleanup`.
+A directory Lyra cannot write to fails at boot with the directory and the fix in one
+sentence, rather than as an `EACCES` from whichever subsystem happened to write first.
 
 ---
+
+## 10.2 Checkpoints
+
+Reversibility, decoupled from where the work happens.
+
+### A second git repository
+
+```
+<session-dir>/.lyra/checkpoints/     GIT_DIR
+<session-dir>/                       work tree
+```
+
+`GIT_DIR` points inside `.lyra` and the work tree is the session's directory. **Your own
+`.git` is never read or written** — no ref, no index, no reflog, no config. A directory that
+is not a repository at all works identically, which matters now that the main session runs
+wherever you launched it.
+
+A checkpoint is a commit over a content-addressed tree. An unchanged tree costs one
+`write-tree` and produces no new object, and git's native mtime-cached index means a large
+working tree does not pay a full walk per snapshot. That is what makes the cadence
+affordable:
+
+**A checkpoint is taken before every state-changing tool call** — `write`, `edit`, `bash`,
+`git`, `jit`, `mcp`, `spawn` — **and at both turn boundaries.** Read-only tools cost
+nothing. Consecutive no-change checkpoints collapse onto the previous one instead of
+duplicating it.
+
+Each checkpoint is **keyed to a transcript entry id**, so rewinding the conversation and
+rewinding the code are one operation on one DAG. Its metadata — a stable id, the kind, the
+anchor, the changed-file count, the exclusion set, and the paths Lyra's own tools reported
+touching — lives in the commit message. There is no side-car database, so checkpoints
+survive a crash, a `kill -9`, and a full disk exactly as well as the trees they describe.
+
+### What is in, and what is out
+
+The rule is deliberately **not** "honour `.gitignore`". A checkpoint exists to undo what
+Lyra did, and a build artifact the model wrote is exactly the kind of thing you may need
+restored. The index is built with `--force`, so every ignore rule is overridden, and exactly
+four paths are held back:
+
+| Excluded | Why |
+|---|---|
+| `.lyra` | Lyra's own state, including every other workspace and this repository. Nesting it grows without bound — one incident reached 20 GB. |
+| `node_modules` | Churn sink, reconstructible from a lockfile. |
+| `target` | Churn sink, reconstructible by rebuilding. |
+| `.git` | Never tracked by git anyway; named so the intent is explicit. |
+
+Every checkpoint records the set that was in force, so a restore is never quietly partial:
+what was outside the snapshot is named in its metadata and in the restore's result.
+
+### The never-clobber rule
+
+**A restore never destroys work Lyra did not do.**
+
+The tool layer reports the paths each call modified; those become the checkpoint's
+attribution. A restore then:
+
+1. Checkpoints the live tree first, so the state being left is always recoverable — the
+   restore is itself undoable, and the result names the checkpoint that undoes it.
+2. Diffs the target against that snapshot and subtracts everything Lyra attributed over the
+   same span. What is left changed outside Lyra's tool calls — an editor, a build, a
+   colleague — and is **preserved by name and reported, never reverted**.
+3. Reverts the rest.
+4. Attributes what it just reverted. Undoing a restore is a restore, and reverting a file is
+   Lyra changing it — but no *tool* ran, so without this nothing would ever say so, and the
+   undo would read every reversion as somebody else's work and preserve all of it. The
+   named undo would resolve, run, and change nothing.
+
+`force` opts into reverting the preserved files too, and is the one flag a client should put
+behind a confirmation. A call that threw, timed out, or was cancelled attributes nothing, so
+whatever it half-wrote is treated as foreign — erring toward "not Lyra's" is the correct
+direction for a rule whose whole job is not destroying someone else's work. A checkpoint that
+collapsed records nothing and therefore carries its attribution forward to the next one that
+does, so a no-op call in front of a real one cannot launder the real one's paths into foreign
+work.
+
+### Retention
+
+Age and count, one named constant each:
+
+| Constant | Default | |
+|---|---|---|
+| `CHECKPOINT_KEEP_ALL_MS` | 24h | Everything younger survives, unconditionally |
+| `CHECKPOINT_KEEP_RECENT` | 200 | The newest N survive however old |
+| `CHECKPOINT_THIN_INTERVAL_MS` | 1h | Past the keep-all window, one per bucket |
+| `CHECKPOINT_MAX_TOTAL` | 2000 | Hard ceiling; oldest go first |
+
+`/cleanup` runs it, alongside archived workspaces and stale previews. Thinning rewrites the
+chain — which is why the addressable id is stable and independent of the commit oid: the
+rewrite reuses existing tree objects (no data is copied) and carries every message across, so
+an id recorded in a transcript keeps resolving.
+
+### Subagents
+
+Identical. A child sharing the parent's directory shares the parent's checkpoint stream. A
+child in an isolated workspace gets its own store rooted in that workspace, so its undo
+history travels with its work and outlives the session that spawned it.
+
+### When it cannot run
+
+No git on the host, or nowhere to write: checkpointing turns itself off, says so once in
+actionable language, and every operation becomes a no-op. A session that cannot checkpoint is
+still a session, and refusing to boot over it would be the worse failure.
 
 ## 11. Process execution
 
@@ -1071,28 +1255,42 @@ agent from OOMing the box; this does.
 
 ---
 
-## 12. Git pipeline
+## 12. Integration is the model's job
 
-Three modes. One command.
+There are no Git modes. `observe`, `stage`, `auto`, `/gitmode`, and the auto-mode consent
+ceremony are all gone, and so is the idea that a pipeline decides when your repository
+changes.
+
+The reasoning: modes existed to answer "when may Lyra touch the repo?" — and the honest
+answer, now that the main session *is* the repo and every state-changing call is
+checkpointed, is "whenever you asked it to, and you can undo it". A mode that gates the
+model's ordinary `git` tool while `bash` sits next to it unrestricted was never a real
+boundary; it was a prompt for a permission the checkpoint already grants.
+
+### When an isolated child finishes
+
+The parent model integrates it, with the tools it already has. Every completed isolated spawn
+returns the child's workspace path, how many commits it made, which paths it left
+uncommitted, and the literal commands:
 
 ```
-/gitmode observe   (default)  never touches the main repo
-/gitmode stage                accumulate, assemble on request, apply on request
-/gitmode auto                 fully hands-free including merge
+git fetch <workspace-path> HEAD:refs/lyra/agents/<name>   # bring its commits here
+git diff HEAD..refs/lyra/agents/<name>                     # review
+git merge --no-ff refs/lyra/agents/<name>                  # integrate
 ```
 
-`auto` requires explicit confirmation the first time and shows persistently in the header.
-It is the one place where the tool imposes on the repository, so it is never a default.
+Because the workspace is an independent repository, the fetch touches neither working tree.
+Uncommitted paths are called out separately, since a fetch will not carry them. A workspace
+that cannot be read is *described* as unreadable rather than raising: a spawn that succeeded
+must never be reported as failed because the summary of it could not be taken.
 
-### Assemble
+### The mechanism that survives
 
-`/review`, or the model calling `git.preview()` — the one action that asks permission, asked
-plainly rather than defensively:
+Two things a model cannot reasonably assemble by hand are kept, as capabilities it invokes
+rather than as a pipeline that runs on its own:
 
-> Three workspaces have work. Assemble a preview at `.lyra/previews/2026-08-05-1246/` and
-> open in Fork?
-
-A fresh CoW clone, then one `git fetch` per workspace:
+**Preview.** A fresh clone plus one `git fetch` per workspace, so every child's work is one
+branch in one graph:
 
 ```
 .lyra/previews/2026-08-05-1246/
@@ -1102,43 +1300,31 @@ A fresh CoW clone, then one `git fetch` per workspace:
   agent/amber-forge      add integration tests
 ```
 
-Open it in Fork, GitKraken, VS Code, `git log --graph`. Reviewing dozens of patches as
+Open it in Fork, GitKraken, VS Code, or `git log --graph`. Reviewing dozens of patches as
 terminal text is not a thing anyone should do; the starburst graph in a real GUI is.
-Auto-detected from PATH, overridable.
 
-### Apply
+**Transactional apply.** Merges happen in a throwaway clone; the origin only ever sees a
+`fetch` and a `reset --hard` of an already-merged commit. A conflict therefore costs nothing
+and leaves no half-merged working tree. The undo is an ordinary checkpoint taken immediately
+before — one undo mechanism, not two, which is why the old CoW snapshot/rollback pair is
+gone.
 
-```
-lyra apply [--preview <name>]     # snapshot, then apply
-lyra rollback [--to <name>]       # restore
-lyra snapshot list
-```
-
-A CoW snapshot is taken **before** any change — instant, zero bytes. Post-apply, if a
-hallucination surfaces at runtime, `lyra rollback` restores exactly. Both directions are
-milliseconds, which is what makes applying AI-authored work reasonable at all.
-
-### Merge conflicts
-
-Isolation is the primary answer: independent repos never collide *while working*. Conflicts
-only exist at assembly.
-
-There, a **resolver** agent (`@merge` role, minimal prompt, own context) receives both
-sides, the conflict, and — importantly — **both agents' original task contracts**, so it
-resolves toward intent rather than toward syntax. It reports in those terms:
+**Merge conflicts.** Isolation is the primary answer: independent repos never collide *while
+working*. Conflicts only exist at assembly, where a **resolver** agent (`@merge` role,
+minimal prompt, own context) receives both sides, the conflict, and — importantly — **both
+agents' original task contracts**, so it resolves toward intent rather than toward syntax:
 
 > Resolved 3 conflicts in `src/auth.rs`. Kept purple-falcon's token validation and
 > hollow-peak's rate limiting; both applied to the same handler.
 
-If it cannot resolve honestly, it stops. Notifies via IRC and the TUI, shows the conflict in
-the diff viewer, and waits. A resolver that guesses is worse than one that asks. In
-`observe`/`stage` mode it is not invoked at all — conflicts surface in the preview repo and
-you resolve them in your GUI.
+If it cannot resolve honestly, it stops, shows the conflict, and waits. A resolver that
+guesses is worse than one that asks. It runs when one is configured, which is the caller
+saying it wanted one — there is no mode left to gate it on.
 
 ### Visibility
 
 Destructive git operations are never blocked (YOLO) and always logged to the activity feed.
-You always know what agents did to your history.
+You always know what agents did to your history — and now you can put it back.
 
 ---
 
@@ -1186,9 +1372,10 @@ premise is that bad sessions are a bug, not weather.
 ```
 # Lyra
 OS: darwin 27.0.0 arm64
-Workspace: /Users/mx/proj/.lyra/workspaces/purple-falcon
-Origin: /Users/mx/proj
+Directory: /Users/mx/proj
 Session: swift-tide-4f2a
+State: .lyra/ holds Lyra's own state — do not read or edit it. Every state-changing tool
+call is checkpointed there; git op:"list"/"diff"/"restore" inspects and rewinds.
 
 ## Tools
 read    — files, directories, URLs, images
@@ -1203,7 +1390,7 @@ hub     — messaging, channels, job control
 skill   — load a skill's instructions
 jit     — declare and run a runtime-authored tool
 mcp     — describe and call MCP tools
-git     — git operations in this workspace
+git     — git commands here; op:"list"/"diff"/"restore" for the checkpoint history
 
 ## Skills
 adversarial-review — implementer/reviewer split for high-stakes changes
@@ -1211,7 +1398,10 @@ draco              — local scraping and web search
 ...
 ```
 
-Environment manifest and capability index. Nothing else.
+Environment manifest and capability index. Nothing else. `Project:` appears only when it
+differs from `Directory:` — that is, for an isolated child agent. A main session runs in
+the project itself, and printing the same path twice under two names taught models there
+was a second place to look for the files they were editing.
 
 No "you are a helpful coding assistant." No tone rules, no length limits, no "think step by
 step," no "do not hallucinate." No coding style. No persona. Under ~500 tokens including
@@ -1240,7 +1430,7 @@ Thirteen. Each finished.
 | `skill` | §16. |
 | `jit` | §8. |
 | `mcp` | §17. |
-| `git` | Workspace git. Destructive ops logged, never blocked. |
+| `git` | One git command in the session directory; destructive ops logged, never blocked. With `op`, the checkpoint history instead: `checkpoint`, `list`, `diff`, `restore` (§10.2). Checkpoints *are* git — a shadow repository over this directory — so they belong here rather than on a fourteenth tool. |
 
 No `web_search` built in — it arrives via Draco's MCP (§17), which is the correct layer.
 
@@ -1426,10 +1616,20 @@ provider/setup_options · detect · verify · add · get · remove
 model/add
 workspace/list · create · drop
 agent/list · spawn · cancel · message
-git/preview · apply · rollback · snapshot
+git/preview · apply
+checkpoint/list · diff · restore
 context/inspect
 settings/get · set
 ```
+
+`checkpoint/*` is the rewind surface a graphical client builds `/rewind` and `/review` on:
+`list` returns entries carrying their transcript anchor and changed-file count, `diff`
+returns a structured file list with an optional unified patch **per file** (a renderer wants
+a summary row per path and the hunks for the one path the user expanded, and reassembling
+that from a combined patch is exactly the client-side parsing this protocol exists to
+avoid), and `restore` reports what it put back and what it *refused* to revert because Lyra
+did not do it (§10.2), with `force` as the flag that overrides — the one call in the surface
+that belongs behind a confirmation.
 
 The method surface is deliberately the same as the JIT runtime API (§8). One control plane,
 two entry points — anything reachable in an orchestration script is reachable over ACP, and
@@ -1464,16 +1664,19 @@ stdio ships first. Remote transport requires auth and is gated behind it.
 |---|---|
 | `/copy` | Copy last message, or pick one |
 | `/dump` | Full transcript to clipboard |
-| `/settings` | Runtime toggles |
+| `/settings` | The effective configuration, read-only |
 | `/provider [name [model]\|edit <name>\|delete <name>]` | Switch, add, edit, or delete |
 | `/model [refresh]` | Switch model; refresh the `/models` cache |
 | `/loop <n \| duration \| until "cond">` | Re-run the goal on every turn end |
 | `/context` | Exact payload inspection (§13) |
 | `/compact` · `/clear` | Force a boundary |
 | `/agents` · `/kill <name>` | Live agents |
-| `/workspaces` · `/cleanup` | CoW workspaces |
-| `/gitmode <observe\|stage\|auto>` | §12 |
-| `/review` · `/apply` · `/rollback` | §12 |
+| `/workspaces` | Agent workspaces and their lifecycle |
+| `/cleanup` | Reclaim archived workspaces, stale previews, and old checkpoints (§10.2) |
+| `/checkpoints` | The rewind list, newest first (§10.2) |
+| `/review [checkpointId]` | What changed since a checkpoint, plus every workspace holding integrable work |
+| `/rollback [checkpointId] [--force]` | Restore the tree. Files changed outside Lyra are never reverted without `--force` |
+| `/apply [--preview <id>]` | Apply an assembled merge preview (§12) |
 | `/skills` · `/mcp` · `/install <tool>` | Capability management |
 | `/fork` · `/resume` · `/sessions` | Session tree |
 | `/health` | Metrics from §3.9 |
@@ -1489,6 +1692,13 @@ each turn end with prior output in context. **Hard-stops on the no-progress dete
 TOML. Data only, never code (§2). Every value has a working default; the file only
 overrides.
 
+Two keys were retired by the §10 redesign and are **accepted and ignored**, with one
+deprecation line reported at boot: `workspace.enabled` (the main session always runs in the
+launch directory now, so there is nothing to toggle) and `git.mode` (§12). Retiring them
+loudly rather than fatally matters because the benchmark harness writes
+`workspace.enabled = false`, and a config that suddenly refused to parse would break every
+such caller to make a point about tidiness.
+
 ```toml
 [roles]
 default = "anthropic/claude-opus-5"
@@ -1501,12 +1711,10 @@ io     = 4
 cgroup = false      # linux: systemd-run isolation
 
 [git]
-mode = "observe"
-gui  = "auto"
+gui = "auto"
 
 [workspace]
-enabled  = true
-archive_after = "7d"
+archive_after = "7d"   # retention for child agent workspaces, and for /cleanup
 
 [tui]
 theme  = "default"
@@ -1550,7 +1758,8 @@ cgroups.
 **9 — JIT runtime.** `lyra:runtime` including `lyra.spawn()` and `lyra.checkpoint()`. This
 is where dynamic workflows appear.
 
-**10 — Git pipeline.** Preview assembly, transactional apply/rollback, resolver agent.
+**10 — Checkpoints and integration.** The shadow-git checkpoint engine (§10.2), preview
+assembly, transactional apply, resolver agent.
 
 **11 — MCP + Draco.** `mcp` tool, lazy hydration, one-keypress Draco.
 
@@ -1579,11 +1788,16 @@ tool calls, that is too coarse — may need a token-boundary path with a coheren
 **Todo tool.** Excluded (§15). If soak testing shows plan drift across compactions, the fix
 might be a todo tool, or it might be better compaction preservation. Compaction first.
 
-**Resolver autonomy in `auto` mode.** How aggressive before it must stop? A wrong silent
-merge is much worse than a pause.
+**Resolver autonomy.** How aggressive before it must stop? A wrong silent merge is much
+worse than a pause. There is no `auto` mode to bound it any more (§12); a configured
+resolver runs whenever assembly conflicts, so the question is now entirely about its own
+judgement.
 
-**Snapshot retention.** Time-based, count-based, or size-based. CoW makes them nearly free,
-which argues for generous retention.
+**~~Snapshot retention.~~ Answered (§10.2).** Age *and* count, with a hard ceiling:
+everything under 24h and the newest 200 survive unconditionally, then one per hour, capped at
+2000, thinned by `/cleanup`. Content addressing makes an unchanged tree free, which is what
+allows retention this generous at per-tool-call granularity. The open part is only whether
+the four constants are the right four numbers, which is a measurement, not a design.
 
 **Remote ACP auth.** Required before remote transport ships. Token, mTLS, or OS keychain.
 
