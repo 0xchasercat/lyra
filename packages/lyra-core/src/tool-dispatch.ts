@@ -1,4 +1,5 @@
 import type { ToolUseBlock } from "@lyra/provider";
+import { DEFAULT_WAIT_CLASS_TOOLS, SteerInterrupt, WAIT_INTERRUPT_MESSAGE } from "./steering.ts";
 import type {
   ToolExecutionContext,
   ToolExecutionResult,
@@ -9,12 +10,21 @@ export const DEFAULT_TOOL_TIMEOUT_MS = 120_000;
 
 export interface ToolDispatcherOptions {
   timeoutMs?: number;
+  /** Tools whose executions block on an external event and may be interrupted by steering. */
+  waitTools?: readonly string[];
+}
+
+/** Anything that can tell a blocked wait-class tool that the user has spoken. */
+export interface WaitInterrupter {
+  subscribe(listener: () => void): () => void;
 }
 
 export interface ToolDispatchContext {
   signal: AbortSignal;
   sessionId: string;
   workspace: string;
+  /** Present while a turn accepts steering; only wait-class tools observe it. */
+  interrupter?: WaitInterrupter;
 }
 
 export interface DispatchedToolResult {
@@ -28,6 +38,7 @@ export interface DispatchedToolResult {
  */
 export class ToolDispatcher {
   readonly timeoutMs: number;
+  readonly waitTools: ReadonlySet<string>;
 
   private readonly knownTools: ReadonlySet<string>;
 
@@ -41,6 +52,7 @@ export class ToolDispatcher {
       throw new RangeError("Tool timeout must be a positive finite number");
     }
     this.knownTools = new Set(toolNames);
+    this.waitTools = new Set(options.waitTools ?? DEFAULT_WAIT_CLASS_TOOLS);
   }
 
   async dispatch(
@@ -76,6 +88,11 @@ export class ToolDispatcher {
     const onParentAbort = (): void => controller.abort(context.signal.reason);
     context.signal.addEventListener("abort", onParentAbort, { once: true });
     const timer = setTimeout(() => controller.abort(deadline), this.timeoutMs);
+    // Only wait-class tools observe steering. A steer must never kill an edit or a build.
+    const interrupt = new SteerInterrupt();
+    const unsubscribe = context.interrupter !== undefined && this.waitTools.has(call.name)
+      ? context.interrupter.subscribe(() => controller.abort(interrupt))
+      : undefined;
 
     const executionContext: ToolExecutionContext = {
       signal: controller.signal,
@@ -91,6 +108,7 @@ export class ToolDispatcher {
         abort.promise,
       ]);
     } catch (error) {
+      if (controller.signal.reason === interrupt) return waitInterruptedResult(call.name);
       if (controller.signal.reason === deadline) {
         return {
           content: `${deadline.message} and was cancelled. Retry with a narrower operation or use a background job.`,
@@ -105,6 +123,7 @@ export class ToolDispatcher {
     } finally {
       clearTimeout(timer);
       abort.cleanup();
+      unsubscribe?.();
       context.signal.removeEventListener("abort", onParentAbort);
     }
   }
@@ -123,6 +142,18 @@ function rejectOnAbort(signal: AbortSignal): { promise: Promise<never>; cleanup:
     cleanup: () => {
       if (listener !== undefined) signal.removeEventListener("abort", listener);
     },
+  };
+}
+
+/**
+ * A steer-interrupted wait is not a failure: the wait simply ended early because the user
+ * spoke. The model is told exactly that, and the metadata lets a client mark the row.
+ */
+function waitInterruptedResult(tool: string): ToolExecutionResult {
+  return {
+    content:
+      `${WAIT_INTERRUPT_MESSAGE} The "${tool}" wait was cut short before its deadline; nothing was received. Read the user's message that follows before waiting again.`,
+    metadata: { interrupted: "steer" },
   };
 }
 

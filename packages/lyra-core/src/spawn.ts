@@ -12,6 +12,10 @@ import type {
 export const DEFAULT_SPAWN_MAX_DEPTH = 2;
 export const DEFAULT_SPAWN_MAX_CONCURRENT = Number.MAX_SAFE_INTEGER; // Host pressure is governed by ProcessHost class semaphores.
 export const DEFAULT_SPAWN_WAIT_MS = 60 * 60 * 1000;
+/** The deliberate ceiling on one wait (§3.4). A longer request is clamped, and the clamp is reported. */
+export const MAX_SPAWN_WAIT_MS = DEFAULT_SPAWN_WAIT_MS;
+/** Terminal jobs stay listable, but only the most recent ones: a session runs for hours. */
+export const DEFAULT_SPAWN_RETAINED_JOBS = 64;
 
 /** A parent execution context used when a running child creates another child. */
 export interface SpawnParentContext {
@@ -45,6 +49,8 @@ export interface SpawnContractDiagnostic {
 export interface SpawnDiagnosticResult extends SpawnResult {
   metadata?: Readonly<Record<string, unknown>>;
   error?: SpawnContractDiagnostic;
+  /** Non-fatal trouble — cleanup that failed after the work itself already succeeded. */
+  warnings?: readonly string[];
 }
 
 export class SpawnError extends Error {
@@ -83,9 +89,10 @@ export class SpawnCancelledError extends SpawnError {
   }
 }
 
+/** Raised to the observer whose wait expired. The job it names keeps running. */
 export class SpawnTimeoutError extends SpawnError {
-  constructor(id: string, timeoutMs: number) {
-    super("timeout", `Spawn ${id} did not complete within ${timeoutMs}ms`, { id, timeoutMs });
+  constructor(id: string, timeoutMs: number, details?: Readonly<Record<string, unknown>>) {
+    super("timeout", `Spawn ${id} did not complete within ${timeoutMs}ms`, { id, timeoutMs, ...details });
     this.name = "SpawnTimeoutError";
   }
 }
@@ -134,6 +141,8 @@ export class SpawnManager {
   readonly defaultWorkspace: string;
   readonly defaultModel: string | undefined;
   readonly availableTools: readonly string[] | undefined;
+  /** How many terminal jobs stay inspectable through list() and getHandle(). */
+  readonly retainedJobs: number = DEFAULT_SPAWN_RETAINED_JOBS;
 
   private readonly executor: SpawnExecutor;
   private readonly createWorkspace: SpawnManagerOptions["createWorkspace"];
@@ -227,6 +236,11 @@ export class SpawnManager {
     return await this.spawn({ ...request, blocking: true }, parent);
   }
 
+  /**
+   * Every wait has a deadline (§3.4), bounded by MAX_SPAWN_WAIT_MS. The deadline belongs to the
+   * observer, never to the job: an expired wait rejects with the job's live status and leaves it
+   * running, so one poller cannot kill work that every other observer is still waiting on.
+   */
   wait(handleOrId: SpawnHandle | string, timeoutMs = DEFAULT_SPAWN_WAIT_MS): Promise<SpawnDiagnosticResult> {
     const id = typeof handleOrId === "string" ? handleOrId : handleOrId?.id;
     if (typeof id !== "string" || id.length === 0) {
@@ -237,7 +251,7 @@ export class SpawnManager {
     if (!Number.isFinite(timeoutMs) || timeoutMs < 0) {
       return Promise.reject(new SpawnRequestError("wait timeout must be a non-negative finite number"));
     }
-    const boundedTimeout = Math.min(timeoutMs, DEFAULT_SPAWN_WAIT_MS);
+    const boundedTimeout = Math.min(timeoutMs, MAX_SPAWN_WAIT_MS);
     if (job.terminal) return job.completion;
 
     return new Promise<SpawnResult>((resolve, reject) => {
@@ -247,8 +261,12 @@ export class SpawnManager {
       };
       timer = setTimeout(() => {
         cleanup();
-        if (!job.terminal) this.cancel(job.id, new SpawnTimeoutError(job.id, boundedTimeout));
-        reject(new SpawnTimeoutError(job.id, boundedTimeout));
+        reject(new SpawnTimeoutError(job.id, boundedTimeout, {
+          status: job.handle.status,
+          running: !job.terminal,
+          cancelled: false,
+          ...(boundedTimeout === timeoutMs ? {} : { requestedTimeoutMs: timeoutMs, maxTimeoutMs: MAX_SPAWN_WAIT_MS }),
+        }));
       }, boundedTimeout);
       unrefTimer(timer);
       void job.completion.then(
@@ -276,6 +294,7 @@ export class SpawnManager {
     job.controller.abort(error);
     job.reject(error);
     this.pump();
+    this.pruneTerminalJobs();
     return true;
   }
 
@@ -369,11 +388,13 @@ export class SpawnManager {
       if (job.controller.signal.aborted) throw job.controller.signal.reason ?? new SpawnCancelledError(job.id);
       const result = this.makeResult(job, output);
       const contractResult = this.applyOutputContract(job.request, result);
-      await this.releaseIsolatedWorkspace(job);
-      this.finish(job, contractResult);
+      // Work that succeeded stays successful: a failed release is a warning, not a verdict.
+      const releaseError = await this.releaseIsolatedWorkspace(job);
+      this.finish(job, releaseError === undefined ? contractResult : withWarning(contractResult, releaseWarning(job, releaseError)));
     } catch (error: unknown) {
-      try { await this.releaseIsolatedWorkspace(job); }
-      catch (cleanupError) { this.fail(job, cleanupError); return; }
+      // The original failure is the reportable one; cleanup trouble must never shadow it.
+      const releaseError = await this.releaseIsolatedWorkspace(job);
+      if (releaseError !== undefined) this.emitReport(job.id, releaseWarning(job, releaseError));
       this.fail(job, error);
     }
   }
@@ -393,10 +414,16 @@ export class SpawnManager {
     job.workspaceReady = true;
   }
 
-  private async releaseIsolatedWorkspace(job: SpawnJob): Promise<void> {
-    if (job.workspaceReleased || job.workspaceName === undefined || this.releaseWorkspace === undefined) return;
+  /** Returns the failure instead of throwing: cleanup never decides a job's verdict. */
+  private async releaseIsolatedWorkspace(job: SpawnJob): Promise<unknown> {
+    if (job.workspaceReleased || job.workspaceName === undefined || this.releaseWorkspace === undefined) return undefined;
+    try {
+      await this.releaseWorkspace(job.workspaceName);
+    } catch (error: unknown) {
+      return error; // The flag stays unset so a later attempt can still retry the release.
+    }
     job.workspaceReleased = true;
-    await this.releaseWorkspace(job.workspaceName);
+    return undefined;
   }
 
   private makeResult(job: SpawnJob, output: unknown): SpawnResult {
@@ -463,6 +490,25 @@ export class SpawnManager {
       this.active = Math.max(0, this.active - 1);
     }
     this.pump();
+    this.pruneTerminalJobs();
+  }
+
+  /**
+   * Terminal jobs stay listable for inspection, but a session that delegates for hours must not
+   * accumulate their requests, results and controllers forever: the oldest ones age out first.
+   * release() already tolerates a job that is no longer in the map, so eviction is safe mid-flight.
+   */
+  private pruneTerminalJobs(): void {
+    let terminal = 0;
+    for (const job of this.jobs.values()) if (job.terminal) terminal += 1;
+    let excess = terminal - this.retainedJobs;
+    if (excess <= 0) return;
+    for (const [id, job] of this.jobs) {
+      if (excess <= 0) break;
+      if (!job.terminal || job.running) continue;
+      this.jobs.delete(id);
+      excess -= 1;
+    }
   }
 
   private validateRequest(request: SpawnRequest, parent?: SpawnParentContext): {
@@ -582,6 +628,15 @@ function withResolvedRequest(request: SpawnRequest, model: string | undefined, t
     tools,
     workspace,
   };
+}
+
+function releaseWarning(job: SpawnJob, error: unknown): string {
+  return `Workspace ${job.workspaceName} could not be released: ${error instanceof Error ? error.message : String(error)}`;
+}
+
+function withWarning(result: SpawnResult, warning: string): SpawnDiagnosticResult {
+  const existing = (result as SpawnDiagnosticResult).warnings ?? [];
+  return { ...result, warnings: [...existing, warning] };
 }
 
 function normalizeExecutionError(id: string, error: unknown): unknown {

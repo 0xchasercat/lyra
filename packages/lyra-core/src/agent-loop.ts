@@ -11,6 +11,7 @@ import { TranscriptStore } from "@lyra/session";
 import type { Compactor } from "./compaction.ts";
 import { deriveContext } from "./context.ts";
 import type { LoopDetector } from "./loop-detection.ts";
+import type { SteerQueue } from "./steering.ts";
 import { ToolDispatcher } from "./tool-dispatch.ts";
 import type {
   AgentEvent,
@@ -18,6 +19,7 @@ import type {
   ContextDerivationOptions,
   DerivedContext,
   LoopWarning,
+  SteerBoundary,
   ToolExecutionResult,
   ToolRegistry,
 } from "./types.ts";
@@ -37,9 +39,20 @@ export interface AgentLoopOptions {
   turnTimeoutMs?: number;
   compactor?: Compactor;
   loopDetector?: LoopDetector;
+  /** Tools a steering message may interrupt mid-execution; defaults to the wait-class set. */
+  waitTools?: readonly string[];
 }
 
 export type UserTurnContent = string | ContentBlock[];
+
+export interface RunTurnOptions {
+  /**
+   * Live steering channel. Text pushed while the turn runs is drained at the next tool
+   * boundary — or at the boundary where the turn would otherwise end — and appended as a
+   * standalone synthetic user message, never folded into a tool result.
+   */
+  steering?: SteerQueue;
+}
 
 export class AgentLoop {
   readonly definitions: readonly ToolDefinition[];
@@ -71,7 +84,10 @@ export class AgentLoop {
     this.dispatcher = new ToolDispatcher(
       options.tools,
       this.definitions.map((definition) => definition.name),
-      options.toolTimeoutMs === undefined ? {} : { timeoutMs: options.toolTimeoutMs },
+      {
+        ...(options.toolTimeoutMs === undefined ? {} : { timeoutMs: options.toolTimeoutMs }),
+        ...(options.waitTools === undefined ? {} : { waitTools: options.waitTools }),
+      },
     );
     this.compactor = options.compactor;
     this.loopDetector = options.loopDetector;
@@ -90,6 +106,7 @@ export class AgentLoop {
   async *runTurn(
     userContent: UserTurnContent,
     signal?: AbortSignal,
+    options: RunTurnOptions = {},
   ): AsyncGenerator<AgentEvent, AgentTurnResult, void> {
     const turnEntries: TranscriptEntry[] = [];
     appendMessage(this.store, turnEntries, {
@@ -97,6 +114,23 @@ export class AgentLoop {
       content: normalizeUserContent(userContent),
       status: "complete",
     });
+    const steering = options.steering;
+    /**
+     * Drains steering into standalone user messages. Returning the events rather than
+     * yielding them keeps this a plain function the generator can splice in at each of the
+     * two drain points.
+     */
+    const drainSteering = (at: SteerBoundary): AgentEvent[] => {
+      if (steering === undefined) return [];
+      return steering.drain().map((text) => {
+        const entry = appendMessage(this.store, turnEntries, {
+          role: "user",
+          content: [{ type: "text", text }],
+          status: "complete",
+        });
+        return { type: "steered" as const, entryId: entry.id, text, at };
+      });
+    };
 
     const deadlineReason = new DOMException(
       `Agent turn exceeded its ${this.turnTimeoutMs}ms deadline`,
@@ -140,6 +174,7 @@ export class AgentLoop {
                 boundaryId: forced.boundary.id,
                 tokensBefore: forced.boundary.tokensBefore,
                 tokensAfter: forced.boundary.tokensAfter,
+                firstKeptEntry: forced.boundary.firstKeptEntry,
               };
               continue;
             }
@@ -156,6 +191,7 @@ export class AgentLoop {
                   boundaryId: compacted.boundary.id,
                   tokensBefore: compacted.boundary.tokensBefore,
                   tokensAfter: compacted.boundary.tokensAfter,
+                  firstKeptEntry: compacted.boundary.firstKeptEntry,
                 };
                 continue;
               }
@@ -176,6 +212,14 @@ export class AgentLoop {
           );
           return terminalResult("cancelled", assistant, turnEntries);
         }
+
+        // The exact payload size that is about to be sent. Raw number: a client derives a
+        // percentage only when it independently knows a verified context limit.
+        yield {
+          type: "context_measured",
+          tokenEstimate: derived.tokenEstimate,
+          sourceEntryCount: derived.sourceEntryIds.length,
+        };
 
         if (derived.repairs.length > 0) {
           const repair = this.store.append({
@@ -210,6 +254,14 @@ export class AgentLoop {
               yield event;
 
               if (event.stopReason !== "tool_use") {
+                // Turn boundary drain: a steer that arrived while the model was closing
+                // out must not be swallowed. It becomes a user turn and the loop runs on,
+                // so the turn ends only once nothing is queued.
+                const boundarySteers = drainSteering("turn_boundary");
+                if (boundarySteers.length > 0) {
+                  for (const steered of boundarySteers) yield steered;
+                  break;
+                }
                 let hardStopRequested = false;
                 if (this.loopDetector !== undefined) {
                   const detection = this.loopDetector.recordTurn([]);
@@ -239,6 +291,7 @@ export class AgentLoop {
                 signal: controller.signal,
                 sessionId: this.sessionId,
                 workspace: this.workspace,
+                ...(steering === undefined ? {} : { interrupter: steering }),
               });
               dispatched = dispatched.map((item) => ({
                 ...item,
@@ -276,6 +329,10 @@ export class AgentLoop {
                 })),
                 status: "complete",
               });
+              // Tool boundary drain — the primary steering delivery point. The synthetic
+              // user message is appended *after* the tool-result message, so it is its own
+              // turn in the transcript rather than a paragraph glued onto a tool result.
+              for (const steered of drainSteering("tool_boundary")) yield steered;
               if (hardStopRequested) {
                 const stopped = appendMessage(this.store, turnEntries, {
                   role: "assistant",

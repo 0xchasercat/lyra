@@ -1,9 +1,12 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import {
+  DEFAULT_SPAWN_RETAINED_JOBS,
   SpawnCancelledError,
   SpawnContractError,
+  SpawnError,
   SpawnManager,
   SpawnRequestError,
+  SpawnTimeoutError,
 } from "../src/spawn.ts";
 import type { SpawnExecutor, SpawnRequest } from "../src/spawn-types.ts";
 
@@ -176,6 +179,112 @@ test("inherits model while allowing each child to choose its own tools", async (
   await manager.spawn({ task: "widen", tools: ["write"], blocking: true }, { depth: 1, model: "@parent", tools: ["read"] });
   expect(seen.at(-1)).toEqual({ model: "@parent", tools: ["write"] });
 });
+
+test("an expired wait reports the still-running job instead of cancelling it", async () => {
+  let unblock: (() => void) | undefined;
+  const manager = track(new SpawnManager({
+    defaultWorkspace: "/repo",
+    executor: async () => { await new Promise<void>((resolve) => { unblock = resolve; }); return "late"; },
+  }));
+
+  const handle = manager.spawn({ task: "slow" });
+  await waitFor(() => unblock !== undefined);
+  const expired = await rejection(manager.wait(handle, 5));
+  expect(expired).toBeInstanceOf(SpawnTimeoutError);
+  // The deadline is reported with the job's live status, and names the effective bound.
+  expect((expired as SpawnError).details).toMatchObject({ id: handle.id, timeoutMs: 5, status: "running", running: true, cancelled: false });
+  expect((expired as SpawnError).details).not.toHaveProperty("requestedTimeoutMs");
+
+  // The job survived its observer: neither cancelled nor aborted, and it still delivers.
+  expect(manager.getHandle(handle.id)?.status).toBe("running");
+  unblock?.();
+  expect(await manager.wait(handle)).toMatchObject({ id: handle.id, output: "late" });
+  expect(manager.getHandle(handle.id)?.status).toBe("completed");
+});
+
+test("racing waiters cannot cancel the job they share", async () => {
+  let unblock: (() => void) | undefined;
+  let aborted = false;
+  const manager = track(new SpawnManager({
+    defaultWorkspace: "/repo",
+    executor: async (_request, context) => {
+      context.signal.addEventListener("abort", () => { aborted = true; }, { once: true });
+      await new Promise<void>((resolve) => { unblock = resolve; });
+      return "shared";
+    },
+  }));
+
+  const handle = manager.spawn({ task: "watched by many" });
+  await waitFor(() => unblock !== undefined);
+  const expiries = await Promise.all([1, 2, 3].map((ms) => rejection(manager.wait(handle, ms))));
+  for (const expiry of expiries) expect(expiry).toBeInstanceOf(SpawnTimeoutError);
+  expect(aborted).toBe(false);
+  expect(manager.getHandle(handle.id)?.status).toBe("running");
+
+  unblock?.();
+  expect(await manager.wait(handle)).toMatchObject({ output: "shared" });
+});
+
+test("a workspace release failure warns instead of failing successful work", async () => {
+  const manager = track(new SpawnManager({
+    defaultWorkspace: "/repo",
+    createWorkspace: async () => ({ name: "copy", path: "/repo-copy" }),
+    releaseWorkspace: async () => { throw new Error("archive is locked"); },
+    executor: async () => ({ ok: true }),
+  }));
+
+  const result = await manager.spawn({ task: "build", blocking: true });
+  expect(result).toMatchObject({ output: { ok: true }, workspace: "/repo-copy" });
+  expect(result.warnings).toEqual(["Workspace copy could not be released: archive is locked"]);
+});
+
+test("a workspace release failure never shadows the executor's own error", async () => {
+  const reports: string[] = [];
+  const manager = track(new SpawnManager({
+    defaultWorkspace: "/repo",
+    createWorkspace: async () => ({ name: "copy", path: "/repo-copy" }),
+    releaseWorkspace: async () => { throw new Error("archive is locked"); },
+    executor: async () => { throw new Error("the build itself failed"); },
+  }));
+  manager.onReport(({ message }) => reports.push(message));
+
+  const failure = await rejection(manager.spawn({ task: "build", blocking: true }));
+  expect((failure as Error).message).toContain("the build itself failed");
+  expect((failure as Error).message).not.toContain("archive is locked");
+  // The cleanup trouble is still visible, just not as the verdict.
+  expect(reports).toEqual(["Workspace copy could not be released: archive is locked"]);
+});
+
+test("retains only the most recent terminal jobs while never evicting live ones", async () => {
+  let unblock: (() => void) | undefined;
+  const manager = track(new SpawnManager({
+    defaultWorkspace: "/repo",
+    executor: async (request) => {
+      if (request.task === "long lived") await new Promise<void>((resolve) => { unblock = resolve; });
+      return request.task;
+    },
+  }));
+
+  const live = manager.spawn({ task: "long lived" });
+  await waitFor(() => unblock !== undefined);
+  const overflow = DEFAULT_SPAWN_RETAINED_JOBS + 5;
+  const finished = [];
+  for (let index = 0; index < overflow; index += 1) finished.push(manager.spawn({ task: `done-${index}`, blocking: true }));
+  await Promise.all(finished);
+
+  expect(manager.list().length).toBe(DEFAULT_SPAWN_RETAINED_JOBS + 1);
+  expect(manager.getHandle(live.id)?.status).toBe("running");
+  expect(manager.getHandle("spawn-2")).toBeUndefined(); // The oldest terminal job aged out first.
+  expect(manager.getHandle(`spawn-${overflow + 1}`)?.status).toBe("completed");
+
+  unblock?.();
+  expect(await manager.wait(live)).toMatchObject({ output: "long lived" });
+});
+
+/** Capture a rejection as a value so a test can assert on it without try/catch noise. */
+async function rejection(promise: Promise<unknown>): Promise<unknown> {
+  return await promise.then(() => undefined, (error: unknown) => error);
+}
 
 function track(manager: SpawnManager): SpawnManager {
   managers.push(manager);

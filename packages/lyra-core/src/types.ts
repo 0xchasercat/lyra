@@ -76,12 +76,23 @@ export type LoopWarning =
   | { type: "no_progress"; turns: number }
   | { type: "oscillation"; path: string; hash: string };
 
+/** Where a drained steering message was injected into the running turn. */
+export type SteerBoundary = "tool_boundary" | "turn_boundary";
+
 export type AgentEvent =
   | ReliableProviderEvent
   | { type: "tool_started"; id: string; name: string; input: unknown }
   | { type: "tool_finished"; id: string; name: string; result: ToolExecutionResult }
   | { type: "context_repaired"; repairs: ContextRepair[] }
-  | { type: "compacted"; boundaryId: EntryId; tokensBefore: number; tokensAfter: number }
+  | {
+    type: "compacted";
+    boundaryId: EntryId;
+    tokensBefore: number;
+    tokensAfter: number;
+    firstKeptEntry: EntryId | null;
+  }
+  | { type: "context_measured"; tokenEstimate: number; sourceEntryCount: number }
+  | { type: "steered"; entryId: EntryId; text: string; at: SteerBoundary }
   | { type: "loop_warning"; warning: LoopWarning; hardStopRequested?: boolean };
 
 export interface AgentTurnResult {

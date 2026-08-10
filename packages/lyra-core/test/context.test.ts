@@ -59,6 +59,27 @@ describe("deriveContext", () => {
     expect(derived.repairs).toEqual([]);
   });
 
+  // Usage entries are bookkeeping the transcript carries for later analysis, not
+  // conversation. Derivation must step over them, or every recorded turn would silently
+  // change the prompt the model sees on the next one.
+  test("ignores turn usage entries when deriving the request", () => {
+    const withoutUsage = transcript([
+      message("u1", "user", [{ type: "text", text: "ask" }]),
+      message("a1", "assistant", [{ type: "text", text: "answer" }]),
+    ]);
+    const withUsage = transcript([
+      message("u1", "user", [{ type: "text", text: "ask" }]),
+      message("a1", "assistant", [{ type: "text", text: "answer" }]),
+      { id: "usage-1", parentId: "placeholder", timestamp: timestamp(0), type: "usage", inputTokens: 1_200, outputTokens: 340, cacheReadTokens: 900, costMicroUsd: 4_100 },
+    ]);
+
+    const derived = deriveContext(withUsage, baseOptions);
+
+    expect(derived.request).toEqual(deriveContext(withoutUsage, baseOptions).request);
+    expect(derived.sourceEntryIds).not.toContain("usage-1");
+    expect(derived.repairs).toEqual([]);
+  });
+
   test("drops unsigned Anthropic thinking and exposes the exact loss", () => {
     const entries = transcript([message("a1", "assistant", [
       { type: "thinking", thinking: "unsigned" },
@@ -204,6 +225,87 @@ describe("deriveContext", () => {
     expect(derived.request.messages).toEqual([{ id: "new", role: "user", content: [{ type: "text", text: "new" }] }]);
   });
 
+  // §3.6's second invariant is about the derived *window*, not the transcript: whatever put
+  // the tool result first — a compaction boundary, a rewind, a lineage that simply begins
+  // there — the payload may not open with a result whose call is outside the window. A
+  // provider that receives one answers `messages.0.content.0: unexpected 'tool_use_id' found
+  // in 'tool_result' blocks` and the turn is lost.
+  test("a window that begins with a tool result drops the orphan whatever put it first", () => {
+    const entries = transcript([
+      message("u1", "user", [{ type: "tool_result", toolUseId: "toolu_live", content: "exit_code: 0" }]),
+      message("a1", "assistant", [{ type: "text", text: "the directory is empty" }]),
+    ]);
+
+    const derived = deriveContext(entries, baseOptions);
+
+    expect(derived.request.messages[0]?.content.some((block) => block.type === "tool_result")).toBe(false);
+    expect(repairCodes(derived)).toContain("orphan_tool_result");
+    expect(leadsWithOrphanResult(derived)).toBe(false);
+  });
+
+  test("a compaction boundary landing between a tool call and its result drops the orphan", () => {
+    const entries = transcript([
+      message("old-user", "user", [{ type: "text", text: "list the files" }]),
+      message("old-assistant", "assistant", [{ type: "tool_use", id: "toolu_live", name: "bash", input: { command: "ls" } }]),
+      message("kept-result", "user", [{ type: "tool_result", toolUseId: "toolu_live", content: "exit_code: 0" }]),
+    ]);
+    entries.push({
+      id: "boundary",
+      parentId: "kept-result",
+      timestamp: timestamp(4),
+      type: "boundary",
+      kind: "compaction",
+      // The hostile boundary: the kept tail opens on the result, the call was summarized away.
+      firstKeptEntry: "kept-result",
+      summary: "ran ls in the workspace",
+      tokensBefore: 90,
+      tokensAfter: 30,
+    });
+    entries.push({
+      ...message("new-user", "user", [{ type: "text", text: "continue" }]),
+      parentId: "boundary",
+      timestamp: timestamp(5),
+    });
+
+    const derived = deriveContext(entries, baseOptions);
+
+    expect(JSON.stringify(derived.request.messages)).not.toContain("toolu_live");
+    expect(JSON.stringify(derived.request.messages)).toContain("ran ls in the workspace");
+    expect(repairCodes(derived)).toContain("orphan_tool_result");
+    expect(leadsWithOrphanResult(derived)).toBe(false);
+  });
+
+  test("a rewind that lands between a tool call and its result drops the orphan", () => {
+    // What a cancel-trim fork leaves behind: the lineage the next request derives from starts
+    // after the assistant turn that opened the call.
+    const entries = transcript([
+      message("kept-result", "user", [{ type: "tool_result", toolUseId: "toolu_live", content: "exit_code: 0" }]),
+      message("prompt", "user", [{ type: "text", text: "continue" }]),
+    ]);
+
+    const derived = deriveContext(entries, baseOptions);
+
+    expect(derived.request.messages).toEqual([
+      { id: "kept-result", role: "user", content: [{ type: "text", text: "continue" }] },
+    ]);
+    expect(repairCodes(derived)).toContain("orphan_tool_result");
+    expect(leadsWithOrphanResult(derived)).toBe(false);
+  });
+
+  test("re-deriving the same hostile window for another provider drops the orphan every time", () => {
+    const entries = transcript([
+      message("u1", "user", [{ type: "tool_result", toolUseId: "toolu_live", content: "exit_code: 0" }]),
+      message("a1", "assistant", [{ type: "text", text: "done" }]),
+      message("u2", "user", [{ type: "text", text: "continue" }]),
+    ]);
+
+    for (const apiType of ["openai_completions", "openai_responses", "openai_websocket", "anthropic_messages"] as const) {
+      const derived = deriveContext(entries, { ...baseOptions, apiType });
+      expect(leadsWithOrphanResult(derived)).toBe(false);
+      expect(repairCodes(derived)).toContain("orphan_tool_result");
+    }
+  });
+
   test("classifies a repaired payload that still exceeds the model window", () => {
     const entries = transcript([message("u1", "user", [{ type: "text", text: "x".repeat(1_000) }])]);
 
@@ -261,4 +363,16 @@ function timestamp(index: number): string {
 
 function repairCodes(derived: ReturnType<typeof deriveContext>): string[] {
   return derived.repairs.map((repair) => repair.code);
+}
+
+/** Whether any tool result in the derived window has no tool call ahead of it. */
+function leadsWithOrphanResult(derived: ReturnType<typeof deriveContext>): boolean {
+  const calls = new Set<string>();
+  for (const message of derived.request.messages) {
+    for (const block of message.content) {
+      if (block.type === "tool_use") calls.add(block.id);
+      if (block.type === "tool_result" && !calls.has(block.toolUseId)) return true;
+    }
+  }
+  return false;
 }
