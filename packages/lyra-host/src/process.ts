@@ -12,6 +12,8 @@ import type {
 export const DEFAULT_ACQUISITION_TIMEOUT_MS = 300_000;
 /** Ordinary commands have a bounded lifetime even when no timeout is supplied. */
 export const DEFAULT_PROCESS_TIMEOUT_MS = 60 * 60_000;
+/** Settled jobs stay retrievable for a while, then age out: a session runs for hours. */
+export const DEFAULT_RETAINED_SETTLED_JOBS = 64;
 
 const MAX_TIMER_MS = 2_147_000_000;
 
@@ -329,6 +331,7 @@ interface NormalizedRequest {
   cwd: string;
   timeoutMs?: number;
   signal?: AbortSignal;
+  background?: boolean;
 }
 
 function normalizeRequest(request: ProcessRequest): NormalizedRequest {
@@ -350,11 +353,16 @@ function normalizeRequest(request: ProcessRequest): NormalizedRequest {
   if (signal !== undefined && (typeof signal !== "object" || signal === null || typeof (signal as { addEventListener?: unknown }).addEventListener !== "function")) {
     throw new ProcessRequestError("Process signal must be an AbortSignal when provided");
   }
+  const background = value.background;
+  if (background !== undefined && typeof background !== "boolean") {
+    throw new ProcessRequestError("Process background must be a boolean when provided");
+  }
   return {
     command: value.command,
     cwd: value.cwd,
     ...(timeout === undefined ? {} : { timeoutMs: timeout }),
     ...(signal === undefined ? {} : { signal: signal as AbortSignal }),
+    ...(background === undefined ? {} : { background }),
   };
 }
 
@@ -384,6 +392,8 @@ export interface ProcessHostOptions {
   lightLimit?: number;
   acquisitionTimeoutMs?: number;
   defaultTimeoutMs?: number;
+  /** How many settled jobs stay retrievable through wait/status/list before ageing out. */
+  retainSettledJobs?: number;
   /** Wrap heavy Linux jobs in a transient systemd user service. */
   cgroup?: boolean;
 }
@@ -436,6 +446,7 @@ export class ProcessHost implements HostProcess {
   readonly #jobs = new Map<string, JobInternal>();
   readonly #acquisitionTimeoutMs: number;
   readonly #defaultTimeoutMs: number;
+  readonly #retainSettledJobs: number;
   readonly #cgroup: boolean;
   readonly #cgroupCpuQuota: string;
   #sequence = 0;
@@ -456,8 +467,10 @@ export class ProcessHost implements HostProcess {
     }
     const acquisitionTimeoutMs = options.acquisitionTimeoutMs ?? DEFAULT_ACQUISITION_TIMEOUT_MS;
     const defaultTimeoutMs = options.defaultTimeoutMs ?? DEFAULT_PROCESS_TIMEOUT_MS;
+    const retainSettledJobs = options.retainSettledJobs ?? DEFAULT_RETAINED_SETTLED_JOBS;
     if (!Number.isFinite(acquisitionTimeoutMs) || acquisitionTimeoutMs < 0) throw new RangeError("acquisitionTimeoutMs must be non-negative");
     if (!Number.isFinite(defaultTimeoutMs) || defaultTimeoutMs <= 0) throw new RangeError("defaultTimeoutMs must be positive");
+    if (!Number.isSafeInteger(retainSettledJobs) || retainSettledJobs < 1) throw new RangeError("retainSettledJobs must be a positive safe integer");
     this.#limits = Object.freeze(limits);
     this.#semaphores = {
       heavy: new Semaphore(limits.heavy),
@@ -466,6 +479,7 @@ export class ProcessHost implements HostProcess {
     };
     this.#acquisitionTimeoutMs = acquisitionTimeoutMs;
     this.#defaultTimeoutMs = defaultTimeoutMs;
+    this.#retainSettledJobs = retainSettledJobs;
     this.#cgroup = options.cgroup === true && process.platform === "linux";
     this.#cgroupCpuQuota = `${Math.min(limits.heavy, 8) * 100}%`;
   }
@@ -514,7 +528,7 @@ export class ProcessHost implements HostProcess {
       if (normalized.signal.aborted) onRequestAbort();
     }
     void this.#execute(job, onRequestAbort);
-    if (processClass === "heavy") return handle;
+    if (processClass === "heavy" || normalized.background === true) return handle;
     return resultPromise;
   }
 
@@ -705,6 +719,26 @@ export class ProcessHost implements HostProcess {
     else if (result.exitCode === 0 && !job.deadlineRequested) job.handle.status = "completed";
     else job.handle.status = "failed";
     job.resolveResult(result);
+    this.#pruneSettledJobs();
+  }
+
+  /**
+   * A settled job holds its whole ProcessResult — complete stdout and stderr — so the map cannot
+   * be allowed to grow for the life of a session (§11). Heavy jobs hand a bare id to the model,
+   * so results stay retrievable for a while; only the oldest settled entries age out, and a job
+   * that is still queued or running is never evicted.
+   */
+  #pruneSettledJobs(): void {
+    let settled = 0;
+    for (const job of this.#jobs.values()) if (job.settled) settled += 1;
+    let excess = settled - this.#retainSettledJobs;
+    if (excess <= 0) return;
+    for (const [id, job] of this.#jobs) {
+      if (excess <= 0) break;
+      if (!job.settled) continue;
+      this.#jobs.delete(id);
+      excess -= 1;
+    }
   }
 
   #cancelledResult(job: JobInternal, message: string): ProcessResult {

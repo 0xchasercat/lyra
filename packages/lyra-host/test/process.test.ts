@@ -121,6 +121,26 @@ describe("classed process execution", () => {
     expect(() => process.kill(pid, 0)).toThrow();
   });
 
+  test("ages out the oldest settled jobs and never evicts a live one", async () => {
+    const root = await mkdtemp(join(tmpdir(), "lyra-host-process-"));
+    roots.push(root);
+    const host = new ProcessHost({ nproc: 1, retainSettledJobs: 2 });
+    hosts.push(host);
+
+    const live = await host.run({ command: "sleep 5", cwd: root });
+    for (let index = 0; index < 4; index += 1) await host.run({ command: `printf out-${index}`, cwd: root });
+
+    // Only the newest two settled jobs survive, alongside the job that is still running.
+    expect(host.listJobs().map((job) => job.id)).toEqual(["job-000001", "job-000004", "job-000005"]);
+    expect(host.status("job-000002")).toBeUndefined();
+    expect(await host.wait("job-000002")).toBeUndefined();
+    expect((await host.wait("job-000005"))?.stdout).toBe("out-3");
+    expect(host.status("job-000001")?.status).toBe("running");
+
+    expect(await host.cancel(live.id)).toBe(true);
+    expect((await host.wait(live.id))?.signal).toBe("SIGTERM");
+  });
+
   test("rejects malformed requests promptly", async () => {
     const host = new ProcessHost();
     hosts.push(host);

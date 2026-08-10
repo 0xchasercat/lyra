@@ -11,6 +11,7 @@ import {
   writeFile,
 } from "node:fs/promises";
 import { dirname, join, relative, resolve, sep } from "node:path";
+import { clonefileSupported, nativeCloneEntry, type CloneEntry } from "./clonefile.ts";
 import type { WorkspaceMode, WorkspaceRecord, WorkspaceState } from "./types.ts";
 
 const ADJECTIVES = [
@@ -48,6 +49,11 @@ export interface WorkspaceManagerOptions {
   workspaceRoot?: string;
   /** Injectable for deterministic tests; production uses the git executable. */
   git?: GitRunner;
+  /**
+   * Injectable copy-on-write clone of a single filesystem entry. Production uses macOS
+   * `clonefile(2)`; pass `false` to force the portable copy path.
+   */
+  clonefile?: CloneEntry | false;
   now?: () => Date;
   onRecoveryIssue?: (message: string) => void;
 }
@@ -62,6 +68,8 @@ export interface WorkspaceCreateOptions {
 export interface GitCapabilities {
   git: boolean;
   cloneLocal: boolean;
+  /** True when the in-kernel hierarchy clone is available (macOS APFS `clonefile(2)`). */
+  clonefile: boolean;
 }
 
 export class WorkspaceError extends Error {
@@ -151,6 +159,7 @@ export class WorkspaceManager {
   private readonly options: WorkspaceManagerOptions;
   private readonly originInput: string;
   private readonly git: GitRunner;
+  private readonly cloneEntry: CloneEntry | undefined;
   private readonly now: () => Date;
   private readonly records = new Map<string, WorkspaceRecord>();
   private readonly occupiedNames = new Set<string>();
@@ -159,7 +168,7 @@ export class WorkspaceManager {
   private mutation: Promise<void> = Promise.resolve();
   private originRoot = "";
   private workspaceRoot = "";
-  private capabilitiesValue: GitCapabilities = { git: false, cloneLocal: false };
+  private capabilitiesValue: GitCapabilities = { git: false, cloneLocal: false, clonefile: false };
   private temporaryCounter = 0;
 
   constructor(optionsOrOrigin: WorkspaceManagerOptions | string) {
@@ -169,6 +178,10 @@ export class WorkspaceManager {
       throw new WorkspaceError("INVALID_ORIGIN", "A repository origin root is required");
     }
     this.git = this.options.git ?? defaultGit;
+    this.cloneEntry = this.options.clonefile === false
+      ? undefined
+      : this.options.clonefile ?? (clonefileSupported() ? nativeCloneEntry : undefined);
+    this.capabilitiesValue.clonefile = this.cloneEntry !== undefined;
     this.now = this.options.now ?? (() => new Date());
   }
 
@@ -544,36 +557,61 @@ export class WorkspaceManager {
 
       let mode: WorkspaceMode = "clone";
       let degradedReason: string | undefined;
+      let snapshotReason: string | undefined;
       let created = false;
+      let mirrored = false;
       if (requested.mode === "worktree") {
         mode = "worktree";
         degradedReason = "Worktree mode was explicitly requested; refs are shared with the origin repository";
-      } else if (this.capabilitiesValue.cloneLocal) {
-        const clone = await this.runGit(["clone", "--local", this.originRoot, path], this.originRoot, signal);
-        if (clone.exitCode === 0) {
-          created = true;
-        } else {
-          degradedReason = `git clone --local failed (${clone.stderr.trim() || `exit ${clone.exitCode}`}); using a shared-ref worktree instead`;
-        }
       } else {
-        degradedReason = "git clone --local is unavailable; using a shared-ref worktree instead";
+        // The in-kernel hierarchy clone is the canonical mechanism: it carries `.git`, the
+        // uncommitted working tree, and untracked files across as one copy-on-write
+        // snapshot, so no checkout and no file-by-file mirror are needed at all.
+        snapshotReason = await this.snapshotWorkspace(path, signal);
+        if (snapshotReason === undefined) {
+          created = true;
+          mirrored = true;
+        }
+      }
+
+      if (!created && requested.mode !== "worktree") {
+        if (this.capabilitiesValue.cloneLocal) {
+          // `--no-checkout` keeps this path from writing the working tree twice: the copy
+          // below is the only pass over the files, and the index is restored afterwards.
+          const clone = await this.runGit(["clone", "--local", "--no-checkout", this.originRoot, path], this.originRoot, signal);
+          if (clone.exitCode === 0) {
+            created = true;
+          } else {
+            degradedReason = `git clone --local failed (${clone.stderr.trim() || `exit ${clone.exitCode}`}); using a shared-ref worktree instead`;
+          }
+        } else {
+          degradedReason = "git clone --local is unavailable; using a shared-ref worktree instead";
+        }
       }
 
       if (!created) {
         await this.removePartialPath(path);
         mode = "worktree";
-        const worktree = await this.runGit(["worktree", "add", "--detach", path, "HEAD"], this.originRoot, signal);
+        const worktree = await this.runGit(["worktree", "add", "--detach", "--no-checkout", path, "HEAD"], this.originRoot, signal);
         if (worktree.exitCode !== 0) {
           await this.removePartialPath(path);
           throw new WorkspaceError(
             "WORKSPACE_CREATE_FAILED",
             `Could not create workspace ${name} by clone or worktree; check Git and repository permissions`,
-            `${degradedReason ?? "clone unavailable"}; ${worktree.stderr.trim() || `worktree exit ${worktree.exitCode}`}`,
+            [snapshotReason, degradedReason ?? "clone unavailable", worktree.stderr.trim() || `worktree exit ${worktree.exitCode}`].filter(Boolean).join("; "),
           );
         }
         created = true;
       }
-      await this.mirrorWorkingTree(path, signal);
+      if (!mirrored) {
+        try {
+          await this.mirrorWorkingTree(path, signal);
+          await this.restoreIndex(path, signal);
+        } catch (error) {
+          await this.removePartialPath(path).catch(() => undefined);
+          throw error;
+        }
+      }
 
       try {
         await this.assertWorkspacePath(path);
@@ -604,12 +642,106 @@ export class WorkspaceManager {
       return cloneRecord(record);
     });
   }
+
+  /**
+   * Clone the whole origin hierarchy in the kernel.
+   *
+   * On APFS this is a handful of `clonefile(2)` calls that share extents instead of copying
+   * bytes, so `.git`, the uncommitted working tree, and untracked files all arrive as one
+   * consistent snapshot — which is exactly the independent-repository semantics a workspace
+   * needs. Returns `undefined` on success, or the reason the portable path must run instead.
+   */
+  private async snapshotWorkspace(destination: string, signal?: AbortSignal): Promise<string | undefined> {
+    const clone = this.cloneEntry;
+    if (!clone) return "an in-kernel hierarchy clone is unavailable on this host";
+    try {
+      // A `.git` file means the origin is itself a linked worktree or a submodule; copying
+      // that pointer would silently share the origin's refs, the opposite of the intent.
+      if (!(await lstat(join(this.originRoot, ".git"))).isDirectory()) return "origin .git is not a directory; only git clone can detach it";
+    } catch (error) {
+      return `origin .git cannot be inspected (${errorMessage(error)})`;
+    }
+    let entries: string[];
+    try {
+      entries = await readdir(this.originRoot);
+    } catch (error) {
+      return `origin ${this.originRoot} cannot be listed (${errorMessage(error)})`;
+    }
+    try {
+      await mkdir(destination);
+    } catch (error) {
+      return `workspace directory ${destination} cannot be created (${errorMessage(error)})`;
+    }
+    try {
+      for (const entry of entries) {
+        // `.lyra` holds every other workspace; cloning it would nest the tree in itself.
+        if (entry === ".lyra") continue;
+        if (signal?.aborted) throw signal.reason;
+        const outcome = await clone(join(this.originRoot, entry), join(destination, entry));
+        // EXDEV, ENOTSUP, or anything else: leave no half-written tree behind and copy.
+        if (!outcome.ok) return await this.abandonSnapshot(destination, `clonefile could not clone ${entry} (${outcome.message ?? `errno ${outcome.errno ?? 0}`})`);
+      }
+      const invalid = await this.verifySnapshot(destination, signal);
+      return invalid === undefined ? undefined : await this.abandonSnapshot(destination, invalid);
+    } catch (error) {
+      await this.removePartialPath(destination).catch(() => undefined);
+      throw error;
+    }
+  }
+
+  private async abandonSnapshot(destination: string, reason: string): Promise<string> {
+    await this.removePartialPath(destination).catch(() => undefined);
+    return reason;
+  }
+
+  /** Confirm the cloned hierarchy is a working repository before anything is recorded. */
+  private async verifySnapshot(destination: string, signal?: AbortSignal): Promise<string | undefined> {
+    // The origin's index may have been locked mid-operation when the snapshot was taken.
+    // The copied lock names no live process and nobody will ever release it, yet git
+    // refuses every command while it exists — so the clone's copy is always meaningless.
+    await rm(join(destination, ".git", "index.lock"), { force: true });
+    const status = await this.runGit(["-C", destination, "status", "--porcelain"], destination, signal);
+    if (status.exitCode !== 0) return `cloned snapshot is not a usable repository (${status.stderr.trim() || `git status exit ${status.exitCode}`})`;
+    // `git clone --local` points `origin` at the local repository; keep both paths
+    // identical so an agent in a workspace can never push straight at the real remote.
+    const rewired = await this.runGit(["-C", destination, "remote", "set-url", "origin", this.originRoot], destination, signal);
+    if (rewired.exitCode !== 0) {
+      const added = await this.runGit(["-C", destination, "remote", "add", "origin", this.originRoot], destination, signal);
+      if (added.exitCode !== 0) return `cloned snapshot could not point origin at ${this.originRoot} (${added.stderr.trim() || `git remote exit ${added.exitCode}`})`;
+    }
+    return undefined;
+  }
+
+  /**
+   * Copy the live working tree over a `--no-checkout` clone or worktree.
+   *
+   * The destination holds only `.git` at this point, so every file is written exactly once;
+   * the removal loop is a cheap guard against a stale directory, not a second pass.
+   */
   private async mirrorWorkingTree(destination: string, signal?: AbortSignal): Promise<void> {
     for (const entry of await readdir(destination)) if (entry !== ".git") await rm(join(destination, entry), { recursive: true, force: true });
     for (const entry of await readdir(this.originRoot)) {
       if (signal?.aborted) throw signal.reason;
       if (entry === ".git" || entry === ".lyra") continue;
       await cp(join(this.originRoot, entry), join(destination, entry), { recursive: true, force: true, preserveTimestamps: true, mode: constants.COPYFILE_FICLONE });
+    }
+  }
+
+  /**
+   * `--no-checkout` leaves an empty index, which would make every copied file look
+   * untracked. Point the index back at HEAD; the working tree is not touched.
+   */
+  private async restoreIndex(destination: string, signal?: AbortSignal): Promise<void> {
+    const head = await this.runGit(["-C", destination, "rev-parse", "--verify", "-q", "HEAD"], destination, signal);
+    // An unborn HEAD (a repository with no commits) is already described by an empty index.
+    if (head.exitCode !== 0) return;
+    const reset = await this.runGit(["-C", destination, "reset", "-q", "--mixed", "HEAD"], destination, signal);
+    if (reset.exitCode !== 0) {
+      throw new WorkspaceError(
+        "WORKSPACE_CREATE_FAILED",
+        `Could not restore the Git index in workspace ${destination}; the working tree copy would look entirely untracked`,
+        reset.stderr.trim() || `git reset exit ${reset.exitCode}`,
+      );
     }
   }
 

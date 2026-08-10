@@ -21,6 +21,12 @@ export interface ProcessRequest {
   cwd: string;
   timeoutMs?: number;
   signal?: AbortSignal;
+  /**
+   * Return a job handle immediately even when the command classifies below `heavy`.
+   * Classification still owns the semaphore class (§11) — this only decides whether the
+   * caller blocks for the result or collects it later with `wait`.
+   */
+  background?: boolean;
 }
 export interface ProcessResult {
   stdout: string;
@@ -40,6 +46,8 @@ export interface JobHandle {
 export interface HostProcess {
   run(request: ProcessRequest): Promise<ProcessResult | JobHandle>;
   wait(id: string, timeoutMs?: number): Promise<ProcessResult | undefined>;
+  /** Present on hosts that keep a job table; lets a caller tell "unknown id" from "still running". */
+  status?(id: string): JobHandle | undefined;
   cancel(id: string): Promise<boolean>;
   classify(command: string): ProcessClass;
   close(): Promise<void>;
