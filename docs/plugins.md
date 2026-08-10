@@ -148,169 +148,69 @@ is four fields, so a plugin that is not short is doing something you did not ask
 
 ---
 
-## Skeleton: an OAuth device-flow plugin
+## Worked example: reusing Claude Code's credential
 
-The shape, not an implementation. The OAuth specifics are deliberately stubbed: which
-authorization server, which client id, which scopes, and what a given vendor's terms allow are
-the community's business, not core's.
+The community's answer to subscription auth is not to re-implement an OAuth flow — it is to
+reuse the credential the vendor's own CLI already maintains. `claude` (Claude Code) keeps a
+refreshable token in the OS credential store; a plugin that reads it, refreshes it through
+the same endpoint near expiry, and writes the rotation back needs no login flow of its own.
+If the user can run `claude`, the plugin works.
+
+The shape (condensed — the full file is ~150 lines with the platform fallbacks):
 
 `~/.lyra/plugins/claude-oauth/plugin.ts`:
 
 ```ts
-import { chmod, mkdir, readFile, writeFile } from "node:fs/promises";
-import { dirname, join } from "node:path";
+const SERVICE = "Claude Code-credentials";          // macOS keychain entry
+const FILE = "~/.claude/.credentials.json";         // where there is no keychain
+const TOKEN_ENDPOINT = "https://console.anthropic.com/v1/oauth/token";
+const MARGIN_MS = 60_000;
 
-const HERE = new URL(".", import.meta.url).pathname;
-const CREDENTIALS = join(HERE, "credentials.json");
-
-// TODO: the vendor's own values. Nothing here is a secret — a public client id is public —
-// but everything here is vendor-specific and changes on their schedule, not Lyra's.
-const DEVICE_CODE_URL = "https://…/oauth/device/code";
-const TOKEN_URL = "https://…/oauth/token";
-const CLIENT_ID = "…";
-const SCOPES = "…";
-
-interface Stored {
-  accessToken: string;
-  refreshToken: string;
-  /** ISO 8601. */
-  expiresAt: string;
+function read(): { store: Store; oauth: StoredOauth } {
+  // keychain via `security find-generic-password -s SERVICE -w`, else the file;
+  // both hold JSON with { claudeAiOauth: { accessToken, refreshToken, expiresAt } }.
+  // Absent → throw the actionable line below.
 }
 
-async function read(): Promise<Stored | undefined> {
-  try { return JSON.parse(await readFile(CREDENTIALS, "utf8")) as Stored; }
-  catch { return undefined; }
-}
-
-async function write(stored: Stored): Promise<void> {
-  await mkdir(dirname(CREDENTIALS), { recursive: true, mode: 0o700 });
-  await writeFile(CREDENTIALS, JSON.stringify(stored, null, 2), { mode: 0o600 });
-  // Belt and braces: writeFile's mode does not apply to a file that already existed.
-  await chmod(CREDENTIALS, 0o600);
+async function refresh(store: Store, oauth: StoredOauth): Promise<StoredOauth> {
+  // POST TOKEN_ENDPOINT { grant_type: "refresh_token", refresh_token, client_id }
+  // → rotate accessToken/refreshToken/expiresAt, write back to the same store
+  //   (best-effort — the token in hand is good either way) so `claude` keeps working.
 }
 
 export default {
   id: "claude-oauth",
+  headers: { "anthropic-beta": "oauth-2025-04-20" },
+  systemPrefix: "You are Claude Code, Anthropic's official CLI for Claude.",
 
-  // The beta flag this endpoint mandates alongside an OAuth bearer token.
-  headers: { "anthropic-beta": "…" },
-
-  // The one line the endpoint checks. Not a prompt — a shibboleth.
-  systemPrefix: "…",
-
-  /**
-   * Interactive. Runs only under `lyra plugins login claude-oauth`, which owns the terminal,
-   * so printing and waiting are both fine here.
-   */
   async login(): Promise<void> {
-    // 1. Ask for a device code.
-    const start = await fetch(DEVICE_CODE_URL, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ client_id: CLIENT_ID, scope: SCOPES }),
-    }).then((response) => response.json() as Promise<{
-      device_code: string; user_code: string; verification_uri: string; interval: number;
-    }>);
-
-    // 2. Tell the human what to do. This is the whole reason login() is separate from getToken().
-    console.log(`Open ${start.verification_uri} and enter code ${start.user_code}`);
-
-    // 3. Poll until they do, or until it expires. Honour `interval`; back off on slow_down.
-    for (;;) {
-      await new Promise((resolve) => setTimeout(resolve, start.interval * 1000));
-      const response = await fetch(TOKEN_URL, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({
-          client_id: CLIENT_ID,
-          device_code: start.device_code,
-          grant_type: "urn:ietf:params:oauth:grant-type:device_code",
-        }),
-      });
-      const body = await response.json() as {
-        access_token?: string; refresh_token?: string; expires_in?: number; error?: string;
-      };
-      if (body.error === "authorization_pending") continue;
-      if (body.error !== undefined) throw new Error(`Sign-in failed: ${body.error}`);
-      if (!body.access_token || !body.refresh_token || !body.expires_in) {
-        throw new Error("The token endpoint returned no usable credentials.");
-      }
-      await write({
-        accessToken: body.access_token,
-        refreshToken: body.refresh_token,
-        expiresAt: new Date(Date.now() + body.expires_in * 1000).toISOString(),
-      });
-      return;
-    }
+    // No flow of our own: Claude Code owns login. Verify the credential exists
+    // (throwing "run `claude` and log in once" when it does not) and refresh if stale.
   },
 
-  /**
-   * Non-interactive, and called on the hot path. Read, refresh if stale, never prompt.
-   */
-  async getToken(): Promise<{ token: string; expiresAt: string }> {
-    const stored = await read();
-    if (stored === undefined) {
-      // The sentence a user sees. Lyra appends `Run \`lyra plugins login claude-oauth\``.
-      throw new Error(`No stored credentials at ${CREDENTIALS}`);
-    }
-
-    // Lyra already refreshes 60s early, so this only fires when the clock moved under us.
-    if (Date.parse(stored.expiresAt) > Date.now() + 30_000) {
-      return { token: stored.accessToken, expiresAt: stored.expiresAt };
-    }
-
-    const body = await fetch(TOKEN_URL, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({
-        client_id: CLIENT_ID,
-        grant_type: "refresh_token",
-        refresh_token: stored.refreshToken,
-      }),
-    }).then((response) => response.json() as Promise<{
-      access_token?: string; refresh_token?: string; expires_in?: number;
-    }>);
-    if (!body.access_token || !body.expires_in) {
-      throw new Error(`Refresh was rejected; the stored credentials at ${CREDENTIALS} are stale`);
-    }
-
-    const next: Stored = {
-      accessToken: body.access_token,
-      refreshToken: body.refresh_token ?? stored.refreshToken,
-      expiresAt: new Date(Date.now() + body.expires_in * 1000).toISOString(),
-    };
-    await write(next);
-    return { token: next.accessToken, expiresAt: next.expiresAt };
+  async getToken(): Promise<{ token: string; expiresAt?: string }> {
+    const { store, oauth } = read();
+    const live = oauth.expiresAt <= Date.now() + MARGIN_MS ? await refresh(store, oauth) : oauth;
+    return { token: live.accessToken, expiresAt: new Date(live.expiresAt - MARGIN_MS).toISOString() };
   },
 };
 ```
 
-Then:
-
-```
-lyra plugins install https://github.com/you/claude-oauth
-lyra plugins login claude-oauth
-```
-
-and in `~/.lyra/providers.toml`:
+Wire it to a provider:
 
 ```toml
 [providers.claude-max]
 base_url = "https://api.anthropic.com/v1"
 api_type = "anthropic_messages"
-auth     = { type = "plugin", plugin = "claude-oauth" }
-
-[roles]
-default = "claude-max/claude-opus-5"
+auth = { type = "plugin", plugin = "claude-oauth" }
+models = ["claude-fable-5", "claude-opus-5", "claude-sonnet-5", "claude-haiku-4-5"]
 ```
 
-## Writing your own
+Why `systemPrefix` matters here: the subscription endpoint requires the Claude Code identity
+line as the first system block. A proxy satisfies that by injecting Claude Code's *entire*
+system prompt — tool instructions included — which contaminates the model's instruction
+following. This plugin pays exactly one line, and Lyra's prompt keeps its authority.
 
-- Keep credentials inside the plugin's own directory, `chmod 600`. Lyra never reads them and
-  never copies them.
-- Throw, with the path in the message, when there is nothing stored. That sentence is the whole
-  error the user gets.
-- `getToken` may be called concurrently by a parent and its spawned children. If a refresh is
-  expensive, memoise the in-flight promise.
-- Do not log the token. `lyra plugins list` and every Lyra error report the credential's
-  *address*, never its contents; keep that true.
+The specifics above — which service name, which endpoint, which client id, and what a given
+vendor's terms allow — are the plugin author's and user's business, not core's. That line is
+the whole reason the hatch is a hatch.
