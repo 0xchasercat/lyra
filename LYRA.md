@@ -322,6 +322,7 @@ has a defined expiry behavior.
 | HTTP request headers | 30s | `transient`, retry |
 | Stream token gap | 45s | §3.3 |
 | Total turn | 30m | Cancel, keep partial, surface |
+| ACP request | 60s — except `session/prompt`, `session/steer`, `session/command` and `agent/spawn`, which carry a turn and get `reliability.turn_timeout` | Abort the handler, answer `-32001` |
 | Tool call (default) | 120s | Kill, return timeout to model |
 | `bash` heavy | Unbounded (job) | Never blocks — §11 |
 | Semaphore acquire | 300s | Return queued handle, do not block |
@@ -586,7 +587,7 @@ dependency.
 
 ```toml
 [providers.anthropic]
-base_url = "https://api.anthropic.com"
+base_url = "https://api.anthropic.com/v1"
 api_type = "anthropic_messages"
 auth     = { type = "env", var = "ANTHROPIC_API_KEY" }
 
@@ -602,10 +603,35 @@ api_type = "openai_completions"
 auth     = { type = "none" }
 
 [providers.claude-max]
-base_url = "https://api.anthropic.com"
+base_url = "https://api.anthropic.com/v1"
 api_type = "anthropic_messages"
 auth     = { type = "plugin", plugin = "claude-oauth" }
 ```
+
+**`base_url` is the exact prefix routes hang off** — one rule for every `api_type`, so a
+provider that was detected at one path shape cannot be requested at another:
+
+| api_type             | request                   |
+| -------------------- | ------------------------- |
+| `openai_completions` | `{base_url}/chat/completions` |
+| `openai_responses`   | `{base_url}/responses`    |
+| `openai_websocket`   | `{base_url}/responses` over `ws(s)` |
+| `anthropic_messages` | `{base_url}/messages`     |
+| *(all)*              | `{base_url}/models`       |
+
+Canonically that prefix carries the API version segment — `https://api.openai.com/v1`,
+`https://api.anthropic.com/v1`, a gateway's own `https://host/api/v1` unchanged — and
+`provider/add` stores what it was given in exactly that form (trailing slash and a pasted
+full route trimmed, a bare origin given `/v1`). `provider/detect` probes both shapes and
+reports the one that answered as `normalizedBaseUrl`, so the form is filled from a
+measurement rather than a convention.
+
+Hand-written configs predate the rule, so it is forgiving: a request that comes back `404`
+before anything has streamed is retried once against the base with its `/v1` added or
+removed. If that works, the shape is remembered for the session and a one-line notice names
+the `base_url` to write down — a healed provider is never a silent divergence from its own
+configuration. A `404` that survives both attempts is reported with the full URL it went to,
+because a 404 is a statement about a path and the path is the one thing its body never has.
 
 **Model discovery.** `GET {base_url}/models` on first use, cached to
 `~/.lyra/providers/<name>/models.json`, refreshed every 24h in the background, `/model
@@ -613,18 +639,46 @@ refresh` to force. If it 404s, models are declared manually. Auto-fetched entrie
 augmented with locally-known context windows and pricing, since `/models` rarely reports
 either.
 
-**Auth plugins** — the one executable hatch, one function:
+**Auth plugins** — the one executable hatch, one required function:
 
 ```typescript
 interface AuthPlugin {
-  id: string
-  getToken(): Promise<{ token: string, expiresAt?: string }>
+  id: string                                                   // must equal the directory name
+  headers?: Record<string, string>                             // extra headers the endpoint mandates
+  systemPrefix?: string                                        // one static line, prepended as the FIRST system block
+  login?(): Promise<void>                                      // interactive; only `lyra plugins login <id>` runs it
+  getToken(): Promise<{ token: string, expiresAt?: string }>   // non-interactive; throws actionably with no creds
 }
 ```
 
-At `~/.lyra/plugins/<id>/`. Lyra caches and refreshes on expiry. The community owns Claude
-Max, ChatGPT, Copilot, and whatever comes next — every subscription resolves to an
-OpenAI- or Anthropic-compatible endpoint, and only token acquisition differs.
+At `~/.lyra/plugins/<id>/plugin.ts` (or `index.ts`), default-exported. Lyra caches the token
+until shortly before `expiresAt`, and on a 401 drops the cache, re-asks, and retries once — the
+existing auth recovery in `ReliableProvider`, connected to the one credential source that can
+actually recover. The community owns Claude Max, ChatGPT, Copilot, and whatever comes next —
+every subscription resolves to an OpenAI- or Anthropic-compatible endpoint, and only token
+acquisition differs.
+
+Three fields beyond `getToken`, because a subscription endpoint checks three things, not one:
+
+- **`headers`** — merged over the provider's own on every request. A plugin returns a *bearer*
+  token by contract, so plugin auth on `anthropic_messages` sends `Authorization: Bearer`, where
+  an API key would have gone in `x-api-key`.
+- **`systemPrefix`** — the reason this is not a one-function interface. Some endpoints check
+  that the first system block is the vendor client's identity line. The workaround in the wild
+  is a proxy injecting that client's *entire* system prompt, which buys access by replacing
+  Lyra's instructions with someone else's — instruction-following contaminated at the root. A
+  declared prefix pays the one line that is actually checked, as its own system block ahead of
+  Lyra's, leaving §14 in authority. It is provider-mandated overhead, so it is added in the
+  provider layer beside the request headers, is excluded from the 4,000-character system prompt
+  budget, and is static for the session, leaving the §13 cache breakpoint where it was.
+- **`login`** — never called during a turn. `getToken` runs inside streaming responses and
+  inside spawned children; an interactive flow there is a hung turn. It throws instead, and Lyra
+  appends `run \`lyra plugins login <id>\``.
+
+Managed with `lyra plugins install|list|update|remove|login`. Install is a shallow clone (or a
+copy, for a local directory) into `~/.lyra/plugins/<id>`, preceded by a line naming the source
+and stating that the code will run with the user's environment — YOLO, made visible rather than
+gated (§1, §12). Full contract, trust model, and a worked skeleton: `docs/plugins.md`.
 
 **Roles:**
 
@@ -1367,6 +1421,9 @@ terminal.
 ```
 initialize
 session/new · load · prompt · update · cancel · fork
+session/models · select_model · providers · select_provider
+provider/setup_options · detect · verify · add · get · remove
+model/add
 workspace/list · create · drop
 agent/list · spawn · cancel · message
 git/preview · apply · rollback · snapshot
@@ -1377,6 +1434,21 @@ settings/get · set
 The method surface is deliberately the same as the JIT runtime API (§8). One control plane,
 two entry points — anything reachable in an orchestration script is reachable over ACP, and
 they are validated by the same tests.
+
+**The daemon boots without a provider.** `provider/*` is answerable when nothing is
+configured, because that is the only moment it matters: a first run comes up with a real
+session whose prompts are refused with an actionable error, `session/snapshot` reports
+`providerConfigured: false`, and the client runs setup over `provider/setup_options` →
+`provider/detect` → `provider/verify` → `provider/add` → `session/select_provider`. A
+credential crosses this pipe once, in `apiKey`; it is never persisted except where `persist`
+says, never logged, and never echoed by a result or a notification.
+
+**Editing and deleting are the same surface.** `provider/get` reads one provider back for the
+form — including where its credential comes from, never what it is — and `provider/add` with
+an existing id replaces it, with `persist: "keep"` for the common edit whose key field was
+left empty. `provider/remove` deletes a declaration through the same non-destructive merge,
+refuses while the session is running on that provider, cleans the OS-keychain entry only when
+asked, and reports the roles left pointing at the removed name rather than repointing them.
 
 **Lyra as ACP client too.** `spawn({ acp: 'claude' })` runs an external harness as a
 subagent, bridged onto the IRC bus (§9). Lyra orchestrates other harnesses using the same
@@ -1393,7 +1465,7 @@ stdio ships first. Remote transport requires auth and is gated behind it.
 | `/copy` | Copy last message, or pick one |
 | `/dump` | Full transcript to clipboard |
 | `/settings` | Runtime toggles |
-| `/provider` | Switch or configure |
+| `/provider [name [model]\|edit <name>\|delete <name>]` | Switch, add, edit, or delete |
 | `/model [refresh]` | Switch model; refresh the `/models` cache |
 | `/loop <n \| duration \| until "cond">` | Re-run the goal on every turn end |
 | `/context` | Exact payload inspection (§13) |
