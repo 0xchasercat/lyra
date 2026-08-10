@@ -8,6 +8,7 @@ import {
   ProcessQueueTimeoutError,
   Semaphore,
   classifyCommand,
+  INLINE_WAIT_BUDGET_MS,
 } from "../src/process.ts";
 
 const hosts: ProcessHost[] = [];
@@ -30,6 +31,24 @@ describe("classed process execution", () => {
     const capped = new ProcessHost({ heavyLimit: 99 });
     hosts.push(capped);
     expect(capped.limits.heavy).toBe(8);
+  });
+
+  // A bounded short sleep is the model waiting on purpose — `sleep 10; git status` is a
+  // poll. Classifying it heavy backgrounded the whole segment and left the model chasing a
+  // handle for a result it was about to get, so only an unbounded or long sleep is a job.
+  test("sleep is a job only when it is unbounded or longer than the inline budget", () => {
+    expect(classifyCommand("sleep 10")).toBe("free");
+    expect(classifyCommand("sleep 0.5")).toBe("free");
+    expect(classifyCommand("sleep 1m 30s")).toBe("free");
+    expect(classifyCommand("sleep 10; git status")).toBe("light");
+    expect(classifyCommand("sleep")).toBe("heavy");
+    expect(classifyCommand("sleep 3600")).toBe("heavy");
+    expect(classifyCommand("sleep 2m")).toBe("heavy");
+    expect(classifyCommand(`sleep ${INLINE_WAIT_BUDGET_MS / 1000}`)).toBe("heavy");
+    expect(classifyCommand("sleep $DURATION")).toBe("heavy");
+    // The genuinely unbounded ones are unchanged: neither ever ends on its own.
+    expect(classifyCommand("yes")).toBe("heavy");
+    expect(classifyCommand("tail -f app.log")).toBe("heavy");
   });
 
   test("enforces class limits and expires queued tickets", async () => {
@@ -59,7 +78,9 @@ describe("classed process execution", () => {
     roots.push(root);
     const host = new ProcessHost({ nproc: 1 });
     hosts.push(host);
-    const handle = await host.run({ command: "sleep 0.03; printf heavy", cwd: root });
+    // A build tool, not a sleep: a bounded short sleep is the model waiting on purpose and
+    // classifies free, so it would no longer be a job at all.
+    const handle = await host.run({ command: "bun --version >/dev/null; printf heavy", cwd: root });
     expect(handle).toMatchObject({ id: "job-000001", class: "heavy" });
     const result = await host.wait(handle.id);
     expect(result?.stdout).toBe("heavy");
@@ -72,7 +93,9 @@ describe("classed process execution", () => {
     roots.push(root);
     const host = new ProcessHost({ nproc: 1 });
     hosts.push(host);
-    const handle = await host.run({ command: "printf partial; sleep 5", cwd: root });
+    // `background` rather than a heavy classification: what is under test is cancellation,
+    // not which pattern happens to send a command to the background this month.
+    const handle = await host.run({ command: "printf partial; sleep 5", cwd: root, background: true });
     await new Promise((resolve) => setTimeout(resolve, 20));
     expect(await host.cancel(handle.id)).toBe(true);
     const result = await host.wait(handle.id);
@@ -100,8 +123,8 @@ describe("classed process execution", () => {
     const root = await mkdtemp(join(tmpdir(), "lyra-host-process-"));
     roots.push(root);
     const host = new ProcessHost({ nproc: 1 });
-    const first = await host.run({ command: "sleep 5", cwd: root });
-    const second = await host.run({ command: "sleep 5", cwd: root });
+    const first = await host.run({ command: "sleep 5", cwd: root, background: true });
+    const second = await host.run({ command: "sleep 5", cwd: root, background: true });
     await host.close();
     expect((await host.wait(first.id))?.signal).toBe("SIGTERM");
     expect((await host.wait(second.id))?.signal).toBe("SIGTERM");
@@ -127,7 +150,7 @@ describe("classed process execution", () => {
     const host = new ProcessHost({ nproc: 1, retainSettledJobs: 2 });
     hosts.push(host);
 
-    const live = await host.run({ command: "sleep 5", cwd: root });
+    const live = await host.run({ command: "sleep 5", cwd: root, background: true });
     for (let index = 0; index < 4; index += 1) await host.run({ command: `printf out-${index}`, cwd: root });
 
     // Only the newest two settled jobs survive, alongside the job that is still running.

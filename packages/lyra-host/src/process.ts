@@ -12,6 +12,14 @@ import type {
 export const DEFAULT_ACQUISITION_TIMEOUT_MS = 300_000;
 /** Ordinary commands have a bounded lifetime even when no timeout is supplied. */
 export const DEFAULT_PROCESS_TIMEOUT_MS = 60 * 60_000;
+/**
+ * How long a deliberately-waiting command may block before it is treated as a job.
+ *
+ * Matches the bash tool's inline budget: a `sleep` shorter than this finishes inside the
+ * call the model made, so backgrounding it would only teach the model to chase a handle for
+ * a result it was already going to get. Longer, or unbounded, and it really is a job.
+ */
+export const INLINE_WAIT_BUDGET_MS = 120_000;
 /** Settled jobs stay retrievable for a while, then age out: a session runs for hours. */
 export const DEFAULT_RETAINED_SETTLED_JOBS = 64;
 
@@ -285,12 +293,39 @@ function hasAny(args: readonly string[], values: readonly string[]): boolean {
   return args.some((argument) => values.includes(argument.toLowerCase()));
 }
 
+/**
+ * How long `sleep` will actually sleep, or undefined when that is unbounded or unknowable.
+ *
+ * GNU/BSD `sleep` accepts several operands and suffixes (`sleep 1m 30s`), so the total is
+ * the sum. Anything that does not parse — a variable, an option, no operand at all — is
+ * undefined, which is read as "unbounded" and therefore heavy: guessing short would be the
+ * dangerous direction.
+ */
+function sleepDurationMs(args: readonly string[]): number | undefined {
+  if (args.length === 0) return undefined;
+  let total = 0;
+  for (const argument of args) {
+    const match = /^(\d+(?:\.\d+)?)([smhd]?)$/.exec(argument);
+    if (match === null) return undefined;
+    const amount = Number(match[1]);
+    if (!Number.isFinite(amount)) return undefined;
+    total += amount * { "": 1_000, s: 1_000, m: 60_000, h: 3_600_000, d: 86_400_000 }[match[2] ?? ""]!;
+  }
+  return total >= INLINE_WAIT_BUDGET_MS ? undefined : total;
+}
+
 function classifySegment(segment: string): ProcessClass {
   const parsed = commandTokens(segment);
   if (parsed === undefined) return "free";
   const { executable, args } = parsed;
 
-  if (executable === "sleep" || executable === "yes" || (executable === "tail" && hasAny(args, ["-f", "--follow"]))) return "heavy";
+  // `yes` and `tail -f` never end on their own, so they are always jobs. `sleep` is the
+  // odd one out: a bounded, short one is the model waiting on purpose — `sleep 10; git
+  // status` is a poll, not a build — and classifying it heavy backgrounded the whole
+  // segment and left the model chasing a handle. It is a job only when the duration is
+  // absent, unparseable, or past the inline budget.
+  if (executable === "sleep") return sleepDurationMs(args) === undefined ? "heavy" : "free";
+  if (executable === "yes" || (executable === "tail" && hasAny(args, ["-f", "--follow"]))) return "heavy";
   if (HEAVY_EXECUTABLES[executable] === true) return "heavy";
 
   if (executable === "git") {
