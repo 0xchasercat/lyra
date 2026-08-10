@@ -2,9 +2,10 @@ import { homedir } from "node:os";
 import { dirname, resolve } from "node:path";
 import { mkdir, rename } from "node:fs/promises";
 import type { HttpTransportConfig } from "./auth.ts";
-import { endpoint, providerHeaders } from "./auth.ts";
+import { providerHeaders } from "./auth.ts";
+import { fetchProviderRoute } from "./endpoints.ts";
 import { classifyProviderError } from "./errors.ts";
-import { fetchWithHeadersDeadline, readJsonError } from "./sse.ts";
+import { readJsonError } from "./sse.ts";
 
 export interface ModelInfo {
   id: string;
@@ -71,6 +72,22 @@ const KNOWN_MODELS: Readonly<Record<string, Partial<ModelInfo>>> = {
   },
 };
 
+/** Reasoning-class families that rejected the deprecated Chat Completions max_tokens. */
+const MAX_COMPLETION_TOKENS_FAMILIES = ["o1", "o3", "o4", "gpt-5"] as const;
+
+/**
+ * Chat Completions replaced `max_tokens` with `max_completion_tokens`, and
+ * reasoning-class models reject the old name outright. Everything else —
+ * including OpenAI-compatible servers that never learned the new name — still
+ * needs `max_tokens`, so the two cannot be sent together.
+ */
+export function usesMaxCompletionTokens(modelId: string): boolean {
+  const id = modelId.toLowerCase().split("/").at(-1) ?? modelId.toLowerCase();
+  return MAX_COMPLETION_TOKENS_FAMILIES.some((family) =>
+    id === family || id.startsWith(`${family}-`) || id.startsWith(`${family}.`)
+  );
+}
+
 export async function discoverModels(
   config: HttpTransportConfig,
   options: ModelDiscoveryOptions = {},
@@ -89,10 +106,11 @@ export async function discoverModels(
   }
 
   const signal = options.signal ?? new AbortController().signal;
-  const modelsPath = config.authHeader === "x-api-key" && !config.baseUrl.endsWith("/v1")
-    ? "v1/models"
-    : "models";
-  const response = await fetchWithHeadersDeadline(endpoint(config.baseUrl, modelsPath), {
+  // `{base}/models` for every api_type, through the one shared resolver — the family-specific
+  // guess this used to make ("append /v1 when the base does not end in it, but only for
+  // x-api-key providers") is exactly the divergence that let discovery succeed against a base
+  // the message endpoint could not use.
+  const { response, url } = await fetchProviderRoute(config, "models", {
     method: "GET",
     headers: await providerHeaders(config, signal),
     signal,
@@ -101,7 +119,7 @@ export async function discoverModels(
   if (response.status === 404) return [...(options.manual ?? [])].map(augmentModel);
   if (!response.ok) {
     const body = await readJsonError(response);
-    throw classifyProviderError({ status: response.status, headers: response.headers, body });
+    throw classifyProviderError({ status: response.status, headers: response.headers, body, url });
   }
 
   const body = await response.json() as unknown;
@@ -149,6 +167,25 @@ export class ModelCatalog {
   }
 }
 
+/**
+ * The models an endpoint listed, plus the ones a provider declares that it did not.
+ *
+ * `discoverModels` folds `manual` in only when the endpoint has no `/models` route at all
+ * (a 404), because that is the case where the declaration is the *whole* answer. A provider
+ * that both discovers and declares — an endpoint that lists a subset, or one a user extended
+ * with `/model add` — needs the union, and needs the declared ids to pick up the same
+ * pricing and context-window facts a discovered id would.
+ */
+export function mergeModelLists(
+  discovered: readonly ModelInfo[],
+  declared: readonly ModelInfo[],
+): ModelInfo[] {
+  const seen = new Set(discovered.map((model) => model.id));
+  return [...discovered, ...declared.filter((model) => !seen.has(model.id))]
+    .map(augmentModel)
+    .sort((left, right) => left.id.localeCompare(right.id));
+}
+
 function parseModels(body: unknown): ModelInfo[] {
   if (!isRecord(body) || !Array.isArray(body.data)) {
     throw classifyProviderError({
@@ -173,9 +210,23 @@ function parseModels(body: unknown): ModelInfo[] {
 }
 
 function augmentModel(model: ModelInfo): ModelInfo {
-  const exact = KNOWN_MODELS[model.id];
-  const family = exact ?? Object.entries(KNOWN_MODELS).find(([id]) => model.id.startsWith(id))?.[1];
+  const family = KNOWN_MODELS[model.id] ?? longestKnownPrefix(model.id);
   return family === undefined ? model : { ...family, ...model };
+}
+
+/**
+ * The most specific family wins: gpt-5.6-luna-x is a luna, not a plain gpt-5.6,
+ * and the two carry different pricing.
+ */
+function longestKnownPrefix(id: string): Partial<ModelInfo> | undefined {
+  let bestLength = 0;
+  let best: Partial<ModelInfo> | undefined;
+  for (const [prefix, info] of Object.entries(KNOWN_MODELS)) {
+    if (prefix.length <= bestLength || !id.startsWith(prefix)) continue;
+    bestLength = prefix.length;
+    best = info;
+  }
+  return best;
 }
 
 async function readCache(path: string): Promise<ModelCache | undefined> {

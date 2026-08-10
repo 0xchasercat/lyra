@@ -1,3 +1,4 @@
+import { joinSystemPrefix } from "./auth.ts";
 import { classifyProviderError, type ProviderFault } from "./errors.ts";
 import type {
   CanonicalMessage,
@@ -17,6 +18,14 @@ export interface ResponsesRequestOptions {
   input?: readonly ResponseItem[];
   generate?: boolean;
   contextManagement?: readonly Readonly<Record<string, unknown>>[];
+  /**
+   * A credential source's mandated line, prepended to `instructions`.
+   *
+   * The Responses API carries one instruction string rather than a list of system blocks, so
+   * "first block" is the first paragraph here — separated by a blank line, and still ahead of
+   * everything Lyra says.
+   */
+  systemPrefix?: string;
 }
 
 export function serializeResponseItems(messages: readonly CanonicalMessage[]): ResponseItem[] {
@@ -40,7 +49,7 @@ export function buildResponsesRequest(
 ): Record<string, unknown> {
   const body: Record<string, unknown> = {
     model: request.model,
-    instructions: request.system,
+    instructions: joinSystemPrefix(options.systemPrefix, request.system),
     input: options.input ?? serializeResponseItems(request.messages),
     tools: serializeResponseTools(request.tools),
     store: false,
@@ -70,6 +79,54 @@ export function responseItemsStartWith(
   }
   return true;
 }
+/**
+ * Whether a `function_call_output` in `items` has no `function_call` ahead of it.
+ *
+ * §3.6's second invariant — every tool result has a preceding tool call — is a property of
+ * the *payload*, not only of the derived window it was sliced from. An incremental slice can
+ * satisfy it in the window and break it on the wire, because the slice starts after the call
+ * and before its result.
+ */
+function orphansToolResult(items: readonly ResponseItem[]): boolean {
+  const calls = new Set<string>();
+  for (const item of items) {
+    if (item.type === "function_call") {
+      const callId = item.call_id;
+      if (typeof callId === "string") calls.add(callId);
+      continue;
+    }
+    if (item.type !== "function_call_output") continue;
+    const callId = item.call_id;
+    if (typeof callId !== "string" || !calls.has(callId)) return true;
+  }
+  return false;
+}
+
+export interface ResponsesChainOptions {
+  /**
+   * Whether the endpoint is trusted to still hold the chained window.
+   *
+   * A WebSocket turn chains against a connection-local cache the socket itself guarantees
+   * (§5.3): the state and the transport live and die together, so an incremental slice may
+   * reference a tool call the server holds and the payload does not.
+   *
+   * Over HTTP nothing guarantees it. Every request says `store: false` (§5.2), so a
+   * conforming endpoint retains nothing and answers `previous_response_id` with
+   * `previous_response_not_found` — recoverable, and already handled. A translating proxy
+   * instead *ignores* the id it cannot resolve and forwards the slice as the entire
+   * conversation. When that slice opens with a `function_call_output`, the upstream model
+   * sees a tool result with no call in front of it and rejects the turn outright:
+   *
+   *     messages.0.content.0: unexpected `tool_use_id` found in `tool_result` blocks
+   *
+   * which is an F5 — a lost turn from a payload that was well-formed one layer up. So unless
+   * the chain is stateful, a cut that would orphan a tool result is not taken; the full
+   * window is resent instead. Against a conforming `store: false` endpoint this costs
+   * nothing, because that chain was going to be refused and replayed anyway.
+   */
+  readonly stateful?: boolean;
+}
+
 export interface PreparedResponseInput {
   fullInput: ResponseItem[];
   input: ResponseItem[];
@@ -84,6 +141,11 @@ export class ResponsesChainState {
   private compacted:
     | { model: string; source: ResponseItem[]; output: readonly ResponseItem[] }
     | undefined;
+  private readonly stateful: boolean;
+
+  constructor(options: ResponsesChainOptions = {}) {
+    this.stateful = options.stateful ?? false;
+  }
 
   prepare(request: ProviderRequest): PreparedResponseInput {
     const fullInput = serializeResponseItems(request.messages);
@@ -92,12 +154,15 @@ export class ResponsesChainState {
       this.model === request.model &&
       responseItemsStartWith(fullInput, this.canonicalWindow)
     ) {
-      return {
-        fullInput,
-        input: fullInput.slice(this.canonicalWindow.length),
-        previousResponseId: this.responseId,
-        incremental: true,
-      };
+      const input = fullInput.slice(this.canonicalWindow.length);
+      if (this.stateful || !orphansToolResult(input)) {
+        return {
+          fullInput,
+          input,
+          previousResponseId: this.responseId,
+          incremental: true,
+        };
+      }
     }
 
     const compacted = this.compacted;
@@ -175,6 +240,28 @@ export function responseError(event: unknown): ProviderFault {
   });
 }
 
+export interface ResponsesDecoderOptions {
+  /**
+   * The `input` items this request sent.
+   *
+   * A conforming Responses endpoint puts *only* the model's new items in `response.output`.
+   * A proxy that translates the protocol commonly echoes the request's own input back inside
+   * it, and because Lyra resends the whole conversation whenever the response chain is not
+   * stored, that echo grows by one turn every turn — which is exactly how a reply came to be
+   * rendered twice, then three times, then four. Knowing what was sent is what lets the
+   * decoder tell a model's output from its own input coming back.
+   */
+  input?: readonly ResponseItem[];
+}
+
+/**
+ * How much streamed text must already exist before a delta that repeats all of it is read as
+ * a cumulative re-send rather than as literal repetition. Short chunks genuinely repeat —
+ * `"the "` followed by `"the "` is ordinary prose — so the rule only engages once the run is
+ * long enough that a chunk restating it from the beginning cannot plausibly be the text.
+ */
+const CUMULATIVE_DELTA_FLOOR = 4;
+
 export class ResponsesStreamDecoder {
   responseId: string | undefined;
   output: ResponseItem[] = [];
@@ -186,8 +273,20 @@ export class ResponsesStreamDecoder {
   private readonly callsEnded = new Set<string>();
   private readonly reasoningEmitted = new Set<string>();
   private readonly textEmitted = new Set<string>();
+  /** Text already streamed, per `item_id:content_index` slot — the ledger content dedup reads. */
+  private readonly streamedText = new Map<string, string>();
+  /** Text already rendered from a completed item, for slots that never streamed. */
+  private readonly completedText = new Set<string>();
+  private readonly inputFingerprints: ReadonlySet<string>;
+  private readonly inputCount: number;
   private refusal = false;
   private sawToolCall = false;
+
+  constructor(options: ResponsesDecoderOptions = {}) {
+    const input = options.input ?? [];
+    this.inputFingerprints = new Set(input.map(itemFingerprint));
+    this.inputCount = input.length;
+  }
 
   consume(value: unknown): ProviderEvent[] {
     if (!isRecord(value)) throw malformedResponse("The provider returned a non-object stream event", value);
@@ -202,29 +301,21 @@ export class ResponsesStreamDecoder {
       }
       case "response.output_text.delta": {
         const delta = requiredString(value.delta, "output text delta", value);
-        this.textEmitted.add(contentKey(value));
-        return delta.length === 0 ? [] : [{ type: "text_delta", text: delta }];
+        return this.streamText(contentKey(value), delta);
       }
       case "response.output_text.done": {
-        const key = contentKey(value);
-        if (this.textEmitted.has(key)) return [];
         const text = requiredString(value.text, "completed output text", value);
-        this.textEmitted.add(key);
-        return text.length === 0 ? [] : [{ type: "text_delta", text }];
+        return this.finishText(contentKey(value), text);
       }
       case "response.refusal.delta": {
         this.refusal = true;
         const delta = requiredString(value.delta, "refusal delta", value);
-        this.textEmitted.add(contentKey(value));
-        return delta.length === 0 ? [] : [{ type: "text_delta", text: delta }];
+        return this.streamText(contentKey(value), delta);
       }
       case "response.refusal.done": {
         this.refusal = true;
-        const key = contentKey(value);
-        if (this.textEmitted.has(key)) return [];
         const refusal = requiredString(value.refusal, "completed refusal", value);
-        this.textEmitted.add(key);
-        return refusal.length === 0 ? [] : [{ type: "text_delta", text: refusal }];
+        return this.finishText(contentKey(value), refusal);
       }
       case "response.reasoning_summary_text.delta":
       case "response.reasoning_text.delta": {
@@ -285,8 +376,63 @@ export class ResponsesStreamDecoder {
     return events;
   }
 
+  /**
+   * Streamed text for one content slot.
+   *
+   * The slot's running text is kept so the completed item can be recognised as the same text
+   * arriving a second time, and so a proxy that re-sends everything it has sent so far in
+   * each delta contributes only what is new. Deltas are never dropped outright: streaming is
+   * the ground truth, and silence renders worse than a duplicate.
+   */
+  private streamText(key: string, delta: string): ProviderEvent[] {
+    this.textEmitted.add(key);
+    const streamed = this.streamedText.get(key) ?? "";
+    const addition = isCumulativeResend(streamed, delta) ? delta.slice(streamed.length) : delta;
+    if (addition.length === 0) return [];
+    this.streamedText.set(key, streamed + addition);
+    return [{ type: "text_delta", text: addition }];
+  }
+
+  /**
+   * Text from a completed item — a `*.done` event or a terminal `response.output` message.
+   *
+   * The slot key catches a conforming provider restating what it streamed. The content check
+   * catches the same restatement under a *fresh* id, which is what a translating proxy emits
+   * and what id-keyed dedup alone could never see.
+   */
+  private finishText(key: string, text: string): ProviderEvent[] {
+    this.textEmitted.add(key);
+    if (text.length === 0) return [];
+    if (this.alreadyRendered(key, text)) return [];
+    this.completedText.add(text);
+    return [{ type: "text_delta", text }];
+  }
+
+  private alreadyRendered(key: string, text: string): boolean {
+    if (this.completedText.has(text)) return true;
+    if (this.streamedText.get(key) === text) return true;
+    for (const streamed of this.streamedText.values()) {
+      if (streamed === text) return true;
+    }
+    return false;
+  }
+
+  /**
+   * Whether an output item is the request's own input coming back.
+   *
+   * Only items that are byte-equivalent to something this request sent, and only within the
+   * leading stretch where a proxy replays them, count: a model that genuinely repeats an
+   * earlier answer word for word emits it *after* the echo, and must still be rendered.
+   */
+  private isEchoedInput(item: ResponseItem, index: number): boolean {
+    if (index >= this.inputCount) return false;
+    return this.inputFingerprints.has(itemFingerprint(item));
+  }
+
   private itemDone(event: Record<string, unknown>): ProviderEvent[] {
     const item = requiredRecord(event.item, "completed output item", event);
+    const index = numberValue(event.output_index);
+    if (index !== undefined && this.isEchoedInput(item, index)) return [];
     this.recordOutput(event, item);
     if (item.type === "reasoning") return this.emitReasoning(item, event);
     if (item.type !== "function_call") return [];
@@ -309,14 +455,21 @@ export class ResponsesStreamDecoder {
     const events: ProviderEvent[] = [];
     const output = arrayOfRecords(response.output);
     if (output !== undefined) {
-      this.output = output;
+      const produced: ResponseItem[] = [];
+      let echoing = true;
       for (let index = 0; index < output.length; index += 1) {
         const item = output[index]!;
+        // The echoed prefix is not this response's output: rendering it would replay earlier
+        // turns, and keeping it would poison the chain window the next request is built from.
+        if (echoing && this.isEchoedInput(item, index)) continue;
+        echoing = false;
+        produced.push(item);
         const synthetic = { output_index: index, item };
         if (item.type === "reasoning") events.push(...this.emitReasoning(item, synthetic));
         else if (item.type === "function_call") events.push(...this.finishTerminalCall(item, synthetic));
-        else if (item.type === "message") events.push(...this.emitTerminalMessage(item));
+        else if (item.type === "message") events.push(...this.emitTerminalMessage(item, index));
       }
+      this.output = produced;
     }
 
     const usage = decodeUsage(response.usage);
@@ -366,10 +519,10 @@ export class ResponsesStreamDecoder {
     events.push({ type: "tool_call_delta", id: callId, argumentsDelta: delta });
   }
 
-  private emitTerminalMessage(item: Record<string, unknown>): ProviderEvent[] {
+  private emitTerminalMessage(item: Record<string, unknown>, outputIndex: number): ProviderEvent[] {
     const content = arrayOfRecords(item.content);
     if (content === undefined) return [];
-    const itemId = stringValue(item.id) ?? "terminal";
+    const itemId = stringValue(item.id) ?? `output:${outputIndex}`;
     const events: ProviderEvent[] = [];
     for (let index = 0; index < content.length; index += 1) {
       const part = content[index]!;
@@ -377,17 +530,11 @@ export class ResponsesStreamDecoder {
       if (this.textEmitted.has(key)) continue;
       if (part.type === "output_text") {
         const text = stringValue(part.text);
-        if (text !== undefined) {
-          this.textEmitted.add(key);
-          events.push({ type: "text_delta", text });
-        }
+        if (text !== undefined) events.push(...this.finishText(key, text));
       } else if (part.type === "refusal") {
         this.refusal = true;
         const refusal = stringValue(part.refusal);
-        if (refusal !== undefined) {
-          this.textEmitted.add(key);
-          events.push({ type: "text_delta", text: refusal });
-        }
+        if (refusal !== undefined) events.push(...this.finishText(key, refusal));
       }
     }
     return events;
@@ -605,6 +752,19 @@ function decodeUsage(value: unknown): ProviderUsage | undefined {
     ...(cacheReadTokens === undefined ? {} : { cacheReadTokens }),
     ...(cacheWriteTokens === undefined ? {} : { cacheWriteTokens }),
   };
+}
+
+/**
+ * Whether a delta restates the slot's whole run so far and then continues it.
+ *
+ * Strictly longer, so a delta that merely equals the run — ordinary repetition like `"ha"`
+ * after `"ha"` — is still rendered; the completed-item ledger is what catches a genuine
+ * re-send of identical text.
+ */
+function isCumulativeResend(streamed: string, delta: string): boolean {
+  return streamed.length >= CUMULATIVE_DELTA_FLOOR
+    && delta.length > streamed.length
+    && delta.startsWith(streamed);
 }
 
 function contentKey(event: Record<string, unknown>): string {

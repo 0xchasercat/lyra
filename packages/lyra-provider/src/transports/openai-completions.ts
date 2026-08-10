@@ -1,7 +1,9 @@
-import { endpoint, providerHeaders } from "../auth.ts";
+import { providerHeaders, providerSystemPrefix } from "../auth.ts";
 import type { HttpTransportConfig } from "../auth.ts";
+import { fetchProviderRoute } from "../endpoints.ts";
 import { classifyProviderError, ProviderFault } from "../errors.ts";
-import { fetchWithHeadersDeadline, parseSse, readJsonError } from "../sse.ts";
+import { usesMaxCompletionTokens } from "../models.ts";
+import { parseSse, readJsonError } from "../sse.ts";
 import type {
   ContentBlock,
   ProviderEvent,
@@ -43,7 +45,7 @@ export class OpenAICompletionsTransport implements ProviderTransport {
     context: TransportContext,
   ): AsyncGenerator<ProviderEvent> {
     const headers = await providerHeaders(this.config, context.signal);
-    const body = serializeRequest(request);
+    const body = serializeRequest(request, await providerSystemPrefix(this.config, context.signal));
     let serializedBody: string;
     try {
       serializedBody = JSON.stringify(body);
@@ -55,8 +57,9 @@ export class OpenAICompletionsTransport implements ProviderTransport {
       );
     }
 
-    const response = await fetchWithHeadersDeadline(
-      endpoint(this.config.baseUrl, "/chat/completions"),
+    const { response, url } = await fetchProviderRoute(
+      this.config,
+      "chat/completions",
       {
         method: "POST",
         headers,
@@ -72,6 +75,7 @@ export class OpenAICompletionsTransport implements ProviderTransport {
         status: response.status,
         body: errorBody,
         headers: response.headers,
+        url,
       });
     }
     if (response.body === null) {
@@ -84,8 +88,13 @@ export class OpenAICompletionsTransport implements ProviderTransport {
   }
 }
 
-function serializeRequest(request: ProviderRequest): Readonly<Record<string, unknown>> {
+function serializeRequest(request: ProviderRequest, systemPrefix?: string): Readonly<Record<string, unknown>> {
   const messages: Record<string, unknown>[] = [];
+  // Its own system message, ahead of Lyra's: the same separation the Anthropic transport gets
+  // from a separate system block, in the shape this wire format has for it.
+  if (systemPrefix !== undefined && systemPrefix.length > 0) {
+    messages.push({ role: "system", content: systemPrefix });
+  }
   if (request.system.length > 0) {
     messages.push({ role: "system", content: request.system });
   }
@@ -114,7 +123,11 @@ function serializeRequest(request: ProviderRequest): Readonly<Record<string, unk
             },
           })),
         }),
-    ...(request.maxOutputTokens === undefined ? {} : { max_tokens: request.maxOutputTokens }),
+    ...(request.maxOutputTokens === undefined
+      ? {}
+      : usesMaxCompletionTokens(request.model)
+        ? { max_completion_tokens: request.maxOutputTokens }
+        : { max_tokens: request.maxOutputTokens }),
     ...(request.temperature === undefined ? {} : { temperature: request.temperature }),
     ...(request.metadata === undefined ? {} : { metadata: request.metadata }),
   };

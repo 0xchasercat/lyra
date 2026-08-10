@@ -15,6 +15,16 @@ describe("classifyProviderError adversarial inputs", () => {
     ["upstream unavailable", nested("upstream_unavailable", "proxy could not reach upstream", 400), "transient"],
     ["context code", nested("context_length_exceeded", "too many tokens"), "context_overflow"],
     ["context spelling", { message: "maximum context length is too long" }, "context_overflow"],
+    [
+      "openai context overflow",
+      nested(
+        "invalid_request_error",
+        "This model's maximum context length is 8192 tokens. However, your messages resulted in 10000 tokens.",
+      ),
+      "context_overflow",
+    ],
+    ["gateway token limit", { status: 400, message: "Token limit exceeded for this request" }, "context_overflow"],
+    ["hard quota 429", { status: 429, message: "You exceeded your current quota, please check your plan and billing details." }, "quota"],
     ["content shape", nested("orphaned-tool-use", "orphaned call"), "content_shape"],
     ["expired token", nested("expired_token", "token expired"), "auth"],
     ["auth status", { status: 403, message: "forbidden" }, "auth"],
@@ -32,6 +42,33 @@ describe("classifyProviderError adversarial inputs", () => {
       expect(classifyProviderError(input).classification).toBe(expected);
     });
   }
+
+  test("routes Anthropic's real overflow wire body to compaction, not bad_request", () => {
+    const fault = classifyProviderError({
+      status: 400,
+      body: {
+        type: "error",
+        error: {
+          type: "invalid_request_error",
+          message: "prompt is too long: 213000 tokens > 200000 maximum",
+        },
+      },
+    });
+    expect(fault.classification).toBe("context_overflow");
+    expect(fault.providerMessage).toBe("prompt is too long: 213000 tokens > 200000 maximum");
+    expect(fault.code).toBe("invalid_request_error");
+  });
+
+  test("a hard-quota 429 is permanent while a plain 429 stays retryable", () => {
+    expect(classifyProviderError({
+      status: 429,
+      message: "Your credit balance is too low to access the Anthropic API",
+    }).classification).toBe("quota");
+    expect(classifyProviderError({
+      status: 429,
+      message: "Rate limit reached for gpt-5.6 in organization org-x on requests per min",
+    }).classification).toBe("transient");
+  });
 
   test("known provider code wins over a generic status", () => {
     expect(classifyProviderError(nested("insufficient_quota", "hard ceiling", 429)).classification)
@@ -72,8 +109,25 @@ describe("classifyProviderError adversarial inputs", () => {
     for (const body of [null, [], "plain string", { error: [] }, { error: { code: 7, message: {} } }]) {
       const fault = classifyProviderError({ status: 400, body });
       expect(fault.classification).toBe("bad_request");
-      expect(fault.providerMessage).toBe("Unknown provider error");
+      // A body that describes nothing leaves the status as the only fact there is, and the
+      // status is what the sentence is built from. It must never degrade into a phrase that
+      // names neither what happened nor where: that wording used to reach the TUI verbatim
+      // as the entire explanation of a failed turn.
+      expect(fault.providerMessage).toBe("The provider answered HTTP 400 with an empty error body");
     }
+  });
+
+  test("describes an empty error response and a non-error rejection by what is actually known", () => {
+    // The exact shape a fresh provider fails with: 401, zero-length body.
+    expect(classifyProviderError({ status: 401, body: undefined })).toMatchObject({
+      classification: "auth",
+      providerMessage: "The provider answered HTTP 401 with an empty error body",
+    });
+    // A socket layer that rejects with an event rather than an Error still has to say so.
+    expect(classifyProviderError({ cause: { kind: "close" } }).providerMessage).toContain("non-error value");
+    expect(classifyProviderError({}).providerMessage).toBe("The provider request failed without reporting a reason");
+    // An Error whose message is empty carries no more information than no Error at all.
+    expect(classifyProviderError({ cause: new Error("") }).providerMessage).toBe("The provider request failed without reporting a reason");
   });
 
   test("uses Error messages without discarding the original cause", () => {

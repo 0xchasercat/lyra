@@ -8,7 +8,7 @@ import {
   resolveModelRole,
   resolveProvider,
 } from "../src/config.ts";
-import { discoverModels } from "../src/models.ts";
+import { discoverModels, usesMaxCompletionTokens } from "../src/models.ts";
 import { PluginAuth } from "../src/plugin-auth.ts";
 import { StaticAuth } from "../src/auth.ts";
 import { KeychainAuth, storeKeychainCredential } from "../src/credentials.ts";
@@ -136,6 +136,35 @@ describe("model discovery", () => {
       inputPricePerMillion: 5,
       outputPricePerMillion: 30,
     });
+  });
+
+  test("augments an unlisted variant from its most specific known family", async () => {
+    const server = Bun.serve({
+      port: 0,
+      fetch: () => Response.json({ data: [{ id: "gpt-5.6-luna-x", owned_by: "openai" }] }),
+    });
+    servers.push(server);
+
+    const models = await discoverModels(
+      { id: "longest-prefix", baseUrl: `http://127.0.0.1:${server.port}/v1` },
+      { cacheDirectory: await temporaryDirectory() },
+    );
+
+    // gpt-5.6 also prefixes this id, but luna pricing is 25x cheaper.
+    expect(models[0]).toMatchObject({
+      id: "gpt-5.6-luna-x",
+      inputPricePerMillion: 0.2,
+      outputPricePerMillion: 1.2,
+    });
+  });
+
+  test("routes reasoning-class ids to max_completion_tokens", () => {
+    for (const id of ["gpt-5.6-luna", "gpt-5", "o1-mini", "o3", "openai/gpt-5.4"]) {
+      expect(usesMaxCompletionTokens(id)).toBe(true);
+    }
+    for (const id of ["gpt-4.1", "claude-opus-5", "local-llama", "o1x-custom"]) {
+      expect(usesMaxCompletionTokens(id)).toBe(false);
+    }
   });
 
   test("a missing models endpoint uses manual declarations", async () => {

@@ -36,6 +36,34 @@ export async function storeKeychainCredential(credential: KeychainCredential, to
   if (result.exitCode !== 0) throw authenticationFault(`Could not store ${credential.service}/${credential.account} in the OS keychain: ${result.stderr.trim() || "credential store failed"}`);
 }
 
+/**
+ * Delete a stored credential, and say whether there was one to delete.
+ *
+ * Removing a provider offers to take its credential with it, and "offered, then silently did
+ * nothing" is the one outcome that must not be possible: a user who asked for the key to go
+ * has to be told whether it went. An entry that was already absent is `false` rather than an
+ * error — the end state the caller asked for is the end state they got — while a keychain
+ * that refused, or a platform with no keychain at all, throws, because that *is* a failure to
+ * do what was asked.
+ */
+export async function deleteKeychainCredential(
+  credential: KeychainCredential,
+  options: { platform?: NodeJS.Platform; run?: CredentialRunner; signal?: AbortSignal } = {},
+): Promise<boolean> {
+  validateCredential(credential);
+  const platform = options.platform ?? process.platform;
+  const command = deleteCommand(platform, credential.service, credential.account);
+  const result = await (options.run ?? runCredentialCommand)(command.command, command.args, undefined, options.signal);
+  if (result.exitCode === 0) return true;
+  // macOS: 44 = "The specified item could not be found in the keychain."
+  // secret-tool: exit 1 with nothing on stderr when the attributes match nothing.
+  const missing = /could not be found|no such|not found/i.test(`${result.stderr} ${result.stdout}`)
+    || (platform === "darwin" && result.exitCode === 44)
+    || (platform === "linux" && result.exitCode === 1 && result.stderr.trim().length === 0);
+  if (missing) return false;
+  throw authenticationFault(`Could not remove ${credential.service}/${credential.account} from the OS keychain: ${result.stderr.trim() || "credential delete failed"}`);
+}
+
 export function supportsOsKeychain(platform: NodeJS.Platform = process.platform): boolean { return platform === "darwin" || (platform === "linux" && Bun.which("secret-tool") !== null); }
 
 function lookupCommand(platform: NodeJS.Platform, service: string, account: string): { command: string; args: string[] } {
@@ -47,6 +75,11 @@ function storeCommand(platform: NodeJS.Platform, service: string, account: strin
   if (platform === "darwin") return { command: "/usr/bin/security", args: ["add-generic-password", "-U", "-s", service, "-a", account, "-w", token] };
   if (platform === "linux") { const command = Bun.which("secret-tool"); if (command) return { command, args: ["store", "--label", `Lyra ${account}`, "service", service, "account", account], input: token }; }
   throw authenticationFault(`OS keychain integration is unavailable on ${platform}; use environment or static auth.`);
+}
+function deleteCommand(platform: NodeJS.Platform, service: string, account: string): { command: string; args: string[] } {
+  if (platform === "darwin") return { command: "/usr/bin/security", args: ["delete-generic-password", "-s", service, "-a", account] };
+  if (platform === "linux") { const command = Bun.which("secret-tool"); if (command) return { command, args: ["clear", "service", service, "account", account] }; }
+  throw authenticationFault(`OS keychain integration is unavailable on ${platform}; there is no stored credential to remove.`);
 }
 function validateCredential(value: KeychainCredential): void { if (!value || typeof value.service !== "string" || value.service.length === 0 || typeof value.account !== "string" || value.account.length === 0) throw new TypeError("Keychain service and account are required."); }
 async function runCredentialCommand(command: string, args: readonly string[], input?: string, signal?: AbortSignal): Promise<CredentialCommandResult> {

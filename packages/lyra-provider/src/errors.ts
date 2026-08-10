@@ -15,6 +15,16 @@ export interface ProviderErrorInput {
   body?: unknown;
   headers?: Headers | Readonly<Record<string, string>>;
   cause?: unknown;
+  /**
+   * The full URL the failing request was sent to.
+   *
+   * A 404 is a statement about a *path*, and the path is exactly what the response body of a
+   * 404 never contains — the reported failure was "HTTP 404 with an empty error body", from
+   * which no user could tell that the request had gone to `…/v1/v1/messages`. Carried here so
+   * the sentence a user reads can name it. Never a credential: query strings are not part of
+   * any Lyra endpoint, and the URL is built from `base_url` and a fixed route.
+   */
+  url?: string;
 }
 
 export class ProviderFault extends Error {
@@ -24,6 +34,8 @@ export class ProviderFault extends Error {
   readonly code: string | undefined;
   readonly retryAfterMs: number | undefined;
   readonly raw: unknown;
+  /** The full URL the request went to, when the failure came from one. */
+  readonly url: string | undefined;
 
   constructor(options: {
     classification: ProviderErrorClass;
@@ -33,6 +45,7 @@ export class ProviderFault extends Error {
     retryAfterMs?: number;
     raw?: unknown;
     cause?: unknown;
+    url?: string;
   }) {
     super(options.providerMessage, { cause: options.cause });
     this.name = "ProviderFault";
@@ -42,6 +55,7 @@ export class ProviderFault extends Error {
     this.code = options.code;
     this.retryAfterMs = options.retryAfterMs;
     this.raw = options.raw;
+    this.url = options.url;
   }
 }
 
@@ -82,6 +96,12 @@ const CONTENT_CODES = new Set([
 ]);
 const REFUSAL_CODES = new Set(["content_policy_violation", "refusal"]);
 const TRANSIENT_CODES = new Set([
+  // A dropped response chain is a fact about the server's store, not about the request: the
+  // transports rebuild the chain from scratch and the next attempt carries the whole
+  // conversation. It only reaches this classifier when a transport could not swallow it —
+  // mid-stream, after output — and there the right answer is a retry that resets what was
+  // rendered, not a failed turn.
+  "previous_response_not_found",
   "rate_limit_exceeded",
   "overloaded_error",
   "server_error",
@@ -92,6 +112,22 @@ const TRANSIENT_CODES = new Set([
   "timeout",
 ]);
 
+/**
+ * Overflow usually arrives as an ordinary 400 whose only signal is prose.
+ * Anthropic sends `invalid_request_error` with "prompt is too long: 213000 tokens
+ * > 200000 maximum"; OpenAI sends "This model's maximum context length is 8192
+ * tokens"; gateways phrase it as an exceeded token limit.
+ */
+const CONTEXT_MESSAGE_PATTERNS: readonly RegExp[] = [
+  /\b(?:prompt|input|request|messages?|conversation)\s+(?:is\s+|was\s+|are\s+|were\s+)?too\s+long\b/,
+  /\bcontext\s+(?:window|length|limit|size)\b/,
+  /\bcontext\b[^.]*\b(?:too\s+long|exceed)/,
+  /\bexceeds?\s+(?:the\s+)?(?:model'?s?\s+)?(?:maximum|max)\b[^.]*\btokens?\b/,
+  /\btokens?\s+limit\s+exceeded\b/,
+  /\btoo\s+many\s+(?:input\s+|prompt\s+)?tokens\b/,
+];
+const QUOTA_MESSAGE_PATTERN = /\b(?:quota|credits?|billing)\b/;
+
 export function classifyProviderError(input: ProviderErrorInput): ProviderFault {
   if (input.cause instanceof ProviderFault) return input.cause;
 
@@ -99,7 +135,7 @@ export function classifyProviderError(input: ProviderErrorInput): ProviderFault 
   const status = input.status;
   const code = normalizeCode(input.code ?? extracted.code);
   const providerMessage =
-    input.message ?? extracted.message ?? messageFromCause(input.cause) ?? "Unknown provider error";
+    input.message ?? extracted.message ?? messageFromCause(input.cause) ?? undescribedFailure(status, input.cause, input.url);
   const retryAfterMs = parseRetryAfter(input.headers);
   const classification = classify(status, code, providerMessage.toLowerCase(), input.cause);
 
@@ -111,6 +147,7 @@ export function classifyProviderError(input: ProviderErrorInput): ProviderFault 
     ...(retryAfterMs === undefined ? {} : { retryAfterMs }),
     ...(input.body === undefined ? {} : { raw: input.body }),
     ...(input.cause === undefined ? {} : { cause: input.cause }),
+    ...(input.url === undefined ? {} : { url: input.url }),
   });
 }
 
@@ -131,15 +168,13 @@ function classify(
   }
 
   if (status === 401 || status === 403) return "auth";
+  // A hard-quota 429 is permanent; retrying it only burns the retry budget.
+  if (status === 429 && isQuotaMessage(message)) return "quota";
   if (status === 408 || status === 429 || status === 502 || status === 503 || status === 529) return "transient";
   if (status !== undefined && status >= 500) return "transient";
 
-  if (message.includes("context") && (message.includes("long") || message.includes("length"))) {
-    return "context_overflow";
-  }
-  if (message.includes("quota") || message.includes("credit") || message.includes("billing")) {
-    return "quota";
-  }
+  if (isContextOverflowMessage(message)) return "context_overflow";
+  if (isQuotaMessage(message)) return "quota";
   if (message.includes("refus") || message.includes("content policy")) return "refusal";
   if (message.includes("model") && (message.includes("not found") || message.includes("deprecated"))) {
     return "model_unavailable";
@@ -147,6 +182,14 @@ function classify(
   if (isTransientCause(cause)) return "transient";
 
   return "bad_request";
+}
+
+function isContextOverflowMessage(message: string): boolean {
+  return CONTEXT_MESSAGE_PATTERNS.some((pattern) => pattern.test(message));
+}
+
+function isQuotaMessage(message: string): boolean {
+  return QUOTA_MESSAGE_PATTERN.test(message);
 }
 
 function extractError(body: unknown): { code?: string; message?: string } {
@@ -165,7 +208,33 @@ function normalizeCode(code: string | undefined): string | undefined {
 }
 
 function messageFromCause(cause: unknown): string | undefined {
-  return cause instanceof Error ? cause.message : undefined;
+  const message = cause instanceof Error ? cause.message : undefined;
+  return message === undefined || message.length === 0 ? undefined : message;
+}
+
+/**
+ * What a failure is called when the provider described it with nothing at all — an error
+ * response with an empty body, or a rejection that is not an `Error`.
+ *
+ * The status is the only fact such a failure carries, so it is the fact the sentence is
+ * built from. The generic wording it replaced ("Unknown provider error") named neither what
+ * happened nor where, and it reached users unchanged: an endpoint that answers 401 with a
+ * zero-length body is the single most common way a freshly configured provider fails, and
+ * that phrasing is what the whole turn was reported as.
+ *
+ * The URL joins it whenever there is one, because "HTTP 404 with an empty error body" is a
+ * sentence about a path that does not name the path.
+ */
+function undescribedFailure(status: number | undefined, cause: unknown, url: string | undefined): string {
+  const at = url === undefined ? "" : ` for ${url}`;
+  if (status !== undefined) return `The provider answered HTTP ${status} with an empty error body${at}`;
+  if (cause !== undefined && !(cause instanceof Error)) return `The provider request failed with a non-error value: ${describeValue(cause)}`;
+  return "The provider request failed without reporting a reason";
+}
+
+function describeValue(value: unknown): string {
+  if (typeof value === "object" && value !== null) return value.constructor?.name ?? "object";
+  return typeof value === "string" ? value : String(value);
 }
 
 function isTransientCause(cause: unknown): boolean {

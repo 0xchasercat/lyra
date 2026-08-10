@@ -3,7 +3,7 @@ import type { AuthSource, HttpTransportConfig } from "./auth.ts";
 import { EnvironmentAuth, NoAuth, StaticAuth } from "./auth.ts";
 import { KeychainAuth } from "./credentials.ts";
 import type { ProviderApiType } from "./types.ts";
-import { PluginAuth } from "./plugin-auth.ts";
+import { isValidAuthPluginId, PluginAuth } from "./plugin-auth.ts";
 
 export type WebSocketPreference = "auto" | "on" | "off";
 
@@ -53,7 +53,9 @@ export function defaultProviderConfig(): ProviderFileConfig {
 
   if (Bun.env.ANTHROPIC_API_KEY !== undefined) {
     providers.anthropic = {
-      base_url: "https://api.anthropic.com",
+      // Canonical form: `base_url` is the exact prefix routes hang off, version segment
+      // included, for every api_type alike (see endpoints.ts).
+      base_url: "https://api.anthropic.com/v1",
       api_type: "anthropic_messages",
       auth: { type: "env", var: "ANTHROPIC_API_KEY" },
     };
@@ -76,12 +78,18 @@ export function defaultProviderConfig(): ProviderFileConfig {
   return { providers, roles };
 }
 
+export interface ResolveProviderOptions {
+  /** Where auth plugins live. Defaults to `~/.lyra/plugins`; tests point it at a fixture home. */
+  pluginRoot?: string;
+}
+
 export function resolveProvider(
   name: string,
   definition: ProviderDefinition,
+  options: ResolveProviderOptions = {},
 ): ResolvedProvider {
   validateDefinition(name, definition);
-  const auth = authSource(definition.auth);
+  const auth = authSource(definition.auth, options);
   return {
     id: name,
     baseUrl: definition.base_url,
@@ -89,7 +97,13 @@ export function resolveProvider(
     websocket: definition.websocket ?? "auto",
     models: definition.models ?? [],
     ...(definition.api_type === "anthropic_messages"
-      ? { authHeader: "x-api-key" as const, headers: { "anthropic-version": "2023-06-01" } }
+      ? {
+        // An API key goes in `x-api-key`; a plugin returns a *bearer* token by contract, and
+        // the subscription endpoints that need a plugin reject it in `x-api-key`. The header
+        // follows the credential's kind, not the wire format's default.
+        authHeader: definition.auth.type === "plugin" ? "bearer" as const : "x-api-key" as const,
+        headers: { "anthropic-version": "2023-06-01" },
+      }
       : {}),
     ...(auth === undefined ? {} : { auth }),
   };
@@ -163,17 +177,23 @@ function parseAuth(provider: string, value: unknown): AuthConfig {
   if (value.type === "static" && typeof value.token === "string" && value.token.length > 0) return { type: "static", token: value.token };
   if (value.type === "keychain" && typeof value.service === "string" && value.service.length > 0 && typeof value.account === "string" && value.account.length > 0) return { type: "keychain", service: value.service, account: value.account };
   if (value.type === "plugin" && typeof value.plugin === "string") {
-    if (!/^[a-z][a-z0-9-]{0,63}$/.test(value.plugin)) throw new Error(`Provider ${provider} auth plugin id is invalid`);
+    if (!isValidAuthPluginId(value.plugin)) {
+      throw new Error(
+        `Provider ${provider} auth plugin id ${JSON.stringify(value.plugin)} is invalid. An id is the plugin's directory name under ~/.lyra/plugins: lowercase letters, digits and dashes, starting with a letter. Run \`lyra plugins list\` to see what is installed.`,
+      );
+    }
     return { type: "plugin", plugin: value.plugin };
   }
   throw new Error(`Provider ${provider} has invalid auth configuration for type ${value.type}`);
 }
 
-function authSource(config: AuthConfig): AuthSource | undefined {
+function authSource(config: AuthConfig, options: ResolveProviderOptions): AuthSource | undefined {
   if (config.type === "env") return new EnvironmentAuth(config.var);
   if (config.type === "static") return new StaticAuth(config.token);
   if (config.type === "keychain") return new KeychainAuth(config);
-  if (config.type === "plugin") return new PluginAuth(config.plugin);
+  if (config.type === "plugin") {
+    return options.pluginRoot === undefined ? new PluginAuth(config.plugin) : new PluginAuth(config.plugin, options.pluginRoot);
+  }
   return new NoAuth();
 }
 

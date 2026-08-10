@@ -169,6 +169,107 @@ describe("recorded HTTP transport wire conformance", () => {
   }
 });
 
+describe("anthropic_messages tolerates unknown protocol elements", () => {
+  test("carries redacted_thinking, unknown events, and unknown deltas without failing", async () => {
+    const fixture = startHttpFixture([{ frames: anthropicRedactedFrames() }]);
+    const transport = new AnthropicMessagesTransport({
+      id: "wire-anthropic-redacted",
+      baseUrl: fixture.baseUrl,
+      auth: new NoAuth(),
+      cacheBreakpoints: { system: false },
+    });
+    try {
+      const outcome = await collectOutcome(transport.stream(baseRequest(), CONTEXT));
+
+      expect(outcome.error).toBeUndefined();
+      expectTerminal(outcome.events, "end_turn");
+      expect(outcome.events).toContainEqual({ type: "text_delta", text: "visible answer" });
+      // The encrypted block has no canonical representation, so it emits nothing.
+      expect(outcome.events.filter((event) => event.type === "thinking_delta")).toHaveLength(0);
+    } finally {
+      await transport.close?.();
+      await fixture.stop();
+    }
+  });
+
+  test("still rejects a known delta applied to the wrong block", async () => {
+    const fixture = startHttpFixture([{
+      frames: [
+        anthropicFrame({ type: "message_start", message: { id: "anthropic-mismatch", usage: { input_tokens: 3, output_tokens: 0 } } }),
+        anthropicFrame({ type: "content_block_start", index: 0, content_block: { type: "text", text: "" } }),
+        anthropicFrame({ type: "content_block_delta", index: 0, delta: { type: "input_json_delta", partial_json: "{}" } }),
+      ],
+    }]);
+    const transport = new AnthropicMessagesTransport({
+      id: "wire-anthropic-mismatch",
+      baseUrl: fixture.baseUrl,
+      auth: new NoAuth(),
+      cacheBreakpoints: { system: false },
+    });
+    try {
+      const outcome = await collectOutcome(transport.stream(baseRequest(), CONTEXT));
+
+      expect(outcome.error).toBeInstanceOf(ProviderFault);
+      expect(outcome.error).toEqual(expect.objectContaining({ classification: "content_shape" }));
+    } finally {
+      await transport.close?.();
+      await fixture.stop();
+    }
+  });
+});
+
+describe("openai_completions output token limit", () => {
+  test("sends max_completion_tokens for reasoning models and max_tokens otherwise", async () => {
+    const fixture = startHttpFixture([
+      { frames: completionsSuccessFrames("reasoning-limit") },
+      { frames: completionsSuccessFrames("legacy-limit") },
+    ]);
+    const transport = new OpenAICompletionsTransport({
+      id: "wire-completions-limits",
+      baseUrl: fixture.baseUrl,
+      auth: new NoAuth(),
+    });
+    try {
+      await collectOutcome(transport.stream(
+        baseRequest({ model: "gpt-5.6-luna", maxOutputTokens: 256 }),
+        CONTEXT,
+      ));
+      await collectOutcome(transport.stream(
+        baseRequest({ model: "local-llama", maxOutputTokens: 256 }),
+        CONTEXT,
+      ));
+
+      expect(fixture.requests[0]?.body).toMatchObject({ max_completion_tokens: 256 });
+      expect(fixture.requests[0]?.body).not.toHaveProperty("max_tokens");
+      expect(fixture.requests[1]?.body).toMatchObject({ max_tokens: 256 });
+      expect(fixture.requests[1]?.body).not.toHaveProperty("max_completion_tokens");
+    } finally {
+      await transport.close?.();
+      await fixture.stop();
+    }
+  });
+});
+
+function anthropicRedactedFrames(): readonly RecordedSseFrame[] {
+  return [
+    anthropicFrame({ type: "message_start", message: { id: "anthropic-redacted", usage: { input_tokens: 7, output_tokens: 0 } } }),
+    anthropicFrame({ type: "message_soft_limit_reached", limit: "thinking" }),
+    anthropicFrame({
+      type: "content_block_start",
+      index: 0,
+      content_block: { type: "redacted_thinking", data: "EmwKAhgBEgy3va3pzix/LafPsn4aDFIT2Xlxh0L5L8rLVyIw" },
+    }),
+    anthropicFrame({ type: "content_block_delta", index: 0, delta: { type: "redacted_thinking_delta", data: "more" } }),
+    anthropicFrame({ type: "content_block_stop", index: 0 }),
+    anthropicFrame({ type: "content_block_start", index: 1, content_block: { type: "text", text: "" } }),
+    anthropicFrame({ type: "content_block_delta", index: 1, delta: { type: "citations_delta", citation: { type: "char_location" } } }),
+    anthropicFrame({ type: "content_block_delta", index: 1, delta: { type: "text_delta", text: "visible answer" } }),
+    anthropicFrame({ type: "content_block_stop", index: 1 }),
+    anthropicFrame({ type: "message_delta", delta: { stop_reason: "end_turn" }, usage: { output_tokens: 5 } }),
+    anthropicFrame({ type: "message_stop" }),
+  ];
+}
+
 function toolResultRequest(includeReasoning: boolean): ProviderRequest {
   const assistantContent: CanonicalMessage["content"] = [
     { type: "thinking", thinking: "compare both", signature: "fixture-signature" },

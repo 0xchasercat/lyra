@@ -1,3 +1,5 @@
+import type { ProviderErrorClass } from "./errors.ts";
+
 export type ProviderApiType =
   | "openai_completions"
   | "openai_responses"
@@ -111,6 +113,20 @@ export interface TransportFallbackEvent {
   to: ProviderApiType;
   reason: string;
   resetsPartialOutput?: boolean;
+  /**
+   * Whether this fallback is the configuration working as asked rather than something the
+   * user needs to know.
+   *
+   * `websocket = "auto"` means *try the socket, use HTTP if it is not there*, and most
+   * OpenAI-compatible endpoints — every local proxy among them — do not offer one. Announcing
+   * that expected outcome put a line in front of the user at the start of every session, about
+   * a preference they never expressed. Only `websocket = "on"` is a request the transport can
+   * fail to honour, so only that failure is worth saying out loud.
+   *
+   * Consumers still act on the event: it is the announcement that is suppressed, never the
+   * partial-output reset that keeps a client's rendering honest.
+   */
+  expected?: boolean;
 }
 
 export type TransportEvent = ProviderEvent | TransportFallbackEvent;
@@ -130,8 +146,15 @@ export interface RetryEvent {
   type: "retry";
   attempt: number;
   maxAttempts: number;
+  /** Human-readable `${classification}: ${providerMessage}`; kept for existing consumers. */
   reason: string;
+  /** Raw classification, so a client renders its own copy instead of parsing `reason`. */
+  classification?: ProviderErrorClass;
+  /** Raw provider message, unjoined. */
+  providerMessage?: string;
   delayMs: number;
+  /** Absolute wall-clock instant the next attempt is scheduled for (`Date.now() + delayMs`). */
+  retryAtMs?: number;
   resetsPartialOutput: boolean;
 }
 

@@ -1,8 +1,10 @@
 import {
-  endpoint,
+  joinSystemPrefix,
   providerHeaders,
+  providerSystemPrefix,
   type HttpTransportConfig,
 } from "../auth.ts";
+import { fetchProviderRoute } from "../endpoints.ts";
 import { classifyProviderError, type ProviderFault } from "../errors.ts";
 import {
   buildResponsesRequest,
@@ -13,7 +15,6 @@ import {
   type ResponseItem,
 } from "../responses-codec.ts";
 import {
-  fetchWithHeadersDeadline,
   parseSse,
   readJsonError,
 } from "../sse.ts";
@@ -58,10 +59,12 @@ export class OpenAIResponsesTransport implements ProviderTransport {
     try {
       let prepared = this.chain.prepare(request);
       let recovered = false;
+      let emitted = false;
       while (true) {
-        const decoder = new ResponsesStreamDecoder();
+        const decoder = new ResponsesStreamDecoder({ input: prepared.input });
         try {
           for await (const event of this.streamAttempt(request, context, prepared, decoder, true)) {
+            emitted = true;
             yield event;
           }
           this.chain.commit(request, prepared, decoder.responseId, decoder.output);
@@ -69,7 +72,10 @@ export class OpenAIResponsesTransport implements ProviderTransport {
         } catch (cause) {
           const fault = asProviderFault(cause);
           this.chain.break();
-          if (!recovered && prepared.incremental && fault.code === "previous_response_not_found") {
+          // Recovery is silent, so it is only silent-able before anything has been rendered.
+          // A chain refused mid-stream is surfaced instead, and the retry that follows tells
+          // the client to discard the partial output rather than append a second copy to it.
+          if (!recovered && !emitted && prepared.incremental && fault.code === "previous_response_not_found") {
             recovered = true;
             prepared = this.chain.recovery(request);
             continue;
@@ -88,7 +94,7 @@ export class OpenAIResponsesTransport implements ProviderTransport {
       let prepared = this.chain.prepare(request);
       let recovered = false;
       while (true) {
-        const decoder = new ResponsesStreamDecoder();
+        const decoder = new ResponsesStreamDecoder({ input: prepared.input });
         try {
           for await (const _event of this.streamAttempt(request, context, prepared, decoder, false)) {
             // Warmup has no model output; terminal events are consumed only to establish the chain.
@@ -119,14 +125,15 @@ export class OpenAIResponsesTransport implements ProviderTransport {
     try {
       const prepared = this.chain.recovery(request);
       const headers = await providerHeaders(this.config, context.signal);
-      const response = await fetchWithHeadersDeadline(
-        endpoint(this.config.baseUrl, this.config.compactPath ?? "responses/compact"),
+      const { response, url } = await fetchProviderRoute(
+        this.config,
+        this.config.compactPath ?? "responses/compact",
         {
           method: "POST",
           headers,
           body: JSON.stringify({
             model: request.model,
-            instructions: request.system,
+            instructions: joinSystemPrefix(await providerSystemPrefix(this.config, context.signal), request.system),
             input: prepared.fullInput,
           }),
           signal: context.signal,
@@ -135,7 +142,7 @@ export class OpenAIResponsesTransport implements ProviderTransport {
       );
       if (!response.ok) {
         const body = await readJsonError(response);
-        throw classifyProviderError({ status: response.status, body, headers: response.headers });
+        throw classifyProviderError({ status: response.status, body, headers: response.headers, url });
       }
 
       const body = await readJsonError(response);
@@ -167,8 +174,10 @@ export class OpenAIResponsesTransport implements ProviderTransport {
     const headers = await providerHeaders(this.config, context.signal);
     headers.set("accept", "text/event-stream");
     const contextManagement = this.contextManagement();
-    const response = await fetchWithHeadersDeadline(
-      endpoint(this.config.baseUrl, this.config.responsesPath ?? "responses"),
+    const systemPrefix = await providerSystemPrefix(this.config, context.signal);
+    const { response, url } = await fetchProviderRoute(
+      this.config,
+      this.config.responsesPath ?? "responses",
       {
         method: "POST",
         headers,
@@ -178,6 +187,7 @@ export class OpenAIResponsesTransport implements ProviderTransport {
           input: prepared.input,
           previousResponseId: prepared.previousResponseId,
           ...(contextManagement === undefined ? {} : { contextManagement }),
+          ...(systemPrefix === undefined ? {} : { systemPrefix }),
         })),
         signal: context.signal,
       },
@@ -186,12 +196,13 @@ export class OpenAIResponsesTransport implements ProviderTransport {
 
     if (!response.ok) {
       const body = await readJsonError(response);
-      throw classifyProviderError({ status: response.status, body, headers: response.headers });
+      throw classifyProviderError({ status: response.status, body, headers: response.headers, url });
     }
     if (response.body === null) {
       throw classifyProviderError({
         code: "stream_truncated",
         message: "The Responses endpoint returned an empty stream",
+        url,
       });
     }
 

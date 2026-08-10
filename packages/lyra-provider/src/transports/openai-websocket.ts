@@ -1,8 +1,10 @@
 import {
-  endpoint,
   providerHeaders,
+  providerSystemPrefix,
   type HttpTransportConfig,
 } from "../auth.ts";
+import type { WebSocketPreference } from "../config.ts";
+import { resolvedProviderEndpoint } from "../endpoints.ts";
 import { classifyProviderError, ProviderFault } from "../errors.ts";
 import {
   buildResponsesRequest,
@@ -27,6 +29,11 @@ const DEFAULT_MAX_CONNECTION_AGE_MS = 55 * 60 * 1_000;
 const OPEN = 1;
 
 export interface OpenAIWebSocketTransportConfig extends OpenAIResponsesTransportConfig {
+  /**
+   * The configured preference this transport was built from. `"on"` is a demand — a fallback
+   * out of it is news. `"auto"` (the default) is a probe, and its fallback is routine.
+   */
+  websocket?: WebSocketPreference;
   websocketUrl?: string;
   websocketPath?: string;
   maxConnectionAgeMs?: number;
@@ -45,7 +52,10 @@ export class OpenAIWebSocketTransport implements ProviderTransport {
 
   private readonly config: OpenAIWebSocketTransportConfig;
   private readonly http: OpenAIResponsesTransport;
-  private readonly chain = new ResponsesChainState();
+  // The socket owns the chained window: the service's cache is connection-local (§5.3), so a
+  // slice that references a tool call only the server holds is safe here and nowhere else.
+  // `this.http` keeps its own, non-stateful chain for the fallback path.
+  private readonly chain = new ResponsesChainState({ stateful: true });
   private readonly now: () => number;
   private readonly maxConnectionAgeMs: number;
   private readonly maxConnectionFailures: number;
@@ -95,7 +105,7 @@ export class OpenAIWebSocketTransport implements ProviderTransport {
       let emittedAny = false;
 
       while (true) {
-        const decoder = new ResponsesStreamDecoder();
+        const decoder = new ResponsesStreamDecoder({ input: prepared.input });
         try {
           for await (const event of this.socketAttempt(request, context, prepared, decoder, true)) {
             emittedAny = true;
@@ -109,7 +119,9 @@ export class OpenAIWebSocketTransport implements ProviderTransport {
           this.chain.break();
 
           if (cause instanceof ProviderFault && cause.code === "previous_response_not_found") {
-            if (recoveredMissingChain) throw cause;
+            // Replaying silently on top of text a client has already rendered would show it
+            // twice; once anything has been emitted the fault is surfaced instead.
+            if (recoveredMissingChain || emittedAny) throw cause;
             recoveredMissingChain = true;
             prepared = this.chain.recovery(request);
             continue;
@@ -175,7 +187,7 @@ export class OpenAIWebSocketTransport implements ProviderTransport {
       let replayAttempts = 0;
       let recoveredMissingChain = false;
       while (true) {
-        const decoder = new ResponsesStreamDecoder();
+        const decoder = new ResponsesStreamDecoder({ input: prepared.input });
         try {
           for await (const _event of this.socketAttempt(request, context, prepared, decoder, false)) {
             // Warmup events only establish the response ID used by the next generated turn.
@@ -249,12 +261,14 @@ export class OpenAIWebSocketTransport implements ProviderTransport {
     const inbox = new SocketInbox();
     this.inbox = inbox;
     const contextManagement = this.contextManagement();
+    const systemPrefix = await providerSystemPrefix(this.config, context.signal);
     const payload = buildResponsesRequest(request, {
       stream: false,
       ...(!generate ? { generate: false } : {}),
       input: prepared.input,
       previousResponseId: prepared.previousResponseId,
       ...(contextManagement === undefined ? {} : { contextManagement }),
+      ...(systemPrefix === undefined ? {} : { systemPrefix }),
     });
     delete payload.stream;
     socket.send(JSON.stringify({ type: "response.create", ...payload }));
@@ -393,6 +407,13 @@ export class OpenAIWebSocketTransport implements ProviderTransport {
     this.disconnect();
   }
 
+  /**
+   * The one notice a session gets, if it gets one at all.
+   *
+   * Announced once per transport — the decision to fall back is remembered for the whole
+   * session, so a client never sees the same sentence twice, and no later turn re-probes a
+   * socket that is already known not to be there.
+   */
   private takeFallbackNotice(): TransportFallbackEvent | undefined {
     if (!this.fallback || this.fallbackAnnounced) return undefined;
     this.fallbackAnnounced = true;
@@ -402,6 +423,7 @@ export class OpenAIWebSocketTransport implements ProviderTransport {
       to: "openai_responses",
       reason: this.fallbackReason,
       resetsPartialOutput: true,
+      expected: this.config.websocket !== "on",
     };
   }
 
@@ -514,9 +536,14 @@ class UnexpectedWebSocketClose extends Error {
   }
 }
 
+/**
+ * Where the socket connects: the same route resolution the HTTP transports use, including
+ * any base-URL shape a 404 already taught this provider — a socket that reconnected to the
+ * unhealed shape would fail for a reason the fallback could never explain.
+ */
 function websocketEndpoint(config: OpenAIWebSocketTransportConfig): string {
   if (config.websocketUrl !== undefined) return config.websocketUrl;
-  const url = new URL(endpoint(config.baseUrl, config.websocketPath ?? "responses"));
+  const url = new URL(resolvedProviderEndpoint(config, config.websocketPath ?? "responses"));
   if (url.protocol === "https:") url.protocol = "wss:";
   else if (url.protocol === "http:") url.protocol = "ws:";
   if (url.protocol !== "wss:" && url.protocol !== "ws:") {

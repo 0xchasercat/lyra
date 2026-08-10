@@ -138,7 +138,10 @@ export class ReliableProvider {
           attempt: attempt + 1,
           maxAttempts: this.options.maxAttempts,
           reason: `${fault.classification}: ${fault.providerMessage}`,
+          classification: fault.classification,
+          providerMessage: fault.providerMessage,
           delayMs,
+          retryAtMs: Date.now() + delayMs,
           resetsPartialOutput: produced,
         };
         if (delayMs > 0) await this.options.sleep(delayMs, outerSignal);

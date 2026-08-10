@@ -1,7 +1,8 @@
 import type { HttpTransportConfig } from "../auth.ts";
-import { endpoint, providerHeaders } from "../auth.ts";
+import { providerHeaders, providerSystemPrefix } from "../auth.ts";
+import { fetchProviderRoute } from "../endpoints.ts";
 import { classifyProviderError } from "../errors.ts";
-import { fetchWithHeadersDeadline, parseSse, readJsonError } from "../sse.ts";
+import { parseSse, readJsonError } from "../sse.ts";
 import type {
   CanonicalMessage,
   ContentBlock,
@@ -32,7 +33,14 @@ export interface AnthropicCacheBreakpoints {
 export interface AnthropicMessagesTransportConfig extends HttpTransportConfig {
   anthropicVersion?: string;
   anthropicBeta?: string | readonly string[];
-  /** Defaults to /v1/messages. */
+  /**
+   * The route under `base_url`, defaulting to `messages`.
+   *
+   * It is a route, not a path from the host root: the version segment belongs to `base_url`
+   * (see `endpoints.ts`). This used to default to `/v1/messages`, which meant a base that
+   * already ended in `/v1` — the shape half the ecosystem publishes — produced
+   * `…/v1/v1/messages` and a 404 nothing explained.
+   */
   path?: string;
   /** Used when a request does not specify maxOutputTokens. Defaults to 4096. */
   defaultMaxOutputTokens?: number;
@@ -43,7 +51,19 @@ type JsonRecord = Record<string, unknown>;
 type StreamBlock =
   | { type: "text" }
   | { type: "thinking" }
+  | { type: "opaque"; blockType: string }
   | { type: "tool_use"; id: string; argumentsEmitted: boolean };
+
+/**
+ * Deltas Anthropic has documented. A known delta on the wrong block is a real
+ * protocol violation; an unrecognized one is a newer feature we ignore.
+ */
+const KNOWN_DELTA_TYPES = new Set([
+  "text_delta",
+  "thinking_delta",
+  "signature_delta",
+  "input_json_delta",
+]);
 
 const DEFAULT_VERSION = "2023-06-01";
 const DEFAULT_MAX_OUTPUT_TOKENS = 4096;
@@ -70,12 +90,14 @@ export class AnthropicMessagesTransport implements ProviderTransport {
     context: TransportContext,
   ): AsyncGenerator<ProviderEvent> {
     const headers = await this.headers(context.signal);
-    const response = await fetchWithHeadersDeadline(
-      endpoint(this.config.baseUrl, this.config.path ?? "/v1/messages"),
+    const systemPrefix = await providerSystemPrefix(this.config, context.signal);
+    const { response, url } = await fetchProviderRoute(
+      this.config,
+      this.config.path ?? "messages",
       {
         method: "POST",
         headers,
-        body: JSON.stringify(serializeRequest(request, this.config, this.cacheBreakpoints)),
+        body: JSON.stringify(serializeRequest(request, this.config, this.cacheBreakpoints, systemPrefix)),
         signal: context.signal,
       },
       context.headersTimeoutMs,
@@ -83,7 +105,7 @@ export class AnthropicMessagesTransport implements ProviderTransport {
 
     if (!response.ok) {
       const body = await readJsonError(response);
-      throw classifyProviderError({ status: response.status, body, headers: response.headers });
+      throw classifyProviderError({ status: response.status, body, headers: response.headers, url });
     }
     if (response.body === null) {
       throw contentShapeFault("Anthropic returned a successful response without an SSE body");
@@ -182,10 +204,12 @@ export class AnthropicMessagesTransport implements ProviderTransport {
               break;
             }
             default:
-              throw contentShapeFault(
-                `Unsupported Anthropic content block type ${JSON.stringify(blockType)} at index ${index}`,
-                event,
-              );
+              // `redacted_thinking` arrives unprompted whenever safety systems
+              // encrypt a thinking block, and betas add further block types.
+              // Track them so their deltas and stop event stay in sequence, but
+              // emit nothing: neither has a canonical representation.
+              blocks.set(index, { type: "opaque", blockType });
+              break;
           }
           break;
         }
@@ -220,7 +244,7 @@ export class AnthropicMessagesTransport implements ProviderTransport {
               block.argumentsEmitted = true;
               yield { type: "tool_call_delta", id: block.id, argumentsDelta };
             }
-          } else {
+          } else if (block.type !== "opaque" && KNOWN_DELTA_TYPES.has(deltaType)) {
             throw contentShapeFault(
               `Anthropic ${deltaType} cannot apply to ${block.type} block at index ${index}`,
               event,
@@ -282,7 +306,8 @@ export class AnthropicMessagesTransport implements ProviderTransport {
         }
 
         default:
-          throw contentShapeFault(`Unsupported Anthropic SSE event type ${JSON.stringify(eventType)}`, event);
+          // Anthropic asks clients to ignore event types they do not know.
+          break;
       }
     }
 
@@ -309,6 +334,7 @@ function serializeRequest(
   request: ProviderRequest,
   config: AnthropicMessagesTransportConfig,
   breakpoints: AnthropicCacheBreakpoints,
+  systemPrefix?: string,
 ): JsonRecord {
   const maxTokens = request.maxOutputTokens ?? config.defaultMaxOutputTokens ?? DEFAULT_MAX_OUTPUT_TOKENS;
   if (!Number.isInteger(maxTokens) || maxTokens <= 0) {
@@ -330,14 +356,34 @@ function serializeRequest(
     model: request.model,
     max_tokens: maxTokens,
     stream: true,
-    system: systemCacheControl === undefined
-      ? request.system
-      : [{ type: "text", text: request.system, cache_control: systemCacheControl }],
+    system: serializeSystem(request.system, systemPrefix, systemCacheControl),
     messages,
     ...(tools.length === 0 ? {} : { tools }),
     ...(request.temperature === undefined ? {} : { temperature: request.temperature }),
     ...(request.metadata === undefined ? {} : { metadata: request.metadata }),
   };
+}
+
+/**
+ * The system field, in the shape Anthropic's `system` accepts.
+ *
+ * A credential source's prefix is its *own* block, ahead of Lyra's — not a paragraph glued to
+ * the front of it. The endpoints that mandate a prefix inspect the first block's text, and a
+ * concatenated string is not that block. Blocks also keep the two authorships separable, which
+ * is the whole reason the prefix exists instead of a whole injected vendor prompt.
+ *
+ * The cache breakpoint stays on the *last* block. Both blocks are static for the session, so
+ * one breakpoint at the end covers the pair, and §13's cache stability is unchanged by the
+ * presence of a prefix.
+ */
+function serializeSystem(
+  system: string,
+  prefix: string | undefined,
+  cache: AnthropicCacheControl | undefined,
+): string | JsonRecord[] {
+  const tail: JsonRecord = { type: "text", text: system, ...(cache === undefined ? {} : { cache_control: cache }) };
+  if (prefix === undefined || prefix.length === 0) return cache === undefined ? system : [tail];
+  return [{ type: "text", text: prefix }, tail];
 }
 
 function serializeMessage(message: CanonicalMessage, cacheAtEnd: boolean): JsonRecord {
