@@ -65,6 +65,7 @@ export function deriveContext(
     system: options.system,
     messages,
     tools: options.tools,
+    ...(options.maxOutputTokens === undefined ? {} : { maxOutputTokens: options.maxOutputTokens }),
   };
   const tokenEstimate = estimateTokens(request);
   if (tokenEstimate >= options.contextWindow) {

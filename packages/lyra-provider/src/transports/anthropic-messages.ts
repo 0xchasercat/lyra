@@ -2,6 +2,7 @@ import type { HttpTransportConfig } from "../auth.ts";
 import { providerHeaders, providerSystemPrefix } from "../auth.ts";
 import { fetchProviderRoute } from "../endpoints.ts";
 import { classifyProviderError } from "../errors.ts";
+import { MAX_OUTPUT_TOKENS_ASK } from "../output-limit.ts";
 import { parseSse, readJsonError } from "../sse.ts";
 import type {
   CanonicalMessage,
@@ -42,7 +43,16 @@ export interface AnthropicMessagesTransportConfig extends HttpTransportConfig {
    * `…/v1/v1/messages` and a 404 nothing explained.
    */
   path?: string;
-  /** Used when a request does not specify maxOutputTokens. Defaults to 4096. */
+  /**
+   * Used when a request does not specify maxOutputTokens.
+   *
+   * This defaulted to 4096, and *nothing upstream ever set the field* — so every Lyra turn
+   * asked for 4096 output tokens regardless of the model. A long reply from a frontier model
+   * was cut at ~4k, stopped mid-sentence, and was recorded as `truncated`. It defaults to
+   * `MAX_OUTPUT_TOKENS_ASK` now: a request that names no ceiling gets the top of what the
+   * current generation offers, and a model whose real cap is lower says so in a 400 that
+   * `ReliableProvider` reads, retries against, and remembers. See `output-limit.ts`.
+   */
   defaultMaxOutputTokens?: number;
   cacheBreakpoints?: AnthropicCacheBreakpoints;
 }
@@ -66,7 +76,7 @@ const KNOWN_DELTA_TYPES = new Set([
 ]);
 
 const DEFAULT_VERSION = "2023-06-01";
-const DEFAULT_MAX_OUTPUT_TOKENS = 4096;
+const DEFAULT_MAX_OUTPUT_TOKENS = MAX_OUTPUT_TOKENS_ASK;
 const EPHEMERAL_CACHE_CONTROL: AnthropicCacheControl = { type: "ephemeral" };
 
 export class AnthropicMessagesTransport implements ProviderTransport {
@@ -442,10 +452,33 @@ function serializeContentBlock(block: ContentBlock, message: CanonicalMessage): 
         `OpenAI reasoning block in message ${JSON.stringify(message.id)} cannot be sent to Anthropic`,
       );
     case "marker":
-      throw contentShapeFault(
-        `Marker block ${JSON.stringify(block.reason)} in message ${JSON.stringify(message.id)} must be repaired before provider serialization`,
-      );
+      return { type: "text", text: renderMarker(block) };
   }
+}
+
+/**
+ * A loss marker, in the one shape every transport already agreed on: in-band text.
+ *
+ * This used to throw. The reasoning was that a marker is an internal annotation and the
+ * context pipeline ought to have repaired it away — but §3.6's rule is *repair, never
+ * reject*, and the two OpenAI codecs had already implemented that rule by rendering
+ * `[reason: detail]` as ordinary text. Only this transport disagreed, and the disagreement
+ * was an F5-class session lockout: §3.8 appends a `truncated` marker to an assistant turn
+ * the provider cut at its output-token limit, that marker is part of the transcript
+ * forever, and every subsequent prompt in the session then failed serialization with
+ * `Marker block "truncated" … must be repaired before provider serialization`, retried
+ * twice as a content-shape fault, and died. One truncated turn poisoned the whole session.
+ *
+ * All four marker kinds failed identically — `image_dropped` (which `deriveContext`
+ * *synthesises* for an oversized image), `interrupted`, `cancelled` and `truncated`. Only
+ * `truncated` was observed because it is the one a user is most likely to follow with
+ * another prompt; a cancelled session that was never continued simply never re-serialized
+ * its marker. Rendering here fixes every kind on every api_type at the single site that
+ * rejected them, and — unlike stripping the block in `deriveContext` — it leaves the marker
+ * in the derived payload, which is where `/context` reads its loss markers from.
+ */
+function renderMarker(block: Extract<ContentBlock, { type: "marker" }>): string {
+  return `[${block.reason}: ${block.detail}]`;
 }
 
 function serializeToolResultContent(block: ContentBlock, messageId: string): JsonRecord {
@@ -456,6 +489,10 @@ function serializeToolResultContent(block: ContentBlock, messageId: string): Jso
       source: { type: "base64", media_type: block.mediaType, data: block.data },
     };
   }
+  // The nested half of the same rule. `deriveContext` replaces an oversized or malformed
+  // image *inside a tool result* with a marker, so this is a shape Lyra itself produces —
+  // rejecting it here would have failed every turn after a screenshot that was too large.
+  if (block.type === "marker") return { type: "text", text: renderMarker(block) };
   throw contentShapeFault(
     `Tool result in message ${JSON.stringify(messageId)} contains unsupported ${JSON.stringify(block.type)} content`,
   );

@@ -13,6 +13,15 @@ export interface IrcMessage<T = unknown> {
   channel?: string;
   text?: string;
   data?: T;
+  /**
+   * Whether the sender can still be answered. Absent means yes.
+   *
+   * It rides the message because only the sender knows: a lifecycle notice for a child that
+   * failed *at resolution* is unanswerable the moment it is written, and by the time the
+   * recipient renders it the peer is already gone from the bus — too late for a lookup, and
+   * the announcement itself has to be sent while the name is still registered.
+   */
+  reply?: boolean;
   createdAt: number;
 }
 export interface IrcDelivery {

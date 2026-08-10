@@ -128,6 +128,28 @@ const CONTEXT_MESSAGE_PATTERNS: readonly RegExp[] = [
 ];
 const QUOTA_MESSAGE_PATTERN = /\b(?:quota|credits?|billing)\b/;
 
+/**
+ * The provider refusing *our own* `max_tokens`, which is not a context overflow.
+ *
+ * The two collide because both are 400s whose prose is about tokens and maximums:
+ * "max_tokens exceeds the maximum allowed number of output tokens" trips
+ * `CONTEXT_MESSAGE_PATTERNS` word for word. Read as an overflow it triggers a pointless
+ * compaction of a conversation that was never too long, and then surfaces the raw 400
+ * anyway. The distinguishing signal is that a `max_tokens`-family request *field* is named,
+ * so this is checked first and vetoes the overflow reading; recovery for it lives in
+ * `output-limit.ts`, which lowers the ask and retries rather than compacting.
+ */
+const OUTPUT_CAP_MESSAGE_PATTERNS: readonly RegExp[] = [
+  /\bmax_?(?:tokens|output_tokens|completion_tokens)\b[^.]*\b(?:maximum|max|limit|allowed|greater|larger|exceed|too large)/,
+  /\b(?:maximum|max)\b[^.]*\bnumber of (?:output|completion) tokens\b/,
+  /\b(?:output|completion) tokens?\b[^.]*\b(?:exceeds?|above|greater than)\b/,
+];
+
+/** Whether a provider message is about our own output-token ask. Message must be lowercased. */
+export function isOutputCapMessage(message: string): boolean {
+  return OUTPUT_CAP_MESSAGE_PATTERNS.some((pattern) => pattern.test(message));
+}
+
 export function classifyProviderError(input: ProviderErrorInput): ProviderFault {
   if (input.cause instanceof ProviderFault) return input.cause;
 
@@ -185,6 +207,7 @@ function classify(
 }
 
 function isContextOverflowMessage(message: string): boolean {
+  if (isOutputCapMessage(message)) return false;
   return CONTEXT_MESSAGE_PATTERNS.some((pattern) => pattern.test(message));
 }
 

@@ -32,7 +32,7 @@ export const BASH_DEFINITION: ToolDefinition = Object.freeze({
     properties: {
       command: { type: ["string", "array"], items: { type: "string" }, minLength: 1, minItems: 1, description: "The command to run, as one shell string. An argv array such as [\"bash\", \"-lc\", \"ls\"] is also accepted and joined. Send this to run something; leave it out or empty when job names a job you are collecting, and anything sent anyway is ignored and reported as ignored." },
       cwd: { type: "string", minLength: 1, description: "Optional absolute or cwd-relative working directory." },
-      timeoutMs: { type: "integer", minimum: 1, maximum: 3_600_000, description: "Optional deadline in milliseconds. With job, how long to wait for the job to finish." },
+      timeoutMs: { type: "integer", minimum: 1, maximum: 3_600_000, description: "Optional deadline in milliseconds, applied to the shell itself. timed_out is true only when that shell was still running when the deadline expired and had to be killed; a command whose shell finished on its own is never reported as timed out, even when it left a background process running — that process is listed instead and keeps running. With job, this is instead how long to wait for the job to finish." },
       description: { type: "string", maxLength: 200, description: "Optional one-line summary of what the command does, shown in the UI. Has no effect on execution." },
       run_in_background: { type: "boolean", description: "Return a job id immediately instead of blocking. Development servers and unbounded commands do this regardless of this flag." },
       job: { type: ["string", "null"], description: "A job id such as \"job-000001\" reported by an earlier background or heavy call. Sending it waits for that job and returns its complete output; any command sent alongside it is ignored and reported as ignored. Leave it out, empty, or null whenever you are running a command." },
@@ -231,12 +231,37 @@ function errorResult(message: string): ToolExecutionResult { return { content: m
 
 function isJobHandle(value: ProcessResult | JobHandle): value is JobHandle { return "id" in value; }
 
+/**
+ * Say what the command left running, because the alternative is a silent contradiction.
+ *
+ * A shell that backgrounds something exits at once, so the call comes back in a couple of
+ * seconds with complete output and the model has no way to tell "this finished" from "this
+ * started a server and walked away". The host names the survivors; this turns them into a line
+ * the model can act on, including the fact that they are *still running* — which is now true,
+ * since a job that ends on its own no longer reaps its own descendants (§11).
+ */
+function survivorLine(result: ProcessResult): string | undefined {
+  const survivors = result.survivors ?? [];
+  if (survivors.length === 0) return undefined;
+  const one = survivors.length === 1;
+  // The command is empty when `ps` could not be read; the pid is still actionable.
+  const shown = survivors.slice(0, 3).map((survivor) => (survivor.command.length > 0 ? survivor.command : `pid ${survivor.pid}`));
+  const rest = survivors.length - shown.length;
+  return `shell exited in ${(result.durationMs / 1000).toFixed(1)}s; ${survivors.length} background ${one ? "child" : "children"} still ${one ? "holds" : "hold"} the output pipe `
+    + `(${shown.join("; ")}${rest > 0 ? `; and ${rest} more` : ""}) — ${one ? "it keeps" : "they keep"} running, and will until you stop ${one ? "it" : "them"} or the session ends.`;
+}
+
 async function present(result: ProcessResult, store: ArtifactStore, budget: number): Promise<string> {
+  const survivors = survivorLine(result);
   const body = [
     `exit_code: ${result.exitCode ?? "null"}`,
     `signal: ${result.signal ?? "none"}`,
-    `timed_out: ${result.signal !== null}`,
+    // Reported, never inferred. Inferring it from `signal` called a cancelled job timed out,
+    // and called a 2.1s command that exited 0 timed out because a grandchild it backgrounded
+    // kept the pipe open until the deadline killed *that*.
+    `timed_out: ${result.timedOut}`,
     `duration_ms: ${result.durationMs}`,
+    ...(survivors === undefined ? [] : [`still_running: ${survivors}`]),
     "--- stdout ---",
     result.stdout,
     "--- stderr ---",

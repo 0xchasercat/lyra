@@ -68,6 +68,16 @@ export interface ContextDerivationOptions {
   apiType: ProviderApiType;
   tools: readonly ToolDefinition[];
   contextWindow: number;
+  /**
+   * The output-token ceiling to ask the provider for, resolved from the model's metadata.
+   *
+   * `ProviderRequest.maxOutputTokens` has always existed and nothing ever populated it, so
+   * every turn fell through to the Anthropic transport's 4096-token default and long replies
+   * were cut off mid-sentence. This is the seam that fills it: the derived request carries
+   * the model's own maximum, and `resolveMaxOutputTokens` supplies a deliberately high ask
+   * for a model no table knows.
+   */
+  maxOutputTokens?: number;
   imageByteLimit?: number;
 }
 

@@ -5,6 +5,7 @@ export * from "./endpoints.ts";
 export * from "./client.ts";
 export * from "./errors.ts";
 export * from "./models.ts";
+export * from "./output-limit.ts";
 export * from "./plugin-auth.ts";
 export * from "./registry.ts";
 export * from "./types.ts";

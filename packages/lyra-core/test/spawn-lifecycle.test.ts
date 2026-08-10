@@ -1,5 +1,5 @@
 import { afterEach, expect, test } from "bun:test";
-import { SpawnDeadlineError, SpawnManager, SpawnTimeoutError } from "../src/spawn.ts";
+import { SpawnDeadlineError, SpawnManager, SpawnResolutionError, SpawnTimeoutError } from "../src/spawn.ts";
 import type { SpawnLifecycleEvent } from "../src/spawn-types.ts";
 
 /**
@@ -178,6 +178,100 @@ test("revival re-runs the same child with the message as its next instruction", 
   expect(events).toEqual(["spawned", "started", "completed", "revived", "started", "completed"]);
 });
 
+/**
+ * The other half of the model-routing defect: the failure notice for a child that died at
+ * resolution suggested `hub send to:"stylist"` — a revive path pointed at the one failure it
+ * cannot repair — and left the name held, which is why the user's retry was called `stylist2`.
+ */
+test("a child that failed at resolution is not revivable and gives its name back", async () => {
+  const events: SpawnLifecycleEvent[] = [];
+  const manager = track(new SpawnManager({
+    defaultWorkspace: "/repo",
+    executor: async (request) => {
+      if (request.task === "restyle it") throw new SpawnResolutionError(`Spawn stylist could not start: Unknown model in "claude-max/opus-5"`);
+      return "ok";
+    },
+  }));
+  manager.onLifecycle((event) => events.push(event));
+
+  const handle = manager.spawn({ task: "restyle it", label: "stylist" });
+  await expect(manager.wait(handle.id, 2_000)).rejects.toThrow(/could not start/);
+  expect(manager.status(handle.id)).toMatchObject({ status: "failed", failure: "resolution", revivable: false });
+
+  // The one event the terminal notice is written from carries all three facts.
+  expect(events.at(-1)).toMatchObject({ type: "failed", peer: "stylist", status: "failed", failure: "resolution", revivable: false, peerReleased: true });
+
+  // Nothing answers to the name any more, so the retry may simply have it.
+  expect(manager.status("stylist")).toBeUndefined();
+  expect(manager.idForPeer("stylist")).toBeUndefined();
+  expect(manager.spawn({ task: "again", label: "stylist" }).peer).toBe("stylist");
+
+  // And reviving it by id says why, rather than re-deriving the same failure in a new turn.
+  expect(() => manager.revive(handle.id, "try again")).toThrow(/before it ever ran/);
+  expect(manager.status(handle.id)?.status).toBe("failed");
+});
+
+test("a child that ran and failed keeps its name and stays revivable", async () => {
+  const events: SpawnLifecycleEvent[] = [];
+  const manager = track(new SpawnManager({
+    defaultWorkspace: "/repo",
+    executor: async (request) => { if (request.task === "review") throw new Error("the provider refused the request"); return "second pass"; },
+  }));
+  manager.onLifecycle((event) => events.push(event));
+
+  const handle = manager.spawn({ task: "review", label: "reviewer" });
+  await expect(manager.wait(handle.id, 2_000)).rejects.toThrow(/refused/);
+  expect(manager.status("reviewer")).toMatchObject({ status: "failed", failure: "execution", revivable: true });
+  expect(events.at(-1)).toMatchObject({ type: "failed", failure: "execution", revivable: true });
+  expect(events.at(-1)).not.toHaveProperty("peerReleased");
+
+  expect(manager.idForPeer("reviewer")).toBe(handle.id);
+  expect(manager.revive("reviewer", "try the lexer instead")).toMatchObject({ id: handle.id, peer: "reviewer" });
+  expect((await manager.wait(handle.id, 2_000)).output).toBe("second pass");
+  expect(manager.status("reviewer")).toMatchObject({ status: "completed", revivable: true });
+});
+
+/** A child the manager never got as far as calling an executor for is the same case. */
+test("a child whose workspace never resolved is treated as never having run", async () => {
+  const manager = track(new SpawnManager({
+    defaultWorkspace: "/repo",
+    createWorkspace: async () => { throw new Error("no space left on device"); },
+    executor: async () => "ok",
+  }));
+  const handle = manager.spawn({ task: "swarm member", isolated: true, label: "swarmer" });
+  await expect(manager.wait(handle.id, 2_000)).rejects.toThrow(/no space left/);
+  expect(manager.status(handle.id)).toMatchObject({ status: "failed", failure: "resolution", revivable: false });
+  expect(manager.status("swarmer")).toBeUndefined();
+});
+
+/**
+ * The fail-fast seam. The manager owns no provider configuration and never will, so the check
+ * is injected — but it is asked *before* a job exists, because the whole defect was that a
+ * caller got `{ status: "running" }` and a handle to a child that could never run.
+ */
+test("an unusable model is refused before any child exists", async () => {
+  const asked: string[] = [];
+  const manager = track(new SpawnManager({
+    defaultWorkspace: "/repo",
+    validateModel: (model) => { asked.push(model); if (model !== "claude-max/claude-opus-5") throw new Error(`Unknown model in ${JSON.stringify(model)}`); },
+    executor: async () => "ok",
+  }));
+
+  await expect(manager.assertModelUsable("claude-max/opus-5")).rejects.toThrow(/Unknown model in "claude-max\/opus-5"/);
+  // Installed after construction as well, because a provider added mid-session has to be
+  // spawnable in the next turn and the boot-time environment cannot know about it.
+  const late = track(new SpawnManager({ defaultWorkspace: "/repo", executor: async () => "ok" }));
+  await late.assertModelUsable("anything/at-all"); // No check installed: nothing to refuse it with.
+  late.setModelValidator(() => { throw new Error("Unknown provider in \"anything/at-all\""); });
+  await expect(late.assertModelUsable("anything/at-all")).rejects.toThrow(/Unknown provider/);
+  await manager.assertModelUsable("claude-max/claude-opus-5");
+  // An inherited model is the one this session is already serving turns with; re-probing its
+  // credential on every delegation would buy latency and nothing else.
+  await manager.assertModelUsable(undefined);
+  expect(asked).toEqual(["claude-max/opus-5", "claude-max/claude-opus-5"]);
+  expect(manager.list()).toEqual([]);
+});
+
 test("a running child is not revived: it is still running", async () => {
   let release!: () => void;
   const gate = new Promise<void>((resolve) => { release = resolve; });
@@ -202,8 +296,12 @@ test("a declared write scope travels to the child and its violations come back i
   const handle = manager.spawn({ task: "port the parser", writeScope: ["src/parser/**"] });
   const result = await manager.wait(handle.id, 2_000);
   // Recorded once: the same refused path twice is one fact about the partition.
-  expect(result.scope).toEqual({ paths: ["src/parser/**"], violations: ["src/lexer/token.ts"] });
+  // And rooted: the declaration is relative to a tree the call never names, so the result
+  // says which tree it landed in rather than leaving a mis-rooted scope to show up as the
+  // child's first refused write.
+  expect(result.scope).toEqual({ paths: ["src/parser/**"], resolved: ["/repo/src/parser/**"], violations: ["src/lexer/token.ts"] });
   expect(manager.status(handle.id)?.writeScope).toEqual(["src/parser/**"]);
+  expect(manager.status(handle.id)?.writeScopeResolved).toEqual(["/repo/src/parser/**"]);
   expect(() => manager.spawn({ task: "x", writeScope: [] })).toThrow(/writeScope/);
 });
 
@@ -263,7 +361,11 @@ test("an isolated child cannot be revived where no workspace can be resumed, and
   await manager.wait(handle.id, 2_000);
   manager.revive("porter", "again");
   await expect(manager.wait(handle.id, 2_000)).rejects.toThrow(/cannot be revived/);
-  expect(manager.status("porter")?.status).toBe("failed");
+  // It ran once, so it keeps its name and stays revivable: `started` is sticky, and a child
+  // with a transcript is not retroactively a child that never existed because one later
+  // attempt to put it back in its workspace failed.
+  expect(manager.status("porter")).toMatchObject({ status: "failed", failure: "execution", revivable: true });
+  expect(manager.idForPeer("porter")).toBe(handle.id);
 });
 
 /**

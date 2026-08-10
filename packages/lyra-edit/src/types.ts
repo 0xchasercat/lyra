@@ -57,17 +57,48 @@ export type EditRequest =
       replace: string;
     };
 
-export interface EditSuccess {
+export type EditApplyMode = EditRequest["mode"];
+
+/** What is true of every applied change, whatever mode produced it. */
+export interface EditSuccessBase {
   ok: true;
   path: string;
-  mode: EditMode;
-  tier: EditTier;
   tag: SnapshotTag;
   changed: true;
   bytesBefore: number;
   bytesAfter: number;
+}
+
+/**
+ * A replacement that landed: which mode resolved it, which tier fired, how many sites it
+ * touched (§6.2). `tier` is only ever a real tier here — `not_applied` names a call that
+ * wrote nothing, so it cannot describe a success.
+ */
+export interface EditApplySuccess extends EditSuccessBase {
+  mode: EditApplyMode;
+  tier: EditTier;
   occurrences: number;
 }
+
+/**
+ * A whole-file write, which has no tier and no occurrence count to report.
+ *
+ * Both used to be present and both were lies: `write` does no matching, so it carried
+ * `tier: "not_applied"` — the marker for a call that changed nothing, on a call that had
+ * just rewritten the file — and `occurrences: 1` counted a match that never happened. The
+ * model paid for two fields on every file it created and read the first as a failure
+ * signal. Splitting the success type is what keeps them gone: they are not optional here,
+ * they are absent, so no future writer can set them by reflex.
+ *
+ * `created` replaces what the noise was standing in for — the one thing a write knows that
+ * the byte counts do not say outright.
+ */
+export interface WriteSuccess extends EditSuccessBase {
+  mode: "write";
+  created: boolean;
+}
+
+export type EditSuccess = EditApplySuccess | WriteSuccess;
 
 export interface EditFailure {
   ok: false;

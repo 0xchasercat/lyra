@@ -382,6 +382,81 @@ function message(id: string, role: "user" | "assistant", content: ContentBlock[]
   };
 }
 
+/**
+ * The session-resume shape from the live lockout: a `truncated` marker mid-history.
+ *
+ * §3.8 appends it to the assistant turn the provider cut at its output-token limit, so it is
+ * part of the transcript on disk from then on. §3.6's contract is that derivation *repairs*
+ * rather than rejects, and that the marker survives derivation is what keeps `/context`
+ * honest about the loss — the wire rendering is each transport's job (see the marker
+ * conformance tests in @lyra/provider), and `anthropic_messages` used to throw on it,
+ * poisoning every subsequent prompt in the session.
+ */
+describe("a turn truncated at the output limit does not poison the session", () => {
+  const truncatedSession = (): TranscriptEntry[] => transcript([
+    message("u1", "user", [{ type: "text", text: "Write the review." }]),
+    message("a1", "assistant", [
+      { type: "text", text: "The review begins" },
+      {
+        type: "marker",
+        reason: "truncated",
+        detail: "The provider reached its 4096-token output limit; the partial response was retained.",
+      },
+    ]),
+    message("u2", "user", [{ type: "text", text: "Continue please." }]),
+  ]);
+
+  for (const apiType of ["anthropic_messages", "openai_completions", "openai_responses", "openai_websocket"] as const) {
+    test(`derives cleanly for ${apiType} and keeps the marker for /context`, () => {
+      const derived = deriveContext(truncatedSession(), { ...baseOptions, apiType });
+
+      const assistant = derived.request.messages.find((entry) => entry.role === "assistant");
+      expect(assistant?.content).toEqual(expect.arrayContaining([
+        expect.objectContaining({ type: "marker", reason: "truncated" }),
+      ]));
+      // The prompt that followed the truncated turn is still in the payload — the whole
+      // point of the fix is that the session continues rather than failing at serialization.
+      expect(derived.request.messages.at(-1)?.content).toEqual([
+        { type: "text", text: "Continue please." },
+      ]);
+    });
+  }
+
+  // Every marker kind takes the identical path. Only `truncated` was ever observed live,
+  // because it is the one a user is most likely to follow with another prompt.
+  for (const reason of ["image_dropped", "interrupted", "cancelled", "truncated"] as const) {
+    test(`keeps a ${reason} marker through derivation`, () => {
+      const derived = deriveContext(transcript([
+        message("u1", "user", [{ type: "text", text: "go" }]),
+        message("a1", "assistant", [{ type: "marker", reason, detail: "why it stopped" }]),
+        message("u2", "user", [{ type: "text", text: "again" }]),
+      ]), { ...baseOptions, apiType: "anthropic_messages" });
+
+      expect(derived.request.messages[1]?.content).toEqual([
+        { type: "marker", reason, detail: "why it stopped" },
+      ]);
+    });
+  }
+});
+
+describe("the derived request carries the model's output ceiling", () => {
+  test("the resolved cap reaches the provider request", () => {
+    const derived = deriveContext(transcript([
+      message("u1", "user", [{ type: "text", text: "hello" }]),
+    ]), { ...baseOptions, maxOutputTokens: 64_000 });
+
+    expect(derived.request.maxOutputTokens).toBe(64_000);
+  });
+
+  test("an unset ceiling leaves the field absent rather than inventing one", () => {
+    const derived = deriveContext(transcript([
+      message("u1", "user", [{ type: "text", text: "hello" }]),
+    ]), baseOptions);
+
+    expect(derived.request.maxOutputTokens).toBeUndefined();
+  });
+});
+
 function timestamp(index: number): string {
   return new Date(Date.UTC(2026, 7, 5, 0, 0, index)).toISOString();
 }

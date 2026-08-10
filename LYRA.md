@@ -602,6 +602,9 @@ dependency.
   preserved validly, the turn's thinking is dropped rather than sent invalid (§3.6).
 - `cache_control` breakpoints placed per §13, never mid-session-mutated.
 - Parallel tool use, and interleaved thinking where the model supports it.
+- Loss markers (§3.8) serialize as in-band text, `[reason: detail]` — the same rendering the
+  OpenAI codecs use. A marker is never a serialization error: rejecting one made a single
+  truncated turn poison every later prompt in that session.
 
 ### 5.5 Configuration
 
@@ -713,6 +716,26 @@ merge   = "anthropic/claude-opus-5"
 
 **Switching mid-session** re-derives the whole payload from the transcript (§3.6). Lossy
 conversions are flagged in the TUI. Streaming is mandatory on all four transports.
+
+---
+
+### 5.6 Output tokens: ask for the model's maximum
+
+**Every request asks for the model's own maximum output tokens.** There is no conservative
+default, because a ceiling nobody chose is a §3.8 loss dressed as a safety margin — the
+shipped 4096-token default cut a long reply mid-sentence and reported it as `truncated`.
+
+- A **known** model takes its published cap from the model table (`ModelInfo.maxOutputTokens`),
+  which a provider's own `/models` listing overrides when it reports one.
+- An **unknown** model is asked high on purpose, and the provider's 400 is the discovery
+  mechanism: the limit is parsed out of the error (Anthropic's message names it), the request
+  is retried once against that number, and the answer is **cached per provider+model for the
+  session** so the round trip is paid once rather than every turn. Where no number can be
+  read, the ask halves and retries.
+- An output-cap 400 is never surfaced raw. It is our own field, not the user's input, and it
+  is classified apart from `context_overflow` so it never triggers a pointless compaction.
+- `max_tokens` as a terminal stop reason stays terminal (§3.3) — no silent auto-continue —
+  but the turn-end marker names the ceiling that fired and the lever that raises it.
 
 ---
 

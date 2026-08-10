@@ -304,3 +304,38 @@ describe("a provider failure says which provider failed", () => {
     } finally { await runtime.close(); }
   }, 30_000);
 });
+
+/**
+ * The spawn path's model check, on a *running* daemon.
+ *
+ * The check itself is covered against fixtures in `spawn-model-routing.test.ts`; what this
+ * pins is that it is actually installed, and that it reads the environment as it is *now*.
+ * The observed failure needed both halves: `spawn { model: "claude-max/opus-5" }` returned a
+ * `status: running` handle because nothing validated it, and the real answer arrived minutes
+ * later through the bus as `Spawn spawn-1 failed: model: opus-5`.
+ */
+describe("spawn model routing on a running daemon", () => {
+  test("rejects an unroutable model at the call, and accepts one added mid-session", async () => {
+    const url = stubProvider();
+    const { root, home } = await fixture(url);
+    const runtime = await LyraRuntime.create({ origin: root, session: "spawn-routing", home });
+    const context = { signal: new AbortController().signal, sessionId: "spawn-routing", workspace: root, callId: "call-1" };
+    try {
+      const rejected = await runtime.app.tools.execute("spawn", { task: "restyle", model: "claude-code/claude-opus-5", label: "stylist" }, context);
+      expect(rejected.isError).toBe(true);
+      // The full reference survives — the observed message had the provider prefix stripped.
+      expect(String(rejected.content)).toContain("claude-code/claude-opus-5");
+      expect(String(rejected.content)).toContain("No child was started");
+      expect(runtime.app.spawn.list()).toEqual([]);
+
+      // The validator reads the live environment, so a provider added now is spawnable now.
+      Bun.env.LYRA_TEST_SPAWN_KEY = "added-key";
+      const call = await connected(runtime);
+      await call("provider/add", { provider: "claude-code", baseUrl: url, apiType: "openai_completions", model: "claude-opus-5", persist: "env", authEnvVar: "LYRA_TEST_SPAWN_KEY" });
+
+      const accepted = await runtime.app.tools.execute("spawn", { task: "restyle", model: "claude-code/claude-opus-5", label: "stylist" }, context);
+      expect(accepted.isError).not.toBe(true);
+      expect(runtime.app.spawn.list()).toHaveLength(1);
+    } finally { delete Bun.env.LYRA_TEST_SPAWN_KEY; await runtime.close(); }
+  }, 30_000);
+});

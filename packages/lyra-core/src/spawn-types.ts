@@ -58,6 +58,21 @@ export type SpawnState =
 /** The states past which nothing more will happen unless the child is revived. */
 export const SPAWN_TERMINAL_STATES: readonly SpawnState[] = Object.freeze(["completed", "failed", "timed_out", "cancelled"]);
 
+/**
+ * Which half of a child's life a `failed` came from — and therefore whether a message to it
+ * would mean anything.
+ *
+ * `resolution` is a child that never ran: its model, its tools or its workspace could not be
+ * resolved, so it has no transcript to continue and the same resolution would fail again the
+ * instant a message revived it. `execution` is a child that ran and failed, which is exactly
+ * the case a corrected instruction picks up from.
+ *
+ * The distinction exists because the two were reported identically, and the terminal notice
+ * for a child that died at resolution offered `hub send to:` — a revive path that cannot
+ * work, pointed at the one failure it cannot repair.
+ */
+export type SpawnFailureKind = "resolution" | "execution";
+
 export interface SpawnResult {
   id: string;
   /** The bus name this child answers to. Authoritative: `hub send to:` takes exactly this. */
@@ -69,8 +84,15 @@ export interface SpawnResult {
   integration?: SpawnIntegration;
   /** Paths this child's tools reported changing, for a shared-tree child. */
   filesModified?: string[];
-  /** Present only when the child declared a `writeScope`. */
-  scope?: { paths: string[]; violations: string[] };
+  /**
+   * Present only when the child declared a `writeScope`.
+   *
+   * `paths` is what the parent wrote; `resolved` is where those patterns actually landed once
+   * rooted at the child's workspace. Both, because a `writeScope` is relative to a tree the
+   * parent never names in the call, and a mis-rooted one is otherwise invisible until the
+   * child's first refused write — at which point the refusal reads as the child's mistake.
+   */
+  scope?: { paths: string[]; resolved: string[]; violations: string[] };
 }
 
 /**
@@ -137,6 +159,8 @@ export interface SpawnStatus {
   currentTool?: string;
   filesModified: string[];
   writeScope?: string[];
+  /** The same partition, rooted at `workspace`. See [`SpawnResult.scope`]. */
+  writeScopeResolved?: string[];
   scopeViolations?: string[];
   /** The tail of whatever the child has said so far. Present only when it has said something. */
   partialOutput?: string;
@@ -144,6 +168,13 @@ export interface SpawnStatus {
   revivals?: number;
   /** Why it failed, for `failed` and `timed_out`. */
   error?: string;
+  /** Which half of its life the failure came from. Present on `failed` only. */
+  failure?: SpawnFailureKind;
+  /**
+   * Whether a message would revive this child. Present once it is terminal, and `false` only
+   * for a resolution failure — the one terminal state a message cannot do anything with.
+   */
+  revivable?: boolean;
   /** True once the result is collectable with `spawn { id }`. */
   resultAvailable: boolean;
   integration?: SpawnIntegration;
@@ -196,6 +227,23 @@ export interface SpawnLifecycleEvent {
   at: number;
   /** Present on `failed` and `timed_out`. */
   error?: string;
+  /** Present on `failed`: whether the child ever ran. See [`SpawnFailureKind`]. */
+  failure?: SpawnFailureKind;
+  /**
+   * Present on every terminal transition: whether a message to `peer` would revive this
+   * child. Whoever writes the terminal notice reads this rather than inferring it from
+   * `status`, because `failed` covers both the child a message repairs and the one it cannot.
+   */
+  revivable?: boolean;
+  /**
+   * Present, and always `true`, when the manager has just given `peer` up.
+   *
+   * A name is only released for a child nothing can be sent to, so the holder of the bus can
+   * `unregister` it on sight: keeping a name reserved for an agent that can never answer is
+   * pure cost, and it is the cost that made a user name their retry `stylist2` because they
+   * could not tell whether `stylist` was still taken.
+   */
+  peerReleased?: boolean;
 }
 
 export interface SpawnExecutorContext {
@@ -234,4 +282,16 @@ export interface SpawnManagerOptions {
   now?: () => number;
   /** Names already taken on the bus, so a label never collides with a live peer. */
   reservedPeers?: () => Iterable<string>;
+  /**
+   * Whether an explicitly requested model can actually serve a turn, asked before the child
+   * exists (see [`SpawnManager.assertModelUsable`]).
+   *
+   * Injected, because this package owns no provider configuration and must not learn one. It
+   * exists because `spawn { model: "claude-max/opus-5" }` answered `status: running` with a
+   * live handle and surfaced the resolution failure minutes later, through the bus, as
+   * `Spawn spawn-1 failed: model: opus-5` — a dead child, a stripped reference, and no
+   * statement of what was wrong. Rejecting the *tool call* is the only report a caller can
+   * act on, and this is the only thing that knows enough to reject it.
+   */
+  validateModel?: (model: string, signal?: AbortSignal) => Promise<void> | void;
 }

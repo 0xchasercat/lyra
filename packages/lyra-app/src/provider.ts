@@ -1,4 +1,5 @@
-import { authPluginRoot, createProviderTransport, loadProviderConfig, ProviderFault, ReliableProvider, resolveProvider, resolveModelRole } from "@lyra/provider";
+import { resolve as resolvePath } from "node:path";
+import { authPluginRoot, cachedModels, createProviderTransport, loadProviderConfig, ProviderFault, ReliableProvider, resolveProvider, resolveModelRole } from "@lyra/provider";
 import type { AuthConfig, AuthSource, ProviderDefinition, ProviderFileConfig, ProviderTransport, ResolveProviderOptions } from "@lyra/provider";
 
 export interface EnvironmentProviderOptions {
@@ -142,6 +143,37 @@ export async function assertProviderUsable(
   options: { timeoutMs?: number; signal?: AbortSignal; home?: string } = {},
 ): Promise<void> {
   const reference = `${name}/${model}`;
+  const fault = await probeProviderCredential(name, definition, options);
+  if (fault === undefined) return;
+  throw new Error(
+    fault.kind === "config"
+      ? `Cannot select ${reference}: its configuration is not usable — ${fault.detail}. ${fault.remedy}`
+      : `Cannot select ${reference}: ${fault.detail}. ${fault.remedy}`,
+    { cause: fault.cause },
+  );
+}
+
+/** Which precondition a provider failed, for a caller that words the two differently. */
+interface ProviderCredentialFault {
+  kind: "config" | "credential";
+  detail: string;
+  remedy: string;
+  cause: unknown;
+}
+
+/**
+ * The work of [`assertProviderUsable`], minus the sentence it wraps around the answer.
+ *
+ * Separated because two callers ask the same question in different words: selecting a
+ * provider for this session, and checking that a *child's* model reference can serve a turn.
+ * Sharing the sentence would have made a spawn rejection read as `Cannot select …`, which is
+ * about a command the caller never ran.
+ */
+async function probeProviderCredential(
+  name: string,
+  definition: ProviderDefinition,
+  options: { timeoutMs?: number; signal?: AbortSignal; home?: string },
+): Promise<ProviderCredentialFault | undefined> {
   let auth: AuthSource | undefined;
   try {
     // Plugin auth is resolved and *run* here like any other source: the same 10s bound covers
@@ -149,9 +181,9 @@ export async function assertProviderUsable(
     // costs a deadline at selection time instead of the first turn.
     auth = resolveProvider(name, definition, pluginOptions(options.home)).auth;
   } catch (cause) {
-    throw new Error(`Cannot select ${reference}: its configuration is not usable — ${messageOf(cause)}. Fix [providers.${name}] in Lyra TOML, or re-add the provider with /provider add.`, { cause });
+    return { kind: "config", detail: messageOf(cause), remedy: `Fix [providers.${name}] in Lyra TOML, or re-add the provider with /provider add.`, cause };
   }
-  if (auth === undefined) return;
+  if (auth === undefined) return undefined;
   const timeoutMs = options.timeoutMs ?? PROVIDER_CREDENTIAL_PROBE_TIMEOUT_MS;
   // An owned timer rather than `AbortSignal.timeout`. That helper's signal is held weakly, and
   // a credential source that runs a dynamic `import()` — which is exactly what plugin auth does
@@ -163,16 +195,187 @@ export async function assertProviderUsable(
   const signal = options.signal === undefined ? deadline.signal : AbortSignal.any([options.signal, deadline.signal]);
   try {
     await auth.getToken(signal);
+    return undefined;
   } catch (cause) {
     // A caller that cancelled gets its own cancellation back, not a provider verdict.
     if (options.signal?.aborted === true) throw cause;
     const detail = deadline.signal.aborted
       ? `${credentialSource(definition.auth)} did not answer within ${timeoutMs}ms`
       : messageOf(cause);
-    throw new Error(`Cannot select ${reference}: ${detail}. ${credentialRemedy(name, definition.auth)}`, { cause });
+    return { kind: "credential", detail, remedy: credentialRemedy(name, definition.auth), cause };
   } finally {
     clearTimeout(timer);
   }
+}
+
+/**
+ * Which of the four things a `provider/model` reference can get wrong.
+ *
+ * They are separate because they call for four different actions — register a provider, pick
+ * a different model, fix a credential, name a role that exists — and reporting them in one
+ * voice is what turned a mistyped model into the unactionable `model: opus-5`.
+ */
+export type ModelReferenceFault = "role" | "provider" | "model" | "credential";
+
+export class ModelReferenceError extends Error {
+  readonly fault: ModelReferenceFault;
+  /** The reference exactly as the caller wrote it, prefix and all. */
+  readonly reference: string;
+  readonly provider?: string;
+  readonly model?: string;
+
+  constructor(fault: ModelReferenceFault, reference: string, message: string, parts: { provider?: string; model?: string; cause?: unknown } = {}) {
+    super(message, parts.cause === undefined ? undefined : { cause: parts.cause });
+    this.name = "ModelReferenceError";
+    this.fault = fault;
+    this.reference = reference;
+    if (parts.provider !== undefined) this.provider = parts.provider;
+    if (parts.model !== undefined) this.model = parts.model;
+  }
+}
+
+/** How many of a provider's models a rejection lists before it says how many it left out. */
+const MODEL_SUGGESTION_LIMIT = 8;
+
+export interface ModelReferenceCheckOptions {
+  /** The provider a bare model id belongs to. Without one, `[roles].default`'s provider is used. */
+  defaultProvider?: string;
+  /** Home directory auth plugins and the model cache are read from. Tests point it away. */
+  home?: string;
+  timeoutMs?: number;
+  signal?: AbortSignal;
+}
+
+/**
+ * Whether a `provider/model` reference can serve a turn — the whole question, answered before
+ * anything commits to it.
+ *
+ * [`assertProviderUsable`] answers two thirds of it: the provider exists and its credential
+ * source produces a credential. The third is the one that got away. A live session ran
+ * `spawn { model: "claude-max/opus-5" }` against a configured, authenticated `claude-max`
+ * whose models are all spelled `claude-…`; nothing checked the model at all, so the spawn
+ * returned a running handle and the endpoint's own `model: opus-5` arrived minutes later,
+ * through the bus, with the provider prefix stripped off it.
+ *
+ * So the model is checked here, against what the provider declares and what discovery
+ * cached — but only when there is a list to check against. A provider with no `/models`
+ * route and no declared ids can only be proven wrong by asking it, and refusing a model on
+ * the strength of an empty list would ground every such provider.
+ */
+export async function assertModelReferenceUsable(
+  config: ProviderFileConfig,
+  reference: string,
+  options: ModelReferenceCheckOptions = {},
+): Promise<void> {
+  const written = reference.trim();
+  if (written.length === 0) throw new ModelReferenceError("model", written, `A model reference is required, in the form "provider/model" — for example "${config.roles.default ?? "anthropic/claude-opus-5"}".`);
+  let resolved: string;
+  try {
+    resolved = resolveModelRole(written, config.roles);
+  } catch (cause) {
+    // `@fast` with no `[roles].fast` is its own mistake, and `resolveModelRole` already lists
+    // the roles that do exist; only the reference the caller actually typed is added.
+    throw new ModelReferenceError("role", written, `Cannot use model ${JSON.stringify(written)}: ${messageOf(cause)}.`, { cause });
+  }
+  const separator = resolved.indexOf("/");
+  const providerName = separator > 0
+    ? resolved.slice(0, separator)
+    : options.defaultProvider ?? config.roles.default?.split("/")[0] ?? Object.keys(config.providers)[0] ?? "";
+  const model = separator > 0 ? resolved.slice(separator + 1) : resolved;
+  const definition = config.providers[providerName];
+  if (definition === undefined) {
+    const configured = Object.keys(config.providers).join(", ") || "none";
+    throw new ModelReferenceError("provider", written, `Unknown provider in model ${JSON.stringify(written)}: nothing is configured under ${JSON.stringify(providerName)}. Configured providers: ${configured}. Add it with /provider add, or declare [providers.${providerName}] in Lyra TOML.`, { provider: providerName, model });
+  }
+  if (model.length === 0) {
+    throw new ModelReferenceError("model", written, `Unknown model in ${JSON.stringify(written)}: the model half of the reference is empty. Write it as "${providerName}/<model>".`, { provider: providerName, model });
+  }
+  const known = await knownModels(providerName, definition, options.home);
+  if (known.length > 0 && !known.includes(model)) {
+    throw new ModelReferenceError("model", written, `Unknown model in ${JSON.stringify(written)}: provider ${providerName} is configured but does not serve ${JSON.stringify(model)}. ${describeCandidates(providerName, model, known)} Register it with /model add if ${providerName} serves it and its /models route does not list it.`, { provider: providerName, model });
+  }
+  const fault = await probeProviderCredential(providerName, definition, options);
+  if (fault === undefined) return;
+  throw new ModelReferenceError(
+    "credential",
+    written,
+    fault.kind === "config"
+      ? `Provider ${providerName} cannot serve ${JSON.stringify(written)}: its configuration is not usable — ${fault.detail}. ${fault.remedy}`
+      : `Provider ${providerName} cannot serve ${JSON.stringify(written)}: ${fault.detail}. ${fault.remedy}`,
+    { provider: providerName, model, cause: fault.cause },
+  );
+}
+
+/**
+ * Every model id this provider is known to serve: the ones it declares first, in the order
+ * they were declared, then whatever discovery cached and the declaration did not name.
+ *
+ * Declared first because a hand-written `models = [...]` is a statement of intent, and it is
+ * the list a user recognises when they are being told they got one of them wrong.
+ */
+async function knownModels(name: string, definition: ProviderDefinition, home: string | undefined): Promise<string[]> {
+  const declared = definition.models ?? [];
+  let discovered: string[] = [];
+  try {
+    // Cache only. Discovery is a network call, and a model check that reached out would turn
+    // every spawn into a request against a provider the child may not even end up using.
+    discovered = (await cachedModels(name, home === undefined ? undefined : resolvePath(home, ".lyra", "providers")))?.map((entry) => entry.id) ?? [];
+  } catch { /* an unreadable cache is no list, and no list means no verdict */ }
+  const seen = new Set(declared);
+  return [...declared, ...discovered.filter((id) => !seen.has(id))];
+}
+
+/**
+ * What the provider does have, and the one entry that is probably what was meant.
+ *
+ * The observed `opus-5` was `claude-opus-5` with the family prefix left off, which is a
+ * near-miss no plain edit distance catches — the two differ by seven characters. Containment
+ * is checked first for exactly that shape, and bounded edit distance covers the ordinary typo.
+ */
+function describeCandidates(provider: string, model: string, known: readonly string[]): string {
+  const shown = known.slice(0, MODEL_SUGGESTION_LIMIT).join(", ");
+  const overflow = known.length - Math.min(known.length, MODEL_SUGGESTION_LIMIT);
+  const listed = `${provider} has: ${shown}${overflow > 0 ? ` (+${overflow} more)` : ""}`;
+  const nearest = nearestModel(model, known);
+  return `${listed}${nearest === undefined ? "." : ` — did you mean ${JSON.stringify(nearest)}?`}`;
+}
+
+function nearestModel(model: string, known: readonly string[]): string | undefined {
+  const wanted = model.toLowerCase();
+  // Containment first, and unbounded: an id that contains the whole of what was asked for is
+  // a stronger signal than any distance, and `claude-opus-5` is seven edits from `opus-5`.
+  // Scored by how much was missing, so it beats `claude-opus-4-8`, which contains it too.
+  // Three characters minimum, because a two-character fragment is contained in everything.
+  if (wanted.length >= 3) {
+    const contained = nearest(known, (id) => (id.includes(wanted) || wanted.includes(id) ? Math.abs(id.length - wanted.length) : undefined));
+    if (contained !== undefined) return contained;
+  }
+  const threshold = Math.max(2, Math.floor(wanted.length / 3));
+  return nearest(known, (id) => { const score = boundedDistance(id, wanted); return score <= threshold ? score : undefined; });
+}
+
+/** The lowest-scoring candidate, where an undefined score means "not a candidate at all". */
+function nearest(known: readonly string[], score: (id: string) => number | undefined): string | undefined {
+  let best: { id: string; score: number } | undefined;
+  for (const candidate of known) {
+    const value = score(candidate.toLowerCase());
+    if (value !== undefined && (best === undefined || value < best.score)) best = { id: candidate, score: value };
+  }
+  return best?.id;
+}
+
+/** Bounded edit distance, enough to tell `claude-opus-4` from `claude-opus-5` without a dependency. */
+function boundedDistance(a: string, b: string): number {
+  if (Math.abs(a.length - b.length) > 3) return 99;
+  let previous = Array.from({ length: b.length + 1 }, (_, index) => index);
+  for (let i = 1; i <= a.length; i += 1) {
+    const row = [i];
+    for (let j = 1; j <= b.length; j += 1) {
+      row[j] = Math.min(previous[j]! + 1, row[j - 1]! + 1, previous[j - 1]! + (a[i - 1] === b[j - 1] ? 0 : 1));
+    }
+    previous = row;
+  }
+  return previous[b.length]!;
 }
 
 /**

@@ -28,13 +28,13 @@ import {
 } from "@lyra/acp";
 import { LspManager } from "@lyra/lsp";
 import type { JobHandle } from "@lyra/host";
-import { discoverModels, loadProviderConfig, mergeModelLists, resolveModelRole, resolveProvider, type ModelInfo, type ProviderUsage } from "@lyra/provider";
+import { discoverModels, loadProviderConfig, mergeModelLists, resolveMaxOutputTokens, resolveModelRole, resolveProvider, type ModelInfo, type ProviderUsage } from "@lyra/provider";
 import { TranscriptStore, type MessageEntry, type TranscriptEntry } from "@lyra/session";
 import { CheckpointStore } from "@lyra/git";
 import { createCheckpointAccess, LyraApplication, type SessionServices } from "./app.ts";
 import { SessionCheckpointer } from "./checkpoints.ts";
 import { createAgentSpawnExecutor } from "./agent-executor.ts";
-import { assertProviderUsable, createConfiguredProvider, createEnvironmentProvider, createUnconfiguredEnvironment, describeProviderFailure, NO_PROVIDER_MESSAGE, type EnvironmentProvider } from "./provider.ts";
+import { assertModelReferenceUsable, assertProviderUsable, createConfiguredProvider, createEnvironmentProvider, createUnconfiguredEnvironment, describeProviderFailure, NO_PROVIDER_MESSAGE, type EnvironmentProvider } from "./provider.ts";
 import { createIntegratedToolRegistry } from "./integrated-tools.ts";
 import { parseLoopSpec, SoakRunner } from "./soak.ts";
 import { WorkspaceFileIndex } from "./completion.ts";
@@ -165,7 +165,7 @@ export class LyraRuntime {
       // aside (§9). It stays in the inbox too, so `hub inbox` still reads it explicitly and
       // `consume` is what stops the same sentence arriving twice.
       asides: (context, steering) => app?.bus.attach(context.peer, {
-        deliver: (message) => { steering.aside({ from: message.from, ...(message.text === undefined ? {} : { text: message.text }), ...(message.data === undefined ? {} : { data: message.data }), messageId: message.id }); },
+        deliver: (message) => { steering.aside({ from: message.from, ...(message.text === undefined ? {} : { text: message.text }), ...(message.data === undefined ? {} : { data: message.data }), messageId: message.id, reply: message.reply ?? app?.bus.getPeer(message.from) !== undefined }); },
         consume: (ids) => { steering.consume(ids); },
       }),
       origin,
@@ -191,6 +191,24 @@ export class LyraRuntime {
       ...(options.home === undefined ? {} : { home: options.home }),
     });
     attachAgentLifecycle(app, emitUpdate);
+    // Fail-fast on `spawn { model: … }`, against the environment as it is *now*.
+    //
+    // Installed after boot rather than passed to the manager, and reading `currentEnvironment`
+    // through the closure rather than capturing its config, because both halves move: a
+    // provider added with `/provider add` mid-session must be spawnable on the next turn, and
+    // a session switched to another provider must resolve a bare id against *that* one. The
+    // check the main session's `/model` path already ran is now the same check the spawn path
+    // runs, at the call, instead of a `status: running` handle whose real answer arrived
+    // minutes later through the bus as `Spawn spawn-1 failed: model: opus-5`.
+    app.spawn.setModelValidator((model, signal) => assertModelReferenceUsable(
+      currentEnvironment.config,
+      model,
+      {
+        defaultProvider: currentEnvironment.providerName,
+        ...(signal === undefined ? {} : { signal }),
+        ...(options.home === undefined ? {} : { home: options.home }),
+      },
+    ));
     main = await MainSession.create({
       app,
       environment: currentEnvironment,
@@ -447,7 +465,7 @@ export class MainSession {
     await this.#waitForIdle();
     const target = entryId ?? this.#store.head.id;
     const head = this.#store.fork(target);
-    this.#loop = createLoop(this.app, this.#environment, this.#store, this.contextWindow);
+    this.#loop = createLoop(this.app, this.#environment, this.#store, this.contextWindow, this.#models);
     this.#contextTokens = undefined;
     this.#emit([{ sessionUpdate: "session_changed", descriptor: { ...this.#store.descriptor }, reason: "fork" }]);
     return { descriptor: this.#store.descriptor, head };
@@ -473,7 +491,7 @@ export class MainSession {
     if (target === undefined) throw new Error("No checkpoint anchors a transcript entry, so there is nothing to rewind to. Pass an entryId, or run /checkpoints to see what is recorded.");
     const before = this.#messagesInLineage();
     this.#store.fork(target);
-    this.#loop = createLoop(this.app, this.#environment, this.#store, this.contextWindow);
+    this.#loop = createLoop(this.app, this.#environment, this.#store, this.contextWindow, this.#models);
     this.#contextTokens = undefined;
     this.#emit([{ sessionUpdate: "session_changed", descriptor: { ...this.#store.descriptor }, reason: "rewind" }]);
     return {
@@ -900,7 +918,16 @@ export class MainSession {
     const row = await this.#providerModels(this.#environment.providerName, force);
     // An endpoint that answered nothing must not empty a catalogue that already had entries:
     // what we knew a moment ago is still the better answer than nothing at all.
+    const previousAsk = resolveMaxOutputTokens(modelMaxOutputTokens(this.#models, this.#environment.model));
     if (row.models.length > 0 || this.#models.length === 0) this.#models = row.models;
+    // The catalogue loads after the session is constructed, so the first loop is built with
+    // no metadata and asks the generous default. Rebuilding once the real ceiling is known
+    // saves the discovery round trip — and is skipped mid-turn, where swapping the loop
+    // under a running generator would be worse than one extra 400.
+    if (this.#activeTurn === undefined
+      && resolveMaxOutputTokens(modelMaxOutputTokens(this.#models, this.#environment.model)) !== previousAsk) {
+      this.#loop = createLoop(this.app, this.#environment, this.#store, this.contextWindow, this.#models);
+    }
     return this.#models;
   }
 
@@ -950,7 +977,7 @@ export class MainSession {
   }
 
   async context(): Promise<unknown> {
-    const derived = deriveContext(this.#store.lineage(), { model: this.#environment.model, system: this.#loop.system, apiType: this.#environment.provider.transport.apiType, tools: this.#loop.definitions, contextWindow: this.contextWindow });
+    const derived = deriveContext(this.#store.lineage(), { model: this.#environment.model, system: this.#loop.system, apiType: this.#environment.provider.transport.apiType, tools: this.#loop.definitions, contextWindow: this.contextWindow, maxOutputTokens: resolveMaxOutputTokens(modelMaxOutputTokens(this.#models, this.#environment.model)) });
     return inspectContext(derived, this.contextWindow);
   }
 
@@ -959,7 +986,7 @@ export class MainSession {
     if (clear) {
       const before = (await this.context()) as { tokenEstimate: number };
       const boundary = this.#store.append({ type: "boundary", kind: "clear", firstKeptEntry: null, summary: "Context cleared by user.", tokensBefore: before.tokenEstimate, tokensAfter: 0 });
-      this.#loop = createLoop(this.app, this.#environment, this.#store, this.contextWindow);
+      this.#loop = createLoop(this.app, this.#environment, this.#store, this.contextWindow, this.#models);
       return boundary;
     }
     return this.#compactor().compact({ force: true });
@@ -1003,7 +1030,10 @@ export class MainSession {
     // After the opening frame, so a client callback that throws cannot leave the sink
     // attached to a queue no turn will ever drain.
     const detachAsides = this.app.bus.attach(this.app.sessionName, {
-      deliver: (message) => { steering.aside({ from: message.from, ...(message.text === undefined ? {} : { text: message.text }), ...(message.data === undefined ? {} : { data: message.data }), messageId: message.id }); },
+      // `reply` is false once the sender's peer is gone from the bus — a child whose name was
+      // released after a terminal failure. The footer then says so instead of documenting a
+      // `hub send` that would address nobody.
+      deliver: (message) => { steering.aside({ from: message.from, ...(message.text === undefined ? {} : { text: message.text }), ...(message.data === undefined ? {} : { data: message.data }), messageId: message.id, reply: message.reply ?? this.app.bus.getPeer(message.from) !== undefined }); },
       consume: (ids) => { steering.consume(ids); },
     });
     try {
@@ -1122,7 +1152,7 @@ export class MainSession {
     this.#store.append({ type: "provider_switch", provider: next.providerName, model: next.model, apiType: next.provider.transport.apiType, losses: [] });
     this.#environment = next;
     this.#updateEnvironment(next);
-    this.#loop = createLoop(this.app, next, this.#store, this.contextWindow);
+    this.#loop = createLoop(this.app, next, this.#store, this.contextWindow, this.#models);
     this.#emit([{ sessionUpdate: "model_changed", provider: next.providerName, model: next.model, apiType: next.provider.transport.apiType }]);
     await previous.provider.transport.close?.();
     void this.refreshModels(false).catch(() => undefined);
@@ -1133,7 +1163,7 @@ export class MainSession {
     this.#store.close();
     this.#store = store;
     this.#path = path;
-    this.#loop = createLoop(this.app, this.#environment, store, this.contextWindow);
+    this.#loop = createLoop(this.app, this.#environment, store, this.contextWindow, this.#models);
     this.#contextTokens = undefined;
     this.#encoder = new SessionUpdateEncoder({ sessionId: store.descriptor.sessionId, usage: () => this.usageContext() });
     this.#emit([{ sessionUpdate: "session_changed", descriptor: { ...store.descriptor }, reason }]);
@@ -1353,7 +1383,13 @@ export function attachAgentLifecycle(app: LyraApplication, emit: (update: Sessio
       }
     } catch { /* a bus that refuses a name must not stop the child it names */ }
     try {
-      app.bus.publish({ channel: SPAWN_LIFECYCLE_CHANNEL, text: describeLifecycle(event), data: event });
+      // Prose only. This used to carry `data: event` as well, so every lifecycle delivery
+      // arrived three times over: the sentence, a full JSON object restating the same
+      // fields, and the aside envelope's instruction footer — roughly 3x the tokens per
+      // event, for one fact. The sentence now carries the fields that matter inline
+      // (`describeLifecycle`), and clients that want the structured form already get it
+      // from the `agent` session update below, which is the channel built for machines.
+      app.bus.publish({ channel: SPAWN_LIFECYCLE_CHANNEL, text: describeLifecycle(event) });
       // And addressed straight to whoever asked for the child, when it ends.
       //
       // The channel alone is not enough: `hub wait` with no channel waits on the caller's
@@ -1364,6 +1400,17 @@ export function attachAgentLifecycle(app: LyraApplication, emit: (update: Sessio
       // turn, or waking its wait.
       if (SPAWN_TERMINAL_STATES.includes(event.status)) notifyParent(app, event);
     } catch { /* publishing is observation; it never fails the job */ }
+    // The manager gave the name back — a child that failed at resolution never ran, so
+    // nothing addressed to it could revive it and holding the name is pure cost. The
+    // observed price of not doing this: the user named their retry `stylist2`, defensively,
+    // because nothing told them `stylist` was free again. Released *after* the announcement
+    // because `bus.send` requires a registered sender, so freeing it first would drop the
+    // one notice that tells the parent its child is gone; the notice carries `reply: false`
+    // so its footer never documents a `hub send` to a name that is already released.
+    if (event.peerReleased === true && registered.has(event.peer)) {
+      registered.delete(event.peer);
+      try { app.bus.unregister(event.peer); } catch { /* already gone */ }
+    }
     // Guarded like everything else here: a client callback that throws must not stop the
     // sweep below, or peers for children that no longer exist accumulate on the bus.
     try { emit(agentUpdate(event)); } catch { /* observation never fails the job */ }
@@ -1390,21 +1437,57 @@ function notifyParent(app: LyraApplication, event: SpawnLifecycleEvent): void {
   if (parent === undefined || parent === event.peer) return;
   const state = app.bus.getPeer(parent)?.state;
   if (state === undefined || state === "parked" || state === "completed" || state === "failed") return;
-  try { app.bus.send({ from: event.peer, to: parent, text: describeLifecycle(event), data: event }); } catch { /* the channel still carries it */ }
+  try { app.bus.send({ from: event.peer, to: parent, text: describeLifecycle(event), reply: isRevivable(event) }); } catch { /* the channel still carries it */ }
 }
 
-/** One sentence a human or a model can read off the `agents` channel without parsing JSON. */
+/**
+ * One sentence a human or a model can read off the `agents` channel without parsing JSON.
+ *
+ * It is the *only* encoding of the event on the bus now, so it carries every field a reader
+ * would otherwise have gone to the JSON blob for — the spawn id, the peer name, the terminal
+ * state, the work done — and it ends with the one next step that actually applies. Prose
+ * with the facts inline costs about a third of what prose-plus-JSON-plus-footer did, and a
+ * model reading it never has to reconcile two spellings of the same event.
+ */
 function describeLifecycle(event: SpawnLifecycleEvent): string {
   const name = event.label === undefined || event.label === event.peer ? event.peer : `${event.peer} (${event.label})`;
+  const at = `${name} [${event.id}, ${event.status}]`;
+  const work = `${event.toolCalls} tool call(s), ${event.filesModified} file(s) changed`;
   switch (event.type) {
-    case "spawned": return `${name} was spawned.`;
-    case "started": return `${name} started.`;
-    case "revived": return `${name} was revived by a message.`;
-    case "completed": return `${name} completed after ${event.toolCalls} tool call(s), ${event.filesModified} file(s) changed. Collect it with spawn { id: "${event.id}" }.`;
-    case "failed": return `${name} failed: ${event.error ?? "no reason was reported"}.`;
-    case "timed_out": return `${name} ran out of time: ${event.error ?? "its deadline expired"}.`;
-    case "cancelled": return `${name} was cancelled.`;
+    case "spawned": return `${at} was spawned.`;
+    case "started": return `${at} started.`;
+    case "revived": return `${at} was revived by a message.`;
+    case "completed": return `${at} completed after ${work}. Collect it with spawn { id: "${event.id}" }.`;
+    case "failed": return `${at} failed after ${work}: ${event.error ?? "no reason was reported"}. ${terminalNextStep(event)}`;
+    case "timed_out": return `${at} ran out of time after ${work}: ${event.error ?? "its deadline expired"}. ${terminalNextStep(event)}`;
+    case "cancelled": return `${at} was cancelled after ${work}. ${terminalNextStep(event)}`;
   }
+}
+
+/**
+ * The next move after a child ended badly — and, when there is none, silence about reviving.
+ *
+ * The observed failure: a child whose *model reference could not be resolved* was announced
+ * with `hub send to:"stylist"` as the suggested recovery. Reviving a child that failed
+ * before its first run is undefined — there is no transcript to continue and the resolution
+ * failure recurs — so that instruction sent the parent down a path that could not work.
+ */
+function terminalNextStep(event: SpawnLifecycleEvent): string {
+  return isRevivable(event)
+    ? `Send it a follow-up with hub { op: "send", to: "${event.peer}", message: "..." }, or read what it did with spawn { id: "${event.id}" }.`
+    : `It never ran, so there is nothing to revive — fix the request and spawn again.`;
+}
+
+/**
+ * Whether a terminal child can be revived by a message.
+ *
+ * Read straight off the lifecycle event so the notice and the manager cannot drift: `revive`
+ * refuses a resolution-failed child, and this is the same fact told to the parent. Absent
+ * only on transitions the manager has no opinion about, where a transcript exists and a
+ * follow-up is therefore meaningful.
+ */
+function isRevivable(event: SpawnLifecycleEvent): boolean {
+  return event.revivable ?? true;
 }
 
 /** The protocol shape of one transition, for a client's presence strip. */
@@ -1428,11 +1511,23 @@ function agentUpdate(event: SpawnLifecycleEvent): SessionUpdate {
   };
 }
 
-function createLoop(app: LyraApplication, environment: EnvironmentProvider, store: TranscriptStore, contextWindow: number): AgentLoop {
+/**
+ * `maxOutputTokens` is looked up here rather than defaulted inside the loop so a known model
+ * asks for its own published ceiling on the very first turn. A model the catalogue does not
+ * cover — or one whose catalogue has not loaded yet — resolves to `MAX_OUTPUT_TOKENS_ASK`
+ * and the provider's own 400 corrects it once; what must never happen again is a quiet
+ * 4096-token ceiling nobody chose (§3.8).
+ */
+function createLoop(app: LyraApplication, environment: EnvironmentProvider, store: TranscriptStore, contextWindow: number, models: readonly ModelInfo[] = []): AgentLoop {
   // The checkpointer reads the transcript head at the moment it snapshots, so a pre-tool
   // checkpoint is anchored to the assistant message that asked for the tool call — which is
   // what makes "rewind the conversation and the code together" one operation.
-  return new AgentLoop({ provider: environment.provider, store, tools: app.tools, model: environment.model, system: systemPrompt(app, app.cwd, store.descriptor.name), contextWindow, workspace: app.cwd, checkpointer: app.checkpointer(() => store.head.id), turnTimeoutMs: durationMs(app.config.reliability.turn_timeout), compactor: new Compactor({ transcript: store, summaryGenerator: new ProviderSummaryGenerator({ provider: environment.provider, model: environment.model }), contextWindow, threshold: app.config.reliability.compact_at }), loopDetector: new LoopDetector() });
+  return new AgentLoop({ provider: environment.provider, store, tools: app.tools, model: environment.model, system: systemPrompt(app, app.cwd, store.descriptor.name), contextWindow, maxOutputTokens: resolveMaxOutputTokens(modelMaxOutputTokens(models, environment.model)), workspace: app.cwd, checkpointer: app.checkpointer(() => store.head.id), turnTimeoutMs: durationMs(app.config.reliability.turn_timeout), compactor: new Compactor({ transcript: store, summaryGenerator: new ProviderSummaryGenerator({ provider: environment.provider, model: environment.model }), contextWindow, threshold: app.config.reliability.compact_at }), loopDetector: new LoopDetector() });
+}
+
+/** The published output ceiling for a model, when the active provider's catalogue knows one. */
+function modelMaxOutputTokens(models: readonly ModelInfo[], model: string): number | undefined {
+  return models.find((candidate) => candidate.id === model)?.maxOutputTokens;
 }
 
 function systemPrompt(app: LyraApplication, workspace: string, session: string, definitions: readonly { name: string; description: string }[] = app.tools.definitions()): string {

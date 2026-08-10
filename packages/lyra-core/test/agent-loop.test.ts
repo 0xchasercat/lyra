@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   classifyProviderError,
+  MAX_OUTPUT_TOKENS_ASK,
   ProviderFault,
   ReliableProvider,
   type ProviderRequest,
@@ -421,6 +422,96 @@ describe("AgentLoop", () => {
       hardStopRequested: true,
       warning: { type: "no_progress", turns: 1 },
     }));
+    store.close();
+  });
+
+
+  /**
+   * The output-token ask, end to end.
+   *
+   * `ProviderRequest.maxOutputTokens` existed from the start and nothing ever populated it,
+   * so every turn fell through to the Anthropic transport's 4096-token default: a Fable 5
+   * review was cut at ~4k, stopped mid-sentence, and was recorded as `truncated`. The loop is
+   * the seam that fills it — the model's own published ceiling when one is known, and the
+   * deliberately high `MAX_OUTPUT_TOKENS_ASK` when it is not.
+   */
+  test("every request asks for the model's maximum output tokens", async () => {
+    const store = createStore();
+    const fixture = scriptedTransport([
+      async function* () {
+        yield { type: "text_delta", text: "ok" };
+        yield { type: "complete", stopReason: "end_turn" };
+      },
+    ]);
+    const loop = new AgentLoop({
+      provider: reliable(fixture.transport),
+      store,
+      tools: emptyRegistry(),
+      model: "claude-haiku-4-5",
+      system: "stable",
+      contextWindow: 200_000,
+      maxOutputTokens: 64_000,
+      workspace: "/workspace",
+    });
+
+    await settleTurn(loop.runTurn("write something long"));
+
+    expect(fixture.requests[0]?.maxOutputTokens).toBe(64_000);
+    store.close();
+  });
+
+  test("a model with no published ceiling asks high rather than guessing low", async () => {
+    const store = createStore();
+    const fixture = scriptedTransport([
+      async function* () {
+        yield { type: "text_delta", text: "ok" };
+        yield { type: "complete", stopReason: "end_turn" };
+      },
+    ]);
+    const loop = new AgentLoop({
+      provider: reliable(fixture.transport),
+      store,
+      tools: emptyRegistry(),
+      model: "some-local-model",
+      system: "stable",
+      contextWindow: 32_000,
+      workspace: "/workspace",
+    });
+
+    await settleTurn(loop.runTurn("write something long"));
+
+    expect(fixture.requests[0]?.maxOutputTokens).toBe(MAX_OUTPUT_TOKENS_ASK);
+    store.close();
+  });
+
+  test("the truncation marker names the ceiling that fired and the lever that raises it", async () => {
+    const store = createStore();
+    const fixture = scriptedTransport([
+      async function* () {
+        yield { type: "text_delta", text: "the review begins" };
+        yield { type: "complete", stopReason: "max_tokens" };
+      },
+    ]);
+    const loop = new AgentLoop({
+      provider: reliable(fixture.transport),
+      store,
+      tools: emptyRegistry(),
+      model: "claude-haiku-4-5",
+      system: "stable",
+      contextWindow: 200_000,
+      maxOutputTokens: 64_000,
+      workspace: "/workspace",
+    });
+
+    const outcome = await settleTurn(loop.runTurn("write the review"));
+
+    // §3.3 keeps this terminal — no silent auto-continue — so the marker has to carry
+    // everything a reader needs to act, rather than reading as "the model gave up".
+    expect(outcome.result.stopReason).toBe("max_tokens");
+    const marker = outcome.result.assistant.content.at(-1);
+    expect(marker).toEqual(expect.objectContaining({ type: "marker", reason: "truncated" }));
+    expect((marker as { detail: string }).detail).toContain("64000-token output limit");
+    expect((marker as { detail: string }).detail).toContain("maxOutputTokens");
     store.close();
   });
 

@@ -11,6 +11,16 @@ export interface ModelInfo {
   id: string;
   ownedBy?: string;
   contextWindow?: number;
+  /**
+   * The most output tokens this model will produce in one response.
+   *
+   * A separate fact from `contextWindow`, and the one nothing used to know: every request
+   * went out with the Anthropic transport's 4096-token floor, so a long reply died
+   * mid-sentence with a `truncated` marker and the user was told the model had stopped.
+   * Populated here so `resolveMaxOutputTokens` can ask for the model's *maximum* on every
+   * request (§3.8: a ceiling nobody chose is a silent loss, not a safety margin).
+   */
+  maxOutputTokens?: number;
   inputPricePerMillion?: number;
   outputPricePerMillion?: number;
 }
@@ -29,6 +39,16 @@ export interface ModelDiscoveryOptions {
   headersTimeoutMs?: number;
 }
 
+/**
+ * Facts about published models that no `/models` route reports.
+ *
+ * `maxOutputTokens` is the model's own per-response ceiling, and the Anthropic family's
+ * values are the published ones: the whole current generation — Fable 5, Opus 5, Opus
+ * 4.8/4.7/4.6, Sonnet 5, Sonnet 4.6 — caps at 128K, and only Haiku 4.5 is lower, at 64K.
+ * The OpenAI-family rows deliberately leave it undefined: nothing here knows their output
+ * caps, and `resolveMaxOutputTokens` handles an unknown model by asking high and learning
+ * the real limit from the provider's own 400 rather than inventing a low number.
+ */
 const KNOWN_MODELS: Readonly<Record<string, Partial<ModelInfo>>> = {
   "gpt-5.6": {
     contextWindow: 1_050_000,
@@ -55,18 +75,63 @@ const KNOWN_MODELS: Readonly<Record<string, Partial<ModelInfo>>> = {
     inputPricePerMillion: 2.5,
     outputPricePerMillion: 15,
   },
+  "claude-fable-5": {
+    contextWindow: 1_000_000,
+    maxOutputTokens: 128_000,
+    inputPricePerMillion: 10,
+    outputPricePerMillion: 50,
+  },
+  "claude-mythos-5": {
+    contextWindow: 1_000_000,
+    maxOutputTokens: 128_000,
+    inputPricePerMillion: 10,
+    outputPricePerMillion: 50,
+  },
   "claude-opus-5": {
     contextWindow: 1_000_000,
+    maxOutputTokens: 128_000,
     inputPricePerMillion: 5,
     outputPricePerMillion: 25,
   },
+  "claude-opus-4-8": {
+    contextWindow: 1_000_000,
+    maxOutputTokens: 128_000,
+    inputPricePerMillion: 5,
+    outputPricePerMillion: 25,
+  },
+  "claude-opus-4-7": {
+    contextWindow: 1_000_000,
+    maxOutputTokens: 128_000,
+    inputPricePerMillion: 5,
+    outputPricePerMillion: 25,
+  },
+  "claude-opus-4-6": {
+    contextWindow: 1_000_000,
+    maxOutputTokens: 128_000,
+    inputPricePerMillion: 5,
+    outputPricePerMillion: 25,
+  },
+  "claude-sonnet-5": {
+    contextWindow: 1_000_000,
+    maxOutputTokens: 128_000,
+    inputPricePerMillion: 3,
+    outputPricePerMillion: 15,
+  },
+  "claude-sonnet-4-6": {
+    contextWindow: 1_000_000,
+    maxOutputTokens: 128_000,
+    inputPricePerMillion: 3,
+    outputPricePerMillion: 15,
+  },
   "claude-haiku-4-5": {
     contextWindow: 200_000,
+    maxOutputTokens: 64_000,
     inputPricePerMillion: 1,
     outputPricePerMillion: 5,
   },
   "claude-haiku-4.5": {
     contextWindow: 200_000,
+    maxOutputTokens: 64_000,
     inputPricePerMillion: 1,
     outputPricePerMillion: 5,
   },
@@ -200,10 +265,17 @@ function parseModels(body: unknown): ModelInfo[] {
     const reportedContext = typeof item.max_input_tokens === "number"
       ? item.max_input_tokens
       : undefined;
+    // `max_tokens` on a model listing is the *output* cap, the sibling of `max_input_tokens`.
+    // A provider that reports it is more current than any table shipped in this file, and
+    // `augmentModel` lets the reported value win over the built-in row for that reason.
+    const reportedOutput = typeof item.max_tokens === "number" && item.max_tokens > 0
+      ? item.max_tokens
+      : undefined;
     result.push({
       id: item.id,
       ...(typeof item.owned_by === "string" ? { ownedBy: item.owned_by } : {}),
       ...(reportedContext === undefined ? {} : { contextWindow: reportedContext }),
+      ...(reportedOutput === undefined ? {} : { maxOutputTokens: reportedOutput }),
     });
   }
   return result.sort((left, right) => left.id.localeCompare(right.id));

@@ -530,6 +530,10 @@ export class WriteTool extends FileToolBase {
       // A tag is only ever demanded for a file that already exists, so the error names the
       // read that produces it rather than leaving the model to infer where a #TAG comes from.
       if (!result.ok) return fail(result.code === "stale_hash" ? `${result.message} Call read({ path: ${JSON.stringify(pathValue)} }) and send the #TAG it returns as tag.` : result.message);
+      // The engine's success shape is the model-facing payload verbatim, so a write reports
+      // `created` and byte counts and nothing about tiers or occurrences — those were trimmed
+      // in the type (@lyra/edit `WriteSuccess`) rather than filtered out here, because a field
+      // that no mode can honestly fill should not exist for `write` to have to hide.
       return ok(jsonResult({ ...result, path: pathValue }), { filesModified: [{ path: pathValue, afterHash: result.tag }] });
     } catch (error) {
       return fail(`Unable to write ${String((input as { path?: unknown })?.path ?? "the requested path")}: ${errorMessage(error)} Check the path and permissions, then retry.`);

@@ -68,6 +68,35 @@ describe("EditEngine boundaries", () => {
     expect(files.files.get("existing.txt")).toBe("safe");
   });
 
+  /**
+   * A whole-file write matches nothing, so no tier fired and there is no occurrence to count.
+   * Both fields were reported anyway — `tier: "not_applied"`, the marker for a call that
+   * changed nothing, on a call that had just created the file — so the success type omits
+   * them for this mode and says created-vs-overwritten instead, which a write does know.
+   */
+  test("a whole-file write reports created, never a tier or an occurrence count", async () => {
+    const files = new MemoryFileSystem();
+    const engine = new EditEngine(files);
+
+    const created = await engine.write("fresh.txt", "one\n");
+    expect(created).toMatchObject({ ok: true, mode: "write", created: true, changed: true, bytesBefore: 0, bytesAfter: 4 });
+    expect(created).not.toHaveProperty("tier");
+    expect(created).not.toHaveProperty("occurrences");
+
+    const read = await engine.read({ path: "fresh.txt" });
+    expect(read.ok).toBe(true);
+    if (!read.ok) return;
+    const overwritten = await engine.write("fresh.txt", "two\n", read.tag);
+    expect(overwritten).toMatchObject({ ok: true, mode: "write", created: false, bytesBefore: 4 });
+
+    // The same engine still reports both for a replacement, where they mean something (§6.2).
+    const reread = await engine.read({ path: "fresh.txt" });
+    expect(reread.ok).toBe(true);
+    if (!reread.ok) return;
+    const replaced = await engine.apply({ mode: "search_replace", path: "fresh.txt", tag: reread.tag, search: "two", replace: "three" });
+    expect(replaced).toMatchObject({ ok: true, mode: "search_replace", tier: "exact", occurrences: 1 });
+  });
+
   test("counts one terminal tier for every apply call", async () => {
     const files = new MemoryFileSystem();
     files.files.set("metrics.txt", "value\n");

@@ -1,4 +1,5 @@
 import { classifyProviderError, ProviderFault } from "./errors.ts";
+import { halveOutputCap, isOutputCapFault, OutputCapMemory, parseOutputCap } from "./output-limit.ts";
 import type {
   ProviderEvent,
   ProviderRequest,
@@ -21,10 +22,23 @@ export interface ReliableProviderOptions {
   sleep?: (ms: number, signal: AbortSignal) => Promise<void>;
   compact?: (request: ProviderRequest) => Promise<ProviderRequest>;
   refreshAuth?: () => Promise<void>;
+  /**
+   * Where output-token ceilings learned from this provider's own 400s are remembered.
+   *
+   * Injectable so a caller can share one memory across providers that front the same
+   * endpoint, or inspect what was learned; the default is a fresh per-provider memory,
+   * which is the scope the fact actually has.
+   */
+  outputCaps?: OutputCapMemory;
 }
+
+/** How many times one turn may lower its output ask before the refusal is surfaced. */
+const MAX_OUTPUT_CAP_RETRIES = 3;
 
 export class ReliableProvider {
   readonly transport: ProviderTransport;
+  /** Output ceilings this provider has stated, so the discovery 400 is paid once. */
+  readonly outputCaps: OutputCapMemory;
   readonly options: Required<Pick<
     ReliableProviderOptions,
     "maxAttempts" | "headersTimeoutMs" | "streamStallTimeoutMs" | "turnTimeoutMs" | "random" | "sleep"
@@ -32,6 +46,7 @@ export class ReliableProvider {
 
   constructor(transport: ProviderTransport, options: ReliableProviderOptions = {}) {
     this.transport = transport;
+    this.outputCaps = options.outputCaps ?? new OutputCapMemory();
     this.options = {
       maxAttempts: options.maxAttempts ?? 8,
       headersTimeoutMs: options.headersTimeoutMs ?? 30_000,
@@ -50,11 +65,16 @@ export class ReliableProvider {
   ): AsyncGenerator<ReliableProviderEvent> {
     const turnTimeout = AbortSignal.timeout(this.options.turnTimeoutMs);
     const outerSignal = signal === undefined ? turnTimeout : AbortSignal.any([signal, turnTimeout]);
-    let request = initialRequest;
+    // The ask starts at whatever the caller resolved from model metadata, lowered by
+    // anything this provider has already refused for this model in this session. Without
+    // the clamp the first turn after a discovery 400 would ask too high again and pay the
+    // round trip a second time.
+    let request = applyLearnedOutputCap(initialRequest, this.outputCaps);
     let transientAttempts = 0;
     let contentShapeRetries = 0;
     let contextRetries = 0;
     let authRetries = 0;
+    let outputCapRetries = 0;
 
     for (let attempt = 1; attempt <= this.options.maxAttempts; attempt += 1) {
       const attemptController = new AbortController();
@@ -119,6 +139,35 @@ export class ReliableProvider {
           throw outerSignal.reason;
         }
 
+        // Checked ahead of the classification switch because an output-cap rejection is a
+        // fact about *our own* request field, not about the conversation: it classifies as a
+        // plain `bad_request`, which would surface a raw 400 for a number the user never
+        // chose. §3.8's rule is that Lyra's own guess must never become the user's error.
+        if (isOutputCapFault(fault) && outputCapRetries < MAX_OUTPUT_CAP_RETRIES) {
+          const asked = request.maxOutputTokens;
+          const stated = parseOutputCap(fault.providerMessage, asked);
+          const next = stated ?? (asked === undefined ? undefined : halveOutputCap(asked));
+          if (next !== undefined && (asked === undefined || next < asked)) {
+            this.outputCaps.learn(request.model, next);
+            request = { ...request, maxOutputTokens: next };
+            outputCapRetries += 1;
+            yield {
+              type: "retry",
+              attempt: attempt + 1,
+              maxAttempts: this.options.maxAttempts,
+              // Retries are visible (§3.2), and this one is worth reading: it says the
+              // provider named a lower ceiling and the turn is being re-asked against it.
+              reason: `${fault.classification}: lowering the output-token ask to ${next} — ${fault.providerMessage}`,
+              classification: fault.classification,
+              providerMessage: fault.providerMessage,
+              delayMs: 0,
+              retryAtMs: Date.now(),
+              resetsPartialOutput: produced,
+            };
+            continue;
+          }
+        }
+
         const action = await this.recoveryAction(fault, {
           request,
           transientAttempts,
@@ -126,7 +175,9 @@ export class ReliableProvider {
           contextRetries,
           authRetries,
         });
-        if (action.type === "surface") throw fault;
+        if (action.type === "surface") {
+          throw isOutputCapFault(fault) ? unrecoverableOutputCap(fault, request) : fault;
+        }
         if (action.type === "compact") {
           request = action.request;
           contextRetries += 1;
@@ -199,6 +250,36 @@ export class ReliableProvider {
         return { type: "surface" };
     }
   }
+}
+
+/** Lower a request's output ask to whatever this provider has already proven it accepts. */
+function applyLearnedOutputCap(request: ProviderRequest, caps: OutputCapMemory): ProviderRequest {
+  const clamped = caps.clamp(request.model, request.maxOutputTokens);
+  if (clamped === request.maxOutputTokens || clamped === undefined) return request;
+  return { ...request, maxOutputTokens: clamped };
+}
+
+/**
+ * The sentence a user reads when even the lowered ask was refused.
+ *
+ * The provider's own words are kept, because they are the only evidence of what it actually
+ * wants — but they arrive wrapped in the one piece of context the raw 400 lacks: the number
+ * Lyra asked for and where that number came from. A bare `max_tokens: 128000 > 64000` reads
+ * as the user's mistake, and it never was one.
+ */
+function unrecoverableOutputCap(fault: ProviderFault, request: ProviderRequest): ProviderFault {
+  return new ProviderFault({
+    classification: fault.classification,
+    providerMessage:
+      `The provider refused this turn's output-token request of ${request.maxOutputTokens ?? "(unset)"} for ${request.model}`
+      + ` and did not state a limit Lyra could retry with: ${fault.providerMessage}.`
+      + ` Set the model's real output ceiling in its provider configuration.`,
+    ...(fault.status === undefined ? {} : { status: fault.status }),
+    ...(fault.code === undefined ? {} : { code: fault.code }),
+    raw: fault.raw,
+    cause: fault,
+    ...(fault.url === undefined ? {} : { url: fault.url }),
+  });
 }
 
 function isContentEvent(event: TransportEvent): boolean {

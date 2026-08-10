@@ -96,7 +96,11 @@ const HUB_DEFINITION: ToolDefinition = Object.freeze({
   description:
     "Talk to the other agents in this session. send addresses one peer by name, publish fans out to a channel, wait blocks for the next message with a deadline, inbox drains what arrived, list shows every peer with its state. " +
     "A message to a running agent folds into its next turn; a message to a finished one revives it. " +
-    "Channel \"agents\" carries every child's lifecycle.",
+    // Said because the default was invisible and read as the opposite: your own children's
+    // endings are addressed to you, so `hub wait` with no channel already sees them. A model
+    // that believes it must subscribe first waits on a channel it never joined.
+    "Your own children's terminal events are addressed to you directly and arrive without subscribing — a plain wait or inbox sees them. " +
+    "Subscribe to channel \"agents\" for the whole swarm's lifecycle, including children you did not spawn.",
   inputSchema: {
     type: "object",
     properties: {
@@ -288,7 +292,7 @@ export class SpawnTool implements LyraTool {
   constructor(private readonly manager: SpawnManager, private readonly parent?: SpawnParentContext) {}
   normalize(args: unknown): unknown | string { return normalizeSpawnArgs(args); }
 
-  async execute(input: unknown, _context: ToolExecutionContext): Promise<ToolExecutionResult> {
+  async execute(input: unknown, context: ToolExecutionContext): Promise<ToolExecutionResult> {
     try {
       const normalized = normalizeSpawnArgs(input);
       if (typeof normalized === "string") return { content: `Invalid spawn arguments: ${normalized}`, isError: true };
@@ -301,19 +305,37 @@ export class SpawnTool implements LyraTool {
         if (op === "cancel") return this.cancel(reference);
         return this.collect(reference, numberField(value, "timeoutMs"));
       }
-      return this.start(value);
+      return await this.start(value, context.signal);
     } catch (error) { return failed("Spawn", error); }
   }
 
-  /** Start a child. Non-blocking answers with the two names the rest of the loop needs. */
-  private async start(value: Record<string, unknown>): Promise<ToolExecutionResult> {
+  /**
+   * Start a child. Non-blocking answers with the two names the rest of the loop needs.
+   *
+   * The model is resolved *here*, before anything is queued. It used to be resolved inside
+   * the child's own first turn, which meant `spawn { model: "claude-max/opus-5" }` answered
+   * `status: running` with a handle to an agent that could never run, and the reason —
+   * `model: opus-5`, prefix stripped, cause unnamed — reached the parent through the bus
+   * minutes later. A model this session cannot serve is a mistake in *this* call, so it is
+   * reported as this call's result and no child is created.
+   */
+  private async start(value: Record<string, unknown>, signal?: AbortSignal): Promise<ToolExecutionResult> {
     const request = spawnRequest(value);
+    try {
+      await this.manager.assertModelUsable(request.model, signal);
+    } catch (error) {
+      return { content: `No child was started: ${error instanceof Error ? error.message : String(error)} Correct the model and call spawn again, or omit model entirely to inherit this session's.`, isError: true };
+    }
     if (request.blocking === true) {
       const { blocking: _blocking, ...rest } = request;
       const handle = this.manager.spawn({ ...rest, blocking: false }, this.parent);
       return this.collect(handle.id, numberField(value, "timeoutMs"));
     }
     const handle = this.manager.spawn({ ...request, blocking: false }, this.parent);
+    // Read back rather than echoed: a `writeScope` is written relative to a tree the call
+    // never names, and the resolved paths are the only way a parent that rooted it wrongly
+    // finds out now instead of at the child's first refused write.
+    const started = this.manager.status(handle.id);
     return {
       content: JSON.stringify({
         id: handle.id,
@@ -321,6 +343,7 @@ export class SpawnTool implements LyraTool {
         status: handle.status,
         ...(handle.label === undefined ? {} : { label: handle.label }),
         workspace: handle.workspace,
+        ...(started?.writeScope === undefined ? {} : { writeScope: started.writeScope, writeScopeResolved: started.writeScopeResolved }),
         next: `Collect with spawn { id: ${JSON.stringify(handle.id)} }, check on it with spawn { id: ${JSON.stringify(handle.id)}, op: "status" }, or talk to it with hub { op: "send", to: ${JSON.stringify(handle.peer)}, message: "..." }.`,
       }),
     };
@@ -354,7 +377,12 @@ export class SpawnTool implements LyraTool {
           status: status?.status ?? "failed",
           error: error instanceof Error ? error.message : String(error),
           ...(status === undefined ? {} : { detail: status }),
-          next: `The child did not produce a result. Read its partialOutput and lastActivity above, then either re-spawn it with a narrower task or send it a message with hub { op: "send", to: ${JSON.stringify(before.peer)} } to revive it with corrected instructions.`,
+          // A child that died at resolution never ran, so the revive path is not merely
+          // unhelpful here — it is the one instruction that cannot work, aimed at the one
+          // failure it cannot repair. Its name is already free for the replacement to take.
+          next: status?.revivable === false
+            ? `The child never ran, so there is nothing to revive and its name ${JSON.stringify(before.peer)} has been released. Fix the spawn call — the error above says what could not be resolved — and start a new child with spawn { task: "..." }.`
+            : `The child did not produce a result. Read its partialOutput and lastActivity above, then either re-spawn it with a narrower task or send it a message with hub { op: "send", to: ${JSON.stringify(before.peer)} } to revive it with corrected instructions.`,
         }),
         isError: true,
       };

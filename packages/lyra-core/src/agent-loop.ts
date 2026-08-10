@@ -5,7 +5,7 @@ import type {
   ToolDefinition,
   ToolUseBlock,
 } from "@lyra/provider";
-import { ProviderFault, ReliableProvider } from "@lyra/provider";
+import { ProviderFault, ReliableProvider, resolveMaxOutputTokens } from "@lyra/provider";
 import type { MessageEntry, TranscriptEntry } from "@lyra/session";
 import { TranscriptStore } from "@lyra/session";
 import type { Compactor } from "./compaction.ts";
@@ -33,6 +33,12 @@ export interface AgentLoopOptions {
   model: string;
   system: string;
   contextWindow: number;
+  /**
+   * The model's own output-token ceiling. Defaults to `MAX_OUTPUT_TOKENS_ASK` — the rule is
+   * that every request asks for the model's maximum, and an unknown model is asked high and
+   * corrected by the provider rather than capped by a guess (see `output-limit.ts`).
+   */
+  maxOutputTokens?: number;
   workspace: string;
   imageByteLimit?: number;
   toolTimeoutMs?: number;
@@ -69,6 +75,7 @@ export class AgentLoop {
   private readonly store: TranscriptStore;
   private readonly dispatcher: ToolDispatcher;
   private readonly derivationOptions: ContextDerivationOptions;
+  private readonly maxOutputTokens: number;
   private readonly turnTimeoutMs: number;
   private readonly sessionId: string;
   private readonly workspace: string;
@@ -81,12 +88,14 @@ export class AgentLoop {
     this.store = options.store;
     this.system = options.system;
     this.definitions = snapshotDefinitions(options.tools.definitions());
+    this.maxOutputTokens = resolveMaxOutputTokens(options.maxOutputTokens);
     this.derivationOptions = Object.freeze({
       model: options.model,
       system: this.system,
       apiType: options.provider.transport.apiType,
       tools: this.definitions,
       contextWindow: options.contextWindow,
+      maxOutputTokens: this.maxOutputTokens,
       ...(options.imageByteLimit === undefined ? {} : { imageByteLimit: options.imageByteLimit }),
     });
     this.dispatcher = new ToolDispatcher(
@@ -281,6 +290,7 @@ export class AgentLoop {
                 turnEntries,
                 content,
                 event.stopReason,
+                this.maxOutputTokens,
               );
               yield event;
 
@@ -454,6 +464,7 @@ function appendCompletedAssistant(
   entries: TranscriptEntry[],
   content: ContentBlock[],
   stopReason: StopReason,
+  maxOutputTokens: number,
 ): MessageEntry {
   if (stopReason === "cancelled") {
     return appendMessage(store, entries, {
@@ -468,7 +479,11 @@ function appendCompletedAssistant(
       content: [...content, {
         type: "marker",
         reason: "truncated",
-        detail: "The provider reached its output-token limit; the partial response was retained.",
+        // §3.3 keeps this terminal — there is no silent auto-continue — but a marker that
+        // does not name the ceiling reads as "the model gave up". It names the number and
+        // the lever instead. With real per-model caps wired this should be rare: it now
+        // means the model genuinely exhausted its own maximum, not Lyra's old 4096 floor.
+        detail: `The provider reached its ${maxOutputTokens}-token output limit; the partial response was retained. Raise maxOutputTokens for this model, or ask for the remainder in a follow-up turn.`,
       }],
       status: "interrupted",
     });

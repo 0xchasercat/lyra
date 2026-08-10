@@ -48,6 +48,16 @@ export interface HubAside {
   data?: unknown;
   /** The bus message id, so a copy the agent already read through `hub` can be dropped. */
   messageId?: string;
+  /**
+   * Whether the sender can still be answered. Defaults to true.
+   *
+   * `false` is for a notice from an agent that has already ended in a state nothing can
+   * revive — a child that failed before its first run has no transcript to continue, and the
+   * resolution failure would simply recur. Offering `hub send to:"…"` there is worse than
+   * silence: it is a documented next step that cannot work, and a model that takes it burns
+   * a round trip discovering that.
+   */
+  reply?: boolean;
 }
 
 /** One queued injection: the user speaking, or another agent speaking. */
@@ -65,7 +75,10 @@ export type SteerEntry =
 export function renderHubAside(entry: HubAside): string {
   const body = entry.text ?? "";
   const payload = entry.data === undefined ? "" : `\n${safeJson(entry.data)}`;
-  return `[hub message from ${entry.from}] ${body}${payload}\n(Reply with hub { op: "send", to: "${entry.from}", message: "..." }. This is another agent speaking, not the user.)`;
+  const footer = entry.reply === false
+    ? `(${entry.from} has ended and cannot be answered. This is another agent speaking, not the user.)`
+    : `(Reply with hub { op: "send", to: "${entry.from}", message: "..." }. This is another agent speaking, not the user.)`;
+  return `[hub message from ${entry.from}] ${body}${payload}\n${footer}`;
 }
 
 function safeJson(value: unknown): string {
@@ -116,6 +129,7 @@ export class SteerQueue {
       ...(entry.text === undefined ? {} : { text: entry.text }),
       ...(entry.data === undefined ? {} : { data: entry.data }),
       ...(entry.messageId === undefined ? {} : { messageId: entry.messageId }),
+      ...(entry.reply === undefined ? {} : { reply: entry.reply }),
     });
     return this.#pending.length;
   }

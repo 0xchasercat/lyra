@@ -1,4 +1,4 @@
-import { IrcBus, SpawnManager, SteerQueue, type SpawnExecutor, type SpawnExecutorContext } from "@lyra/core";
+import { IrcBus, SpawnManager, SpawnResolutionError, SteerQueue, type SpawnExecutor, type SpawnExecutorContext } from "@lyra/core";
 import type { SessionUpdate } from "@lyra/acp";
 import { ToolRegistry, createDefaultToolRegistry } from "@lyra/tools";
 import { afterEach, expect, test } from "bun:test";
@@ -130,9 +130,20 @@ test("the session that could not watch its child, run the whole way through", as
   expect(collected.json).toMatchObject({ collected: true, id: "spawn-1", peer: "parser", filesModified: ["src/parser.ts"] });
   expect(collected.json.output).toContain("just the lexer");
 
-  // 7. The whole run was on the `agents` channel the entire time.
+  // 7. The whole run was on the `agents` channel the entire time — as prose, and only as
+  // prose. It used to be published as a sentence *and* a full JSON restatement of the same
+  // event, so every lifecycle delivery cost roughly three times what one fact is worth.
   const lifecycle = await app.call("hub", { op: "wait", channel: "agents", timeoutMs: 100 });
-  expect((lifecycle.json as any[]).map((message) => message.data.type)).toEqual(["spawned", "started", "completed"]);
+  const sentences = (lifecycle.json as any[]).map((message) => message.text as string);
+  expect(sentences).toEqual([
+    expect.stringContaining("was spawned"),
+    expect.stringContaining("started"),
+    expect.stringContaining("completed after"),
+  ]);
+  expect((lifecycle.json as any[]).every((message) => message.data === undefined)).toBe(true);
+  // The fields a reader would otherwise have gone to the JSON blob for are inline.
+  expect(sentences[2]).toContain("spawn-1");
+  expect(sentences[2]).toContain("file(s) changed");
 
   // 8. And on the protocol, for a client that renders presence.
   const agentUpdates = app.updates.filter((update) => update.sessionUpdate === "agent");
@@ -278,10 +289,13 @@ test("a write scope reaches the child and its refusals reach the parent's status
     return "did what I could";
   });
   const started = await app.call("spawn", { task: "port the parser", label: "porter", writeScope: ["src/parser/**"] });
+  // Echoed at the call, rooted: a `writeScope` aimed at the wrong tree is otherwise invisible
+  // until the child is refused a write, where it reads as the child's mistake.
+  expect(started.json).toMatchObject({ writeScope: ["src/parser/**"], writeScopeResolved: ["/repo/src/parser/**"] });
   const status = await until(async () => (await app.call("spawn", { id: "porter", op: "status" })).json, "a status");
-  expect(await status).toMatchObject({ writeScope: ["src/parser/**"] });
+  expect(await status).toMatchObject({ writeScope: ["src/parser/**"], writeScopeResolved: ["/repo/src/parser/**"] });
   const collected = await app.call("spawn", { id: started.json.id });
-  expect(collected.json.scope).toEqual({ paths: ["src/parser/**"], violations: ["src/lexer.ts"] });
+  expect(collected.json.scope).toEqual({ paths: ["src/parser/**"], resolved: ["/repo/src/parser/**"], violations: ["src/lexer.ts"] });
   const listed = await app.call("hub", { op: "list" });
   expect(listed.json.peers.find((entry: any) => entry.name === "porter")).toMatchObject({ writeScope: ["src/parser/**"] });
 });
@@ -296,9 +310,12 @@ test("a child that fails while the parent is waiting wakes the wait and says why
   const started = await app.call("spawn", { task: "review", label: "reviewer" });
   const woken = await app.call("hub", { op: "wait", peer: "main", timeoutMs: 3_000 });
   expect(woken.json[0]).toMatchObject({ from: "reviewer" });
-  expect(woken.json[0].text).toContain("failed");
-  expect(woken.json[0].data).toMatchObject({ type: "failed", id: started.json.id, status: "failed" });
-  expect(woken.json[0].data.error).toContain("refused");
+  // Prose carrying the fields, with no JSON restatement beside it.
+  const notice = woken.json[0].text as string;
+  expect(notice).toContain("failed");
+  expect(notice).toContain(started.json.id);
+  expect(notice).toContain("refused");
+  expect(woken.json[0].data).toBeUndefined();
   // And collecting it explains the same thing, with a way forward.
   const collected = await app.call("spawn", { id: "reviewer" });
   expect(collected.isError).toBe(true);
@@ -316,4 +333,36 @@ test("a hub call padded by a schema-complete emitter still lands", async () => {
   // And a stringified scalar, which JSON-mode emitters routinely produce.
   const waited = await app.call("hub", { op: "wait", channel: "agents", timeoutMs: "1" as unknown as number });
   expect(waited.isError).not.toBe(true);
+});
+
+/**
+ * The other half of "a resolution failure is not revivable": what the *parent* is told.
+ *
+ * The observed notice suggested `hub send to:"stylist"` for a child that never ran, so the
+ * documented next step could not work — and nothing said the name was free again, which is
+ * why the user named their retry `stylist2`.
+ */
+test("a child that never ran is announced without a revive path, and gives its name back", async () => {
+  const app = harness(async () => { throw new SpawnResolutionError('Cannot spawn with model "claude-max/opus-5"'); });
+  await app.call("spawn", { task: "restyle", label: "stylist" });
+
+  const woken = await app.call("hub", { op: "wait", peer: "main", timeoutMs: 3_000 });
+  const notice = woken.json[0].text as string;
+  expect(notice).toContain("failed");
+  expect(notice).toContain("nothing to revive");
+  expect(notice).not.toContain('hub { op: "send"');
+
+  // The bus gave the name back with the announcement, so the retry can reuse it.
+  expect(app.bus.getPeer("stylist")).toBeUndefined();
+});
+
+/** A child that ran and failed is the opposite case: its transcript exists, so a message works. */
+test("a child that ran and failed keeps its name and is announced with the revive path", async () => {
+  const app = harness(async () => { throw new Error("the tests did not pass"); });
+  await app.call("spawn", { task: "review", label: "reviewer" });
+
+  const woken = await app.call("hub", { op: "wait", peer: "main", timeoutMs: 3_000 });
+  const notice = woken.json[0].text as string;
+  expect(notice).toContain('hub { op: "send", to: "reviewer"');
+  expect(app.bus.getPeer("reviewer")).toBeDefined();
 });

@@ -1,6 +1,6 @@
 import { mkdir } from "node:fs/promises";
 import { join, resolve } from "node:path";
-import { AgentLoop, Compactor, LoopDetector, ProviderSummaryGenerator, SteerQueue, type AgentEvent, type SpawnExecutor, type SpawnExecutorContext, type SpawnRequest, type ToolCheckpointer, type ToolRegistry } from "@lyra/core";
+import { AgentLoop, Compactor, LoopDetector, ProviderSummaryGenerator, SpawnResolutionError, SteerQueue, type AgentEvent, type SpawnExecutor, type SpawnExecutorContext, type SpawnRequest, type ToolCheckpointer, type ToolRegistry } from "@lyra/core";
 import type { CheckpointAccess } from "./integrated-tools.ts";
 import type { ReliableProvider } from "@lyra/provider";
 import { TranscriptStore } from "@lyra/session";
@@ -60,6 +60,16 @@ export function createAgentSpawnExecutor(options: AgentSpawnExecutorOptions): Sp
     let selected: ReturnType<NonNullable<AgentSpawnExecutorOptions["resolveEnvironment"]>> | undefined;
     let provider: ReliableProvider | undefined;
     let detachAsides: (() => void) | undefined;
+    /**
+     * Whether this child got as far as a turn.
+     *
+     * Everything above `runTurn` is setup — resolving the model, opening the transcript,
+     * building the tool registry — and a failure there produces a child with no transcript at
+     * all. That is a different terminal state from a child that ran and broke: a message can
+     * continue the second and has nothing to continue in the first, so the two are reported
+     * as different things rather than both as `failed`. See [`SpawnResolutionError`].
+     */
+    let ran = false;
     try {
       const childContext = context;
       const steering = new SteerQueue();
@@ -77,6 +87,7 @@ export function createAgentSpawnExecutor(options: AgentSpawnExecutorOptions): Sp
       // wrote a `.jsonl` per delegation that nothing ever read.
       if (request.acp !== undefined) {
         if (!options.externalAcp) throw new Error("External ACP spawning is not configured.");
+        ran = true;
         return await options.externalAcp(request.acp, request, childContext);
       }
       if (existing !== undefined) {
@@ -95,6 +106,7 @@ export function createAgentSpawnExecutor(options: AgentSpawnExecutorOptions): Sp
       // is running folds into it, and one that arrives after it parks revives it instead.
       detachAsides = options.asides?.(childContext, steering);
       const prompt = request.context ? `${request.context}\n\n${request.task}` : request.task;
+      ran = true;
       const iterator = loop.runTurn(prompt, childContext.signal, { steering });
       let terminal;
       while (true) {
@@ -106,6 +118,14 @@ export function createAgentSpawnExecutor(options: AgentSpawnExecutorOptions): Sp
       const text = terminal.assistant.content.flatMap((block) => block.type === "text" ? [block.text] : []).join("");
       if (request.output_schema !== undefined) { try { return JSON.parse(text); } catch { throw new Error(`Typed spawn ${childContext.peer} returned non-JSON output; revise the child task or schema.`); } }
       return text;
+    } catch (error: unknown) {
+      // A cancel is never a resolution failure, whenever it lands: the child was stopped, not
+      // unbuildable, and calling it unrevivable would take the parent's own child away from it.
+      if (ran || context.signal.aborted) throw error;
+      throw new SpawnResolutionError(
+        `Spawn ${context.peer} could not start: ${error instanceof Error ? error.message : String(error)}`,
+        { id: context.id, peer: context.peer, cause: error },
+      );
     } finally {
       // Each independently: `tools.close()` shuts down an owned language server, and one
       // that refuses to die must not take the checkpoint store and an owned provider

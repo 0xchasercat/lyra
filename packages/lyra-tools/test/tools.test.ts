@@ -66,6 +66,34 @@ describe("core tool behavior", () => {
     } finally { await dispose(root); }
   });
 
+  /**
+   * The result the model actually reads. A created file used to arrive carrying
+   * `tier: "not_applied"` and `occurrences: 1` — a failure-shaped marker and a match count on
+   * a call that never matched anything — paid for on every file written.
+   */
+  test("a created file's result carries no tier or occurrences, and a replacement's still does", async () => {
+    const { root, store, context } = await fixture();
+    try {
+      const write = new WriteTool({ root, artifactStore: store });
+      const reader = new ReadTool({ root, artifactStore: store });
+      const created = JSON.parse((await write.execute({ path: "fresh.ts", content: "const value = 1;\n" }, context)).content.toString());
+      expect(created).toMatchObject({ ok: true, mode: "write", path: "fresh.ts", created: true, changed: true, bytesBefore: 0 });
+      expect(created).not.toHaveProperty("tier");
+      expect(created).not.toHaveProperty("occurrences");
+
+      const read = await reader.execute({ path: "fresh.ts" }, context);
+      const tag = read.content.toString().match(/(#[a-f0-9]+)/i)?.[1];
+      const overwritten = JSON.parse((await write.execute({ path: "fresh.ts", content: "const value = 2;\n", tag }, context)).content.toString());
+      expect(overwritten).toMatchObject({ ok: true, mode: "write", created: false });
+      expect(overwritten).not.toHaveProperty("tier");
+
+      const reread = await reader.execute({ path: "fresh.ts" }, context);
+      const nextTag = reread.content.toString().match(/(#[a-f0-9]+)/i)?.[1];
+      const edited = JSON.parse((await new EditTool({ root, artifactStore: store }).execute({ path: "fresh.ts", tag: nextTag, search: "2", replace: "3" }, context)).content.toString());
+      expect(edited).toMatchObject({ ok: true, mode: "search_replace", tier: "exact", occurrences: 1 });
+    } finally { await dispose(root); }
+  });
+
   test("allows explicit paths across the filesystem while retaining artifact and glob behavior", async () => {
     const { root, store, context } = await fixture();
     const outside = await mkdtemp(join(tmpdir(), "lyra-tools-outside-"));
@@ -132,6 +160,37 @@ describe("core tool behavior", () => {
       const activity = events as Array<{ type?: string }>;
       expect(activity.some((event) => event.type === "git_started")).toBe(true);
     } finally { await processes.close(); await Promise.all([dispose(root), dispose(outside)]); }
+  });
+
+  /**
+   * The presented half of the live bug: the shell exited in seconds, but `timed_out` was
+   * inferred from `signal` and the reap hid the fact that anything was left running. The model
+   * saw `exit_code: 0` beside `timed_out: true` and no mention of the server it had just
+   * started. It now reads the truth, and reads what it left behind.
+   */
+  test("bash reports the shell's own timeout and names what the command left running", async () => {
+    const { root, store, context } = await fixture();
+    const processes = new ProcessHost();
+    const bash = new BashTool({ root, artifactStore: store, processHost: processes });
+    try {
+      const backgrounded = await bash.execute({ command: "/bin/sleep 30 & echo started" }, context);
+      const text = backgrounded.content.toString();
+      expect(backgrounded.isError).not.toBe(true);
+      expect(text).toContain("exit_code: 0");
+      expect(text).toContain("timed_out: false");
+      expect(text).toContain("signal: none");
+      expect(text).toContain("started");
+      expect(text).toContain("still_running:");
+      expect(text).toContain("sleep 30");
+      expect(text).toContain("keeps running");
+
+      // A shell that really did overrun its own deadline still says so.
+      const overran = await bash.execute({ command: "/usr/bin/perl -e 'select undef, undef, undef, 5'", timeoutMs: 300 }, context);
+      const overranText = overran.content.toString();
+      expect(overranText).toContain("timed_out: true");
+      expect(overranText).toContain("signal: SIGTERM");
+      expect(overranText).not.toContain("still_running:");
+    } finally { await processes.close(); await dispose(root); }
   });
 
   test("git follows an in-workspace cwd symlink to another repository", async () => {

@@ -5,7 +5,7 @@ import type {
   EditMetrics,
   EditRequest,
   EditResult,
-  EditSuccess,
+  EditSuccessBase,
   EditMode,
   EditTier,
   ReadRequest,
@@ -250,7 +250,9 @@ export class EditEngine {
     const tier = mode === "search_replace" ? (resolved.tier ?? "exact") : "not_applied";
     if (mode === "search_replace") this.counts.tierCalls[resolved.tier ?? "exact"]++;
     else this.counts.tierCalls.not_applied++;
-    return this.persist(path, mode, source, resolved.content, resolved.occurrences, tier);
+    const persisted = await this.persist(path, mode, source, resolved.content);
+    if (!persisted.ok) return persisted;
+    return { ...persisted, mode, tier, occurrences: resolved.occurrences };
   }
 
   async applyBatch(requests: readonly EditRequest[]): Promise<BatchEditResult> {
@@ -306,10 +308,17 @@ export class EditEngine {
     if (existed && before === content) {
       return error(path, "write", "no_op", `Write for ${path} produces no byte changes; revise the content and retry.`);
     }
-    return this.persist(path, "write", before, content, 1, "not_applied");
+    const persisted = await this.persist(path, "write", before, content);
+    if (!persisted.ok) return persisted;
+    return { ...persisted, mode: "write", created: !existed };
   }
 
-  private async persist(path: string, mode: EditRequest["mode"] | "write", before: string, content: string, occurrences: number, tier: EditTier): Promise<EditResult> {
+  /**
+   * Writes, verifies, and reports only what every mode has in common. The mode-specific
+   * fields are added by the caller that knows them, so `write` has no `tier` or
+   * `occurrences` to pass and cannot invent one to satisfy a shared shape.
+   */
+  private async persist(path: string, mode: EditMode, before: string, content: string): Promise<EditSuccessBase | Extract<EditResult, { ok: false }>> {
     try {
       this.counts.writes++;
       await this.filesystem.writeAtomic(path, content);
@@ -328,18 +337,15 @@ export class EditEngine {
     if (actual !== content) {
       return error(path, mode, "write_failed", `Post-write verification for ${path} did not match requested content; re-read before retrying.`, { tag });
     }
-    const success: EditSuccess = {
+    const persisted: EditSuccessBase = {
       ok: true,
       path,
-      mode,
-      tier,
       tag,
       changed: true,
       bytesBefore: byteLength(before),
       bytesAfter: byteLength(actual),
-      occurrences,
     };
-    return success;
+    return persisted;
   }
 }
 

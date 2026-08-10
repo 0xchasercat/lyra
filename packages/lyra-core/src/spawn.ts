@@ -1,7 +1,9 @@
+import { isAbsolute, resolve as resolvePath } from "node:path";
 import type {
   SpawnActivity,
   SpawnExecutor,
   SpawnExecutorContext,
+  SpawnFailureKind,
   SpawnHandle,
   SpawnLifecycleEvent,
   SpawnOutputSchema,
@@ -119,6 +121,37 @@ export class SpawnDeadlineError extends SpawnError {
   }
 }
 
+/**
+ * The child could not be set up, so it never ran a turn.
+ *
+ * Thrown by an executor that got as far as being called and no further — an unresolvable
+ * model, a tool registry it could not build, a missing external harness. It is a separate
+ * class rather than a plain failure because the manager has to answer a question a message
+ * alone cannot: is there a transcript here to continue? A child that died at resolution has
+ * none, so it is marked [`SpawnFailureKind`] `resolution`, refused a revival, and gives its
+ * peer name back (see [`SpawnManager.revive`]).
+ */
+export class SpawnResolutionError extends SpawnError {
+  constructor(message: string, details?: Readonly<Record<string, unknown>>) {
+    super("resolution_failed", message, details);
+    this.name = "SpawnResolutionError";
+  }
+}
+
+/**
+ * A model reference that cannot serve a turn, raised from the spawn call itself.
+ *
+ * Distinct from [`SpawnResolutionError`], which is a child already in flight discovering the
+ * same thing: this one is raised before any child exists, so the caller gets an error where
+ * it asked the question rather than a handle to something already dead.
+ */
+export class SpawnModelError extends SpawnError {
+  constructor(message: string, details?: Readonly<Record<string, unknown>>) {
+    super("invalid_model", message, details);
+    this.name = "SpawnModelError";
+  }
+}
+
 export class SpawnClosedError extends SpawnError {
   constructor() {
     super("closed", "Spawn manager is closed");
@@ -149,6 +182,16 @@ interface SpawnJob {
   reject: (error: unknown) => void;
   terminal: boolean;
   queued: boolean;
+  /**
+   * Whether the executor has ever been entered for this job. Sticky across revivals, because
+   * revival is a continuation: a child that ran once has a transcript, and a later run that
+   * could not be set up does not retroactively make it a child that never existed.
+   */
+  started: boolean;
+  /** Set when this job's terminal transition gave its peer name back. See [`fail`]. */
+  peerReleased: boolean;
+  /** Which half of its life the failure came from, once it has failed. */
+  failure?: SpawnFailureKind;
   /**
    * The epochs of this job's executions that are still on the wire.
    *
@@ -211,6 +254,13 @@ export class SpawnManager {
   private readonly resolveNamedWorkspace: SpawnManagerOptions["resolveWorkspace"];
   private readonly releaseWorkspace: SpawnManagerOptions["releaseWorkspace"];
   private readonly reservedPeers: SpawnManagerOptions["reservedPeers"];
+  /**
+   * Not `readonly`, because the only thing that can answer "will this model serve a turn" is
+   * the live provider environment, and that is re-read — and replaced — whenever a provider is
+   * added mid-session. Whoever owns it installs the check here once the manager exists, rather
+   * than the manager being constructed with a closure over an environment that is already stale.
+   */
+  private validateModel: SpawnManagerOptions["validateModel"];
   private readonly now: () => number;
   private readonly jobs = new Map<string, SpawnJob>();
   private readonly peers = new Map<string, string>();
@@ -236,7 +286,7 @@ export class SpawnManager {
     assertNonNegativeInteger(maxDepth, "maxDepth");
     assertPositiveInteger(maxConcurrent, "maxConcurrent");
     if (options.availableTools !== undefined) assertTools(options.availableTools, "availableTools");
-    for (const name of ["createWorkspace", "describeWorkspace", "resolveWorkspace", "releaseWorkspace", "now", "reservedPeers"] as const) {
+    for (const name of ["createWorkspace", "describeWorkspace", "resolveWorkspace", "releaseWorkspace", "now", "reservedPeers", "validateModel"] as const) {
       if (options[name] !== undefined && typeof options[name] !== "function") {
         throw new SpawnRequestError(`${name} must be a function when provided`);
       }
@@ -253,6 +303,7 @@ export class SpawnManager {
     this.resolveNamedWorkspace = options.resolveWorkspace;
     this.releaseWorkspace = options.releaseWorkspace;
     this.reservedPeers = options.reservedPeers;
+    this.validateModel = options.validateModel;
     this.now = options.now ?? Date.now;
   }
 
@@ -266,6 +317,18 @@ export class SpawnManager {
 
   get queuedCount(): number {
     return this.queue.reduce((count, job) => count + (job.queued && !job.terminal ? 1 : 0), 0);
+  }
+
+  /**
+   * Install (or clear) the model check [`assertModelUsable`] runs. See [`validateModel`].
+   *
+   * Separate from the constructor because the manager is built before the thing that can
+   * answer the question exists: a provider added mid-session has to be spawnable in the very
+   * next turn, so the check reads a live environment rather than one captured at boot.
+   */
+  setModelValidator(validate: SpawnManagerOptions["validateModel"]): void {
+    if (validate !== undefined && typeof validate !== "function") throw new SpawnRequestError("validateModel must be a function when provided");
+    this.validateModel = validate;
   }
 
   /** Listen to reports without coupling the executor to a UI or session. */
@@ -304,6 +367,34 @@ export class SpawnManager {
   /** Explicit async spelling for callers that do not use the blocking request flag. */
   async run(request: SpawnRequest, parent?: SpawnParentContext): Promise<SpawnDiagnosticResult> {
     return await this.spawn({ ...request, blocking: true }, parent);
+  }
+
+  /**
+   * Whether an explicitly requested model can serve a turn — asked before anything is queued.
+   *
+   * This is the fail-fast half of model routing, and it is a separate call rather than part
+   * of `spawn` because the check is asynchronous (a credential source has to be asked) while
+   * a non-blocking `spawn` returns its handle synchronously by contract. A caller that starts
+   * a child from a tool call awaits this first and reports the rejection as the tool's own
+   * result; the observed alternative was `status: running`, a handle to a child that could
+   * never run, and the reason arriving through the bus minutes later.
+   *
+   * Only an *explicit* model is checked. An inherited one is the model this session is
+   * already serving turns with, and re-probing its credential on every delegation would buy
+   * nothing but latency.
+   */
+  async assertModelUsable(model: string | undefined, signal?: AbortSignal): Promise<void> {
+    if (model === undefined || this.validateModel === undefined) return;
+    assertNonEmptyString(model, "model");
+    try {
+      await this.validateModel(model, signal);
+    } catch (error: unknown) {
+      // Re-raised verbatim: the validator is the only thing that knows *which* failure this
+      // is — unknown provider, unknown model, or an unusable one — and flattening those three
+      // into one sentence is the defect this path exists to fix.
+      if (error instanceof SpawnError) throw error;
+      throw new SpawnModelError(error instanceof Error ? error.message : String(error), { model, cause: error });
+    }
   }
 
   /**
@@ -422,6 +513,12 @@ export class SpawnManager {
    * The id, the peer name, the workspace and the transcript all survive — a revived child is
    * the same child, one turn later, not a new one wearing its name. A child that is still
    * running needs no revival and is left alone; the message reaches it as an aside instead.
+   *
+   * A child that failed at *resolution* is refused rather than restarted. It has no
+   * transcript — it never ran — so there is nothing for the message to continue, and whatever
+   * would not resolve would not resolve again; restarting it would spend a turn re-deriving
+   * the error it already reported. The refusal throws, because "nothing happened" is exactly
+   * the answer that sent a user chasing a child that was never coming back.
    */
   revive(idOrPeer: string, message: string): SpawnHandle | undefined {
     if (this.closed) throw new SpawnClosedError();
@@ -429,6 +526,13 @@ export class SpawnManager {
     const job = this.resolveJob(idOrPeer);
     if (!job) return undefined;
     if (!job.terminal) return undefined;
+    if (job.failure === "resolution") {
+      throw new SpawnResolutionError(
+        `Spawn ${job.id} (${job.peer}) cannot be revived: it failed before it ever ran — ${job.error ?? "its model, tools or workspace could not be resolved"}. ` +
+        `There is no transcript to continue and the same resolution would fail again, so its name has been released. Fix the spawn call and start a new child with spawn { task: "..." }.`,
+        { id: job.id, peer: job.peer, failure: "resolution" satisfies SpawnFailureKind },
+      );
+    }
     const { promise, resolve, reject } = withResolvers<SpawnResult>();
     void promise.catch(() => undefined);
     job.completion = promise;
@@ -444,6 +548,7 @@ export class SpawnManager {
     for (let index = this.queue.indexOf(job); index >= 0; index = this.queue.indexOf(job)) this.queue.splice(index, 1);
     job.request = { ...job.request, task: message, resume: true };
     delete job.error;
+    delete job.failure;
     delete job.result;
     delete job.currentTool;
     job.partialOutput = "";
@@ -482,11 +587,13 @@ export class SpawnManager {
       toolCalls: job.toolCalls,
       ...(job.currentTool === undefined ? {} : { currentTool: job.currentTool }),
       filesModified: [...job.filesModified],
-      ...(job.writeScope === undefined ? {} : { writeScope: [...job.writeScope] }),
+      ...(job.writeScope === undefined ? {} : { writeScope: [...job.writeScope], writeScopeResolved: resolveScopePaths(job.workspace, job.writeScope) }),
       ...(job.scopeViolations.length === 0 ? {} : { scopeViolations: [...job.scopeViolations] }),
       ...(partial.length === 0 ? {} : { partialOutput: partial }),
       ...(job.revivals === 0 ? {} : { revivals: job.revivals }),
       ...(job.error === undefined ? {} : { error: job.error }),
+      ...(job.failure === undefined ? {} : { failure: job.failure }),
+      ...(job.terminal ? { revivable: job.failure !== "resolution" } : {}),
       resultAvailable: job.result !== undefined,
       ...(job.integration === undefined ? {} : { integration: job.integration }),
     };
@@ -560,6 +667,8 @@ export class SpawnManager {
       reject,
       terminal: false,
       queued: true,
+      started: false,
+      peerReleased: false,
       runs: new Set<number>(),
       epoch: 0,
       queuedAt: createdAt,
@@ -635,6 +744,9 @@ export class SpawnManager {
       if (controller.signal.aborted) throw controller.signal.reason ?? new SpawnCancelledError(job.id);
       const executionRequest = withResolvedRequest(job.request, job.model, job.tools, job.workspace);
       const context = this.makeExecutorContext(job, epoch, controller);
+      // Recorded before the call, not after it returns: this is the fact `fail` reads to tell
+      // a child that never got as far as an executor from one that ran and broke.
+      job.started = true;
       this.transition(job, "running", "started");
       const output = await this.executor(executionRequest, context);
       if (controller.signal.aborted) throw controller.signal.reason ?? new SpawnCancelledError(job.id);
@@ -709,7 +821,9 @@ export class SpawnManager {
       // A shared-tree child wrote into the parent's own directory, so what it touched is the
       // parent's next question. An isolated child answers that with `integration` instead.
       ...(job.filesModified.size === 0 ? {} : { filesModified: [...job.filesModified] }),
-      ...(job.writeScope === undefined ? {} : { scope: { paths: [...job.writeScope], violations: [...job.scopeViolations] } }),
+      // Resolved as well as declared: `writeScope: ["src/**"]` means nothing until it is said
+      // which `src` — and the parent that mis-rooted it is the one reading this.
+      ...(job.writeScope === undefined ? {} : { scope: { paths: [...job.writeScope], resolved: resolveScopePaths(job.workspace, job.writeScope), violations: [...job.scopeViolations] } }),
     };
   }
 
@@ -775,6 +889,19 @@ export class SpawnManager {
     this.emitLifecycle(job, "completed");
   }
 
+  /**
+   * Record a terminal failure, and say which kind it is.
+   *
+   * `resolution` when the executor was never entered (the workspace could not be resolved) or
+   * when it was entered and reported that it could not set the child up at all. Everything
+   * else ran, so it is `execution` — including a *revived* run that broke during setup, since
+   * `started` is sticky and a child with a transcript is still a child a message can pick up.
+   *
+   * A resolution failure gives its peer name back here. Nothing can be sent to that child
+   * that would achieve anything (`revive` refuses it), so holding the name only makes the
+   * next spawn pick a worse one — which is exactly what a user did, naming their retry
+   * `stylist2` because they could not tell whether `stylist` was still taken.
+   */
   private fail(job: SpawnJob, epoch: number, error: unknown): void {
     if (job.epoch !== epoch || job.terminal) {
       this.release(job, epoch);
@@ -785,7 +912,15 @@ export class SpawnManager {
     job.error = normalized instanceof Error ? normalized.message : String(normalized);
     delete job.currentTool;
     const state: SpawnState = isDeadline(normalized) ? "timed_out" : "failed";
+    if (state === "failed") job.failure = !job.started || isResolutionFailure(normalized) ? "resolution" : "execution";
     job.handle.status = state;
+    // Freed before the announcement carries `peerReleased`, so a listener that unregisters
+    // the name on that event and a spawn that asks for it a moment later agree about who
+    // holds it. The job keeps the string: the terminal notice still has to name the child.
+    if (job.failure === "resolution" && this.peers.get(job.peer) === job.id) {
+      this.peers.delete(job.peer);
+      job.peerReleased = true;
+    }
     job.reject(normalized);
     this.release(job, epoch);
     this.emitLifecycle(job, state === "timed_out" ? "timed_out" : "failed");
@@ -993,6 +1128,11 @@ export class SpawnManager {
       filesModified: job.filesModified.size,
       at: this.now(),
       ...(job.error === undefined ? {} : { error: job.error }),
+      ...(job.failure === undefined ? {} : { failure: job.failure }),
+      // Stated rather than inferred: `failed` covers both the child a message repairs and the
+      // one it cannot, and whoever writes the terminal notice must not have to guess which.
+      ...(job.terminal ? { revivable: job.failure !== "resolution" } : {}),
+      ...(job.peerReleased ? { peerReleased: true } : {}),
     };
     for (const listener of this.lifecycleListeners) {
       try {
@@ -1026,6 +1166,23 @@ function lifecycleTypeFor(state: SpawnState): SpawnLifecycleEvent["type"] {
     case "running": return "started";
     default: return "spawned";
   }
+}
+
+/** A child that reported it could never start, however the error reached us. */
+function isResolutionFailure(error: unknown): boolean {
+  return error instanceof SpawnError && error.code === "resolution_failed";
+}
+
+/**
+ * A declared write partition, rooted at the tree the child actually writes in.
+ *
+ * Globs survive it: `**` and `*` are ordinary path segments to a resolver, so `src/**` under
+ * `/repo` comes back as `/repo/src/**` and still means what it meant. An entry that is
+ * already absolute is left where the parent put it, because a parent that wrote an absolute
+ * path meant that path and rooting it again would silently move it.
+ */
+function resolveScopePaths(workspace: string, patterns: readonly string[]): string[] {
+  return patterns.map((pattern) => (isAbsolute(pattern) ? pattern : resolvePath(workspace, pattern)));
 }
 
 function isDeadline(error: unknown): boolean {

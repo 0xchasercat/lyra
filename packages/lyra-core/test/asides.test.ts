@@ -148,6 +148,21 @@ describe("hub asides", () => {
     expect(rendered).toContain('hub { op: "send", to: "builder"');
     expect(rendered).toContain("not the user");
   });
+
+  /**
+   * A notice from an agent nothing can revive must not document a reply address.
+   *
+   * The observed failure: a child that could not resolve its model was announced with
+   * `hub send to:"stylist"` as the next step. There was no transcript to continue and the
+   * resolution failure would simply recur, so the one documented recovery could not work.
+   */
+  test("an aside from an agent that has ended offers no reply address", () => {
+    const rendered = renderHubAside({ from: "stylist", text: "stylist failed", reply: false });
+    expect(rendered).toContain("[hub message from stylist]");
+    expect(rendered).toContain("has ended and cannot be answered");
+    expect(rendered).not.toContain('hub { op: "send"');
+    expect(rendered).toContain("not the user");
+  });
 });
 
 describe("per-tool deadlines", () => {

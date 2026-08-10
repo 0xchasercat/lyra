@@ -1,6 +1,8 @@
 import { describe, expect, test } from "bun:test";
 import { NoAuth } from "../src/auth.ts";
+import { ReliableProvider } from "../src/client.ts";
 import { ProviderFault } from "../src/errors.ts";
+import { MAX_OUTPUT_TOKENS_ASK } from "../src/output-limit.ts";
 import { AnthropicMessagesTransport } from "../src/transports/anthropic-messages.ts";
 import { OpenAICompletionsTransport } from "../src/transports/openai-completions.ts";
 import { OpenAIResponsesTransport } from "../src/transports/openai-responses.ts";
@@ -483,3 +485,265 @@ function expectTerminal(events: readonly TransportEvent[], stopReason: string): 
   expect(events.filter((event) => event.type === "complete")).toHaveLength(1);
   expect(events.at(-1)).toEqual(expect.objectContaining({ type: "complete", stopReason }));
 }
+
+/**
+ * The observed F5-class lockout: one turn cut at the provider's output-token limit made
+ * every subsequent prompt in that session unserializable.
+ *
+ * §3.8 appends a `truncated` marker to the assistant turn the provider cut short. That
+ * marker then lives in the transcript forever, and `anthropic_messages` used to throw
+ * `Marker block "truncated" … must be repaired before provider serialization` on it —
+ * classified as `content_shape`, retried twice, and the turn died. §3.6's rule is repair,
+ * never reject, and the two OpenAI codecs had already implemented it as in-band text.
+ */
+describe("loss markers reach every transport as text", () => {
+  /** The exact shape on disk after a max_tokens turn: marker mid-history, prompt after it. */
+  function truncatedHistory(): ProviderRequest {
+    return baseRequest({
+      messages: [
+        { id: "user-1", role: "user", content: [{ type: "text", text: "Write the review." }] },
+        {
+          id: "e_01KZPGZJ7DGY56R3HV7EEYQNT8",
+          role: "assistant",
+          content: [
+            { type: "text", text: "The review begins" },
+            {
+              type: "marker",
+              reason: "truncated",
+              detail: "The provider reached its 4096-token output limit; the partial response was retained.",
+            },
+          ],
+        },
+        { id: "user-2", role: "user", content: [{ type: "text", text: "Continue please." }] },
+      ],
+    });
+  }
+
+  for (const adapter of HTTP_ADAPTERS) {
+    test(`${adapter.kind} serializes a truncated marker instead of refusing the turn`, async () => {
+      const fixture = startHttpFixture([{ frames: adapter.successFrames(`${adapter.kind}-after-truncation`) }]);
+      const transport = adapter.create(fixture.baseUrl);
+      try {
+        const outcome = await collectOutcome(transport.stream(truncatedHistory(), CONTEXT));
+
+        expect(outcome.error).toBeUndefined();
+        expectTerminal(outcome.events, "end_turn");
+        expect(JSON.stringify(fixture.requests[0]?.body)).toContain("[truncated:");
+      } finally {
+        await transport.close?.();
+        await fixture.stop();
+      }
+    });
+  }
+
+  // Every marker kind failed identically; only `truncated` was ever observed because it is
+  // the one a user is most likely to follow with another prompt. A cancelled session that
+  // was never continued simply never re-serialized its marker.
+  for (const reason of ["image_dropped", "interrupted", "cancelled", "truncated"] as const) {
+    test(`anthropic_messages serializes a ${reason} marker`, async () => {
+      const fixture = startHttpFixture([{ frames: anthropicSuccessFrames(`marker-${reason}`) }]);
+      const transport = new AnthropicMessagesTransport({
+        id: `wire-anthropic-${reason}`,
+        baseUrl: fixture.baseUrl,
+        auth: new NoAuth(),
+        cacheBreakpoints: { system: false },
+      });
+      try {
+        const outcome = await collectOutcome(transport.stream(
+          baseRequest({
+            messages: [
+              { id: "user-1", role: "user", content: [{ type: "text", text: "hello" }] },
+              {
+                id: "assistant-1",
+                role: "assistant",
+                content: [{ type: "marker", reason, detail: "why it stopped" }],
+              },
+              { id: "user-2", role: "user", content: [{ type: "text", text: "carry on" }] },
+            ],
+          }),
+          CONTEXT,
+        ));
+
+        expect(outcome.error).toBeUndefined();
+        expect(JSON.stringify(fixture.requests[0]?.body)).toContain(`[${reason}: why it stopped]`);
+      } finally {
+        await transport.close?.();
+        await fixture.stop();
+      }
+    });
+  }
+
+  test("anthropic_messages serializes a marker nested in a tool result", async () => {
+    const fixture = startHttpFixture([{ frames: anthropicSuccessFrames("marker-nested") }]);
+    const transport = new AnthropicMessagesTransport({
+      id: "wire-anthropic-nested-marker",
+      baseUrl: fixture.baseUrl,
+      auth: new NoAuth(),
+      cacheBreakpoints: { system: false },
+    });
+    try {
+      const outcome = await collectOutcome(transport.stream(
+        baseRequest({
+          messages: [
+            {
+              id: "assistant-1",
+              role: "assistant",
+              content: [{ type: "tool_use", id: "call-a", name: "weather", input: { city: "Paris" } }],
+            },
+            {
+              id: "user-2",
+              role: "user",
+              content: [{
+                type: "tool_result",
+                toolUseId: "call-a",
+                content: [
+                  { type: "text", text: "screenshot" },
+                  { type: "marker", reason: "image_dropped", detail: "image is 9000000 bytes" },
+                ],
+              }],
+            },
+          ],
+        }),
+        CONTEXT,
+      ));
+
+      expect(outcome.error).toBeUndefined();
+      expect(JSON.stringify(fixture.requests[0]?.body)).toContain("[image_dropped: image is 9000000 bytes]");
+    } finally {
+      await transport.close?.();
+      await fixture.stop();
+    }
+  });
+});
+
+/**
+ * The output-token ask, and the one 400 that corrects it.
+ *
+ * The rule is that every request asks for the *model's maximum* — a known model from its
+ * metadata, an unknown one from `MAX_OUTPUT_TOKENS_ASK` — because the alternative that
+ * shipped was a 4096-token default nobody chose, which cut a long reply mid-sentence and
+ * reported it as `truncated`. A model whose real cap is lower says so in a 400 that names
+ * the number, and that number is read back, retried against, and remembered.
+ */
+describe("anthropic_messages output token ask", () => {
+  function anthropicTransport(baseUrl: string, id: string): AnthropicMessagesTransport {
+    return new AnthropicMessagesTransport({ id, baseUrl, auth: new NoAuth(), cacheBreakpoints: { system: false } });
+  }
+
+  test("a request carries the resolved model cap, and an unset one falls back to the high ask", async () => {
+    const fixture = startHttpFixture([
+      { frames: anthropicSuccessFrames("cap-explicit") },
+      { frames: anthropicSuccessFrames("cap-default") },
+    ]);
+    const transport = anthropicTransport(fixture.baseUrl, "wire-anthropic-cap");
+    try {
+      await collectOutcome(transport.stream(baseRequest({ maxOutputTokens: 64_000 }), CONTEXT));
+      await collectOutcome(transport.stream(baseRequest(), CONTEXT));
+
+      expect(fixture.requests[0]?.body).toMatchObject({ max_tokens: 64_000 });
+      expect(fixture.requests[1]?.body).toMatchObject({ max_tokens: MAX_OUTPUT_TOKENS_ASK });
+    } finally {
+      await transport.close?.();
+      await fixture.stop();
+    }
+  });
+
+  test("a 400 that names the model's limit is read, retried against, and remembered", async () => {
+    const fixture = startHttpFixture([
+      {
+        status: 400,
+        body: {
+          type: "error",
+          error: {
+            type: "invalid_request_error",
+            message: "max_tokens: 128000 > 64000, which is the maximum allowed number of output tokens for claude-haiku-4-5",
+          },
+        },
+      },
+      { frames: anthropicSuccessFrames("cap-learned") },
+      { frames: anthropicSuccessFrames("cap-remembered") },
+    ]);
+    const provider = new ReliableProvider(anthropicTransport(fixture.baseUrl, "wire-anthropic-discovery"), {
+      random: () => 0,
+      sleep: async () => undefined,
+    });
+    try {
+      const first = await collectOutcome(provider.stream(
+        baseRequest({ model: "claude-haiku-4-5", maxOutputTokens: MAX_OUTPUT_TOKENS_ASK }),
+      ));
+      expect(first.error).toBeUndefined();
+      expectTerminal(first.events, "end_turn");
+
+      // The retry asks for exactly what the provider said it would accept…
+      expect(fixture.requests[0]?.body).toMatchObject({ max_tokens: MAX_OUTPUT_TOKENS_ASK });
+      expect(fixture.requests[1]?.body).toMatchObject({ max_tokens: 64_000 });
+      expect(provider.outputCaps.get("claude-haiku-4-5")).toBe(64_000);
+
+      // …and the next turn is clamped up front, so the 400 is paid once per session, not
+      // once per turn — the whole reason the learned cap is remembered at all.
+      const second = await collectOutcome(provider.stream(
+        baseRequest({ model: "claude-haiku-4-5", maxOutputTokens: MAX_OUTPUT_TOKENS_ASK }),
+      ));
+      expect(second.error).toBeUndefined();
+      expect(fixture.requests).toHaveLength(3);
+      expect(fixture.requests[2]?.body).toMatchObject({ max_tokens: 64_000 });
+    } finally {
+      await fixture.stop();
+    }
+  });
+
+  test("a refusal that names no limit halves the ask instead of surfacing a raw 400", async () => {
+    const refusal = {
+      status: 400,
+      body: {
+        type: "error",
+        error: { type: "invalid_request_error", message: "max_tokens exceeds the maximum allowed for this model" },
+      },
+    } as const;
+    const fixture = startHttpFixture([refusal, { frames: anthropicSuccessFrames("cap-halved") }]);
+    const provider = new ReliableProvider(anthropicTransport(fixture.baseUrl, "wire-anthropic-halve"), {
+      random: () => 0,
+      sleep: async () => undefined,
+    });
+    try {
+      const outcome = await collectOutcome(provider.stream(
+        baseRequest({ model: "mystery-model", maxOutputTokens: 128_000 }),
+      ));
+
+      expect(outcome.error).toBeUndefined();
+      expect(fixture.requests[1]?.body).toMatchObject({ max_tokens: 64_000 });
+      expect(provider.outputCaps.get("mystery-model")).toBe(64_000);
+    } finally {
+      await fixture.stop();
+    }
+  });
+
+  test("an unrecoverable output-cap refusal never surfaces as a raw 400 about our own guess", async () => {
+    const refusal = {
+      status: 400,
+      body: {
+        type: "error",
+        error: { type: "invalid_request_error", message: "max_tokens exceeds the maximum allowed number of output tokens" },
+      },
+    } as const;
+    const fixture = startHttpFixture([refusal, refusal, refusal, refusal, refusal]);
+    const provider = new ReliableProvider(anthropicTransport(fixture.baseUrl, "wire-anthropic-unrecoverable"), {
+      random: () => 0,
+      sleep: async () => undefined,
+    });
+    try {
+      const outcome = await collectOutcome(provider.stream(
+        baseRequest({ model: "mystery-model", maxOutputTokens: 2_048 }),
+      ));
+
+      expect(outcome.error).toBeInstanceOf(ProviderFault);
+      const message = (outcome.error as ProviderFault).providerMessage;
+      expect(message).toContain("mystery-model");
+      expect(message).toContain("output-token request");
+      // The provider's own words are kept — they are the only evidence of what it wants.
+      expect(message).toContain("maximum allowed number of output tokens");
+    } finally {
+      await fixture.stop();
+    }
+  });
+});

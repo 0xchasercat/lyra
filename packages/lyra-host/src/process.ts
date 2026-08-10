@@ -6,6 +6,7 @@ import type {
   ProcessClass,
   ProcessRequest,
   ProcessResult,
+  ProcessSurvivor,
 } from "./types.ts";
 
 /** The longest an item is allowed to wait for its class semaphore. */
@@ -22,6 +23,20 @@ export const DEFAULT_PROCESS_TIMEOUT_MS = 60 * 60_000;
 export const INLINE_WAIT_BUDGET_MS = 120_000;
 /** Settled jobs stay retrievable for a while, then age out: a session runs for hours. */
 export const DEFAULT_RETAINED_SETTLED_JOBS = 64;
+/**
+ * How long the output readers keep collecting after the shell has already exited.
+ *
+ * The call completes when the *shell* exits, not when its stdout pipe reaches EOF, because a
+ * grandchild the shell backgrounded inherits that pipe and can hold it open for hours (§11).
+ * Bytes the shell wrote just before exiting may still be in flight at that instant, so the
+ * readers get a short grace to pick them up — long enough that nothing the shell itself
+ * produced is lost (§3.8), short enough that it is not a second deadline.
+ */
+export const OUTPUT_DRAIN_GRACE_MS = 150;
+/** A survivor survey must never become the reason a fast command feels slow. */
+const SURVIVOR_SURVEY_TIMEOUT_MS = 2_000;
+/** `ps` reports full argv; a pathological one must not end up pasted into a tool result. */
+const SURVIVOR_COMMAND_LIMIT = 200;
 
 const MAX_TIMER_MS = 2_147_000_000;
 
@@ -532,6 +547,16 @@ function executionOfSegment(segment: string): CommandExecution {
  * Decide whether a command blocks the caller, hands back a job, or is a server. Composed
  * across a compound command by severity: one server segment makes the whole line a server,
  * and one job segment makes it a job.
+ *
+ * A trailing-`&` line that stands a server up inline — `node server.js & sleep 1; curl …` —
+ * stays `inline` on purpose, and the temptation to reclassify it as a `server` is a trap. The
+ * foreground half of that line (the curls) *is* the answer the model asked for, so handing
+ * back a job id would withhold the output and make the model chase a handle for a result it
+ * had already produced. What made the inline path look broken was never the classification: it
+ * was `#spawn` waiting for pipe EOF, which the backgrounded server held open until the
+ * deadline. With the call ending on the shell's own exit, the line returns in its real 2.1s
+ * with its curl output intact, and the server it left running is named in `survivors` instead
+ * of being silently killed — which is the better answer on both axes.
  */
 export function classifyExecution(command: string): CommandExecution {
   if (typeof command !== "string" || command.trim().length === 0) return "inline";
@@ -650,12 +675,101 @@ function signalNameFromExitCode(exitCode: number | null): string | null {
   return names[exitCode - 128] ?? null;
 }
 
-function readOutput(stream: unknown): Promise<string> {
-  if (stream === null || stream === undefined || typeof stream === "number") return Promise.resolve("");
-  return new Response(stream as unknown as BodyInit).text().catch((error: unknown) => `Unable to read process output: ${error instanceof Error ? error.message : String(error)}`);
+/**
+ * An incremental reader for one of the child's pipes.
+ *
+ * Reading a pipe to EOF is *not* the same question as "has the command finished", and
+ * conflating them was a live bug: `node server.js & sleep 1; curl …` printed everything and
+ * the shell exited in 2.1s, but the orphaned server inherited the stdout pipe, EOF never came,
+ * and the call sat until its 120s deadline and then reported `exit_code: 0` beside
+ * `timed_out: true` and `signal: SIGTERM` — three claims that cannot all be true. So bytes are
+ * accumulated as they arrive and the call ends on the shell's exit instead.
+ */
+interface OutputCollector {
+  /** Everything read so far. */
+  text(): string;
+  /**
+   * Stop accumulating, but keep draining the pipe.
+   *
+   * Deliberately not a cancel: closing our read end would hand the surviving grandchild an
+   * EPIPE on its next log line and kill the very server the model asked to keep running
+   * (§11's reap split below). Discarding costs nothing and the pipe dies with the group when
+   * the host is closed.
+   */
+  detach(): void;
+  /** Resolves when the pipe reaches EOF on its own. */
+  readonly done: Promise<void>;
+}
+
+function collectOutput(stream: unknown): OutputCollector {
+  if (stream === null || stream === undefined || typeof stream === "number") {
+    return { text: () => "", detach: () => {}, done: Promise.resolve() };
+  }
+  const decoder = new TextDecoder();
+  let text = "";
+  let detached = false;
+  const done = (async () => {
+    const reader = (stream as ReadableStream<Uint8Array>).getReader();
+    try {
+      for (;;) {
+        const chunk = await reader.read();
+        if (chunk.done === true) break;
+        // After `detach` the bytes are still read — see the comment above — and dropped.
+        if (!detached && chunk.value !== undefined) text += decoder.decode(chunk.value, { stream: true });
+      }
+      if (!detached) text += decoder.decode();
+    } catch (error: unknown) {
+      if (!detached) text += `Unable to read process output: ${error instanceof Error ? error.message : String(error)}`;
+    } finally {
+      try { reader.releaseLock(); } catch { /* already released by a cancelled stream */ }
+    }
+  })();
+  return { text: () => text, detach: () => { detached = true; }, done };
 }
 
 function processGroupAlive(pgid: number): boolean { try { process.kill(-pgid, 0); return true; } catch (error) { return error instanceof Error && "code" in error && (error as { code?: unknown }).code === "EPERM"; } }
+
+/**
+ * Name the processes still alive in a job's process group.
+ *
+ * The child is its own group leader (`detached: true`), so the group is exactly "the shell and
+ * everything it started". `ps -A` plus a filter rather than `ps -g <pgid>`: BSD's `-g` selects
+ * by process group, but procps' `-g` selects by *session* id, so the obvious portable-looking
+ * spelling silently answers a different question on Linux.
+ *
+ * Failure is never fatal — a survey is a courtesy, not the result. When `ps` cannot be read we
+ * still know from `processGroupAlive` that *something* is there, so the group leader's id is
+ * reported with no command rather than pretending the group was empty (§3.8).
+ */
+async function surveyProcessGroup(pgid: number): Promise<readonly ProcessSurvivor[]> {
+  if (!Number.isSafeInteger(pgid) || pgid <= 1 || !processGroupAlive(pgid)) return [];
+  const unidentified: readonly ProcessSurvivor[] = [{ pid: pgid, command: "" }];
+  let ps: Bun.Subprocess | undefined;
+  try {
+    ps = Bun.spawn(["ps", "-A", "-o", "pgid=,pid=,args="], { stdin: "ignore", stdout: "pipe", stderr: "ignore" });
+    const text = await Promise.race([
+      new Response(ps.stdout as unknown as BodyInit).text(),
+      Bun.sleep(SURVIVOR_SURVEY_TIMEOUT_MS).then(() => undefined),
+    ]);
+    if (text === undefined) return unidentified;
+    const survivors: ProcessSurvivor[] = [];
+    for (const line of text.split("\n")) {
+      const match = /^\s*(\d+)\s+(\d+)\s+(.*)$/.exec(line);
+      if (match === null) continue;
+      const pid = Number(match[2]);
+      // The group leader *is* the shell, which is gone by the time this runs; excluding it
+      // guards the case where its slot has not yet disappeared from the table.
+      if (Number(match[1]) !== pgid || pid === pgid) continue;
+      survivors.push({ pid, command: match[3]!.trim().slice(0, SURVIVOR_COMMAND_LIMIT) });
+    }
+    // An alive group that lists nothing is a race with the last member exiting, not a survivor.
+    return survivors;
+  } catch {
+    return unidentified;
+  } finally {
+    if (ps !== undefined) { try { ps.kill("SIGKILL"); } catch { /* already exited */ } }
+  }
+}
 
 function killProcessTree(child: Bun.Subprocess, signal: "SIGTERM" | "SIGKILL"): void {
   if (typeof child.pid === "number" && child.pid > 1) {
@@ -676,10 +790,27 @@ async function reapProcessGroup(child: Bun.Subprocess): Promise<void> {
   if (processGroupAlive(child.pid)) killProcessTree(child, "SIGKILL");
 }
 
+/**
+ * The same reap, for a group whose `Bun.Subprocess` is long gone.
+ *
+ * `processGroupAlive` is re-checked immediately before signalling because a pgid is just a
+ * number the kernel recycles: signalling a remembered-but-dead group id is how a session-end
+ * sweep ends up killing an unrelated process that happened to inherit it.
+ */
+async function reapGroup(pgid: number): Promise<void> {
+  if (!Number.isSafeInteger(pgid) || pgid <= 1 || !processGroupAlive(pgid)) return;
+  try { process.kill(-pgid, "SIGTERM"); } catch { /* the group may have exited */ }
+  await Bun.sleep(150);
+  if (!processGroupAlive(pgid)) return;
+  try { process.kill(-pgid, "SIGKILL"); } catch { /* the group may have exited */ }
+}
+
 export class ProcessHost implements HostProcess {
   readonly #semaphores: Readonly<Record<Exclude<ProcessClass, "free">, Semaphore>>;
   readonly #limits: ClassSemaphoreLimits;
   readonly #jobs = new Map<string, JobInternal>();
+  /** Process groups completed jobs left running; §11's session-end sweep is `close`. */
+  readonly #survivingGroups = new Set<number>();
   readonly #acquisitionTimeoutMs: number;
   readonly #defaultTimeoutMs: number;
   readonly #retainSettledJobs: number;
@@ -846,6 +977,14 @@ export class ProcessHost implements HostProcess {
 
   getStatus(id: string): ProcessStatus | undefined { return this.status(id); }
 
+  /**
+   * Session end, and therefore where §11's "nothing is orphaned" is actually enforced.
+   *
+   * A completed job deliberately leaves its background descendants running (see the reap split
+   * in `#spawn`), so closing has to sweep them: every group a finished job left behind is
+   * reaped here alongside the jobs still in flight. Without this half, "descendants survive
+   * the call" would mean "descendants survive the process", which is the leak §11 forbids.
+   */
   async close(): Promise<void> {
     if (!this.#closed) this.#closed = true;
     const pending = [...this.#jobs.values()].filter((job) => !job.settled);
@@ -856,6 +995,9 @@ export class ProcessHost implements HostProcess {
       if (job.child !== undefined) killProcessTree(job.child, "SIGTERM");
     }
     await Promise.all(pending.map((job) => job.resultPromise));
+    const groups = [...this.#survivingGroups];
+    this.#survivingGroups.clear();
+    await Promise.all(groups.map((pgid) => reapGroup(pgid)));
   }
 
   async #execute(job: JobInternal, onRequestAbort: () => void): Promise<void> {
@@ -915,14 +1057,20 @@ export class ProcessHost implements HostProcess {
         stderr: `Unable to spawn bash in ${job.request.cwd}: ${error instanceof Error ? error.message : String(error)}`,
         exitCode: null,
         signal: null,
+        timedOut: false,
         durationMs: Date.now() - started,
       };
     }
 
+    const pgid = typeof child.pid === "number" ? child.pid : 0;
+    let exited = false;
     let terminationSignal: string | null = null;
     let forceTimer: ReturnType<typeof setTimeout> | undefined;
     const terminate = (): void => {
-      if (terminationSignal === null) terminationSignal = "SIGTERM";
+      // Only a kill aimed at a *live* shell is that shell's termination signal. Once the shell
+      // has exited, `terminate` is only ever sweeping descendants — recording SIGTERM there is
+      // how a command that exited 0 came back carrying a signal it never received.
+      if (!exited && terminationSignal === null) terminationSignal = "SIGTERM";
       if (job.cgroupUnit) killCgroupUnit(job.cgroupUnit, "SIGTERM");
       killProcessTree(child, "SIGTERM");
       if (forceTimer === undefined) {
@@ -933,41 +1081,92 @@ export class ProcessHost implements HostProcess {
     job.controller.signal.addEventListener("abort", onAbort, { once: true });
     if (job.controller.signal.aborted) terminate();
 
+    // Started before the first await so nothing the shell writes early can be missed.
+    const stdout = collectOutput(child.stdout);
+    const stderr = collectOutput(child.stderr);
+    let killedByDeadline = false;
+
     try {
       const timeoutMs = job.request.timeoutMs ?? (job.class === "heavy" ? undefined : this.#defaultTimeoutMs);
       let deadlineTimer: ReturnType<typeof setTimeout> | undefined;
       if (timeoutMs !== undefined) {
         deadlineTimer = setTimeout(() => {
+          // A shell that already exited cannot be late. Before this guard the deadline fired
+          // during the pipe-EOF wait a backgrounded grandchild was holding open, and a command
+          // that finished in 2.1s reported itself timed out at 120s.
+          if (exited) return;
+          killedByDeadline = true;
           job.deadlineRequested = true;
           if (!job.controller.signal.aborted) job.controller.abort(new Error(`Process exceeded its ${timeoutMs}ms deadline`));
         }, Math.min(timeoutMs, MAX_TIMER_MS));
       }
       try {
-        const [stdout, stderr, exitCode] = await Promise.all([readOutput(child.stdout), readOutput(child.stderr), child.exited]);
+        // The shell's own exit is the completion signal — never pipe EOF, which belongs to
+        // whichever descendant holds the pipe last (see `OutputCollector`).
+        const exitCode = await child.exited;
+        exited = true;
+        // Snapshotted here: a later `cancel` or `close` aimed at the surviving descendants
+        // must not retroactively rewrite how this shell ended. `durationMs` is the shell's own
+        // lifetime for the same reason — the drain grace and the survivor survey below are this
+        // host's bookkeeping, and charging them to the command would make the reported duration
+        // disagree with the "shell exited in 2.1s" the model is shown.
+        const signal = terminationSignal ?? signalNameFromExitCode(exitCode);
+        const timedOut = killedByDeadline;
+        const durationMs = Date.now() - started;
+        await Promise.race([Promise.all([stdout.done, stderr.done]), Bun.sleep(OUTPUT_DRAIN_GRACE_MS)]);
+        stdout.detach();
+        stderr.detach();
+        // Only a job reaching its own natural end can leave anything behind; the other two
+        // paths reap the whole group in the `finally` below, so the survey would be a lie.
+        const survivors = timedOut || job.cancelRequested ? [] : await surveyProcessGroup(pgid);
         return {
-          stdout,
-          stderr,
+          stdout: stdout.text(),
+          stderr: stderr.text(),
           exitCode,
-          signal: terminationSignal ?? signalNameFromExitCode(exitCode),
-          durationMs: Date.now() - started,
+          signal,
+          timedOut,
+          durationMs,
+          ...(survivors.length === 0 ? {} : { survivors }),
         };
       } catch (error: unknown) {
         return {
-          stdout: "",
+          stdout: stdout.text(),
           stderr: `Unable to collect process output: ${error instanceof Error ? error.message : String(error)}`,
           exitCode: null,
           signal: terminationSignal,
+          timedOut: killedByDeadline,
           durationMs: Date.now() - started,
         };
       } finally {
         if (deadlineTimer !== undefined) clearTimeout(deadlineTimer);
+        // Idempotent, and the safety net for the error path: an attached collector would keep
+        // appending a survivor's output to a string nobody will ever read again.
+        stdout.detach();
+        stderr.detach();
       }
     } finally {
       if (forceTimer !== undefined) clearTimeout(forceTimer);
       job.controller.signal.removeEventListener("abort", onAbort);
-      await reapProcessGroup(child);
+      // The §11 reap split. "Nothing is orphaned. Session end kills its process tree" is a
+      // *session*-level promise, and enforcing it per call is what limited a live session's
+      // `node server.js &` to a single call: the server the model deliberately backgrounded
+      // was killed the instant the call that started it returned, so the start-a-server-then-
+      // poke-it-from-the-next-call pattern could not work at all. A job that reaches its own
+      // natural end therefore leaves its descendants alone and hands the group to `close`,
+      // which is where session end actually is. The two paths where killing the tree *is* the
+      // correct answer keep it: a cancelled job (the caller asked for it to stop) and a job
+      // the deadline killed (its shell was still running, so its children are that shell's
+      // unfinished work, not something it chose to leave behind).
+      if (job.cancelRequested || killedByDeadline) await reapProcessGroup(child);
+      else this.#trackSurvivingGroup(pgid);
       job.child = undefined;
     }
+  }
+
+  /** Remember a group a completed job left running, so `close` can honour §11 at session end. */
+  #trackSurvivingGroup(pgid: number): void {
+    if (!Number.isSafeInteger(pgid) || pgid <= 1 || !processGroupAlive(pgid)) return;
+    this.#survivingGroups.add(pgid);
   }
   #cgroupCommand(job: JobInternal): string[] {
     const unit = `lyra-${process.pid}-${job.handle.id}`;
@@ -1012,6 +1211,7 @@ export class ProcessHost implements HostProcess {
       stderr: message,
       exitCode: null,
       signal: "SIGTERM",
+      timedOut: false,
       durationMs: Math.max(0, Date.now() - job.handle.startedAt),
     };
   }
@@ -1022,6 +1222,9 @@ export class ProcessHost implements HostProcess {
       stderr: message,
       exitCode: null,
       signal: null,
+      // A queue timeout is the *host* refusing to start work, not a shell overrunning its
+      // deadline; conflating them would tell the model its command ran and was too slow.
+      timedOut: false,
       durationMs: Math.max(0, Date.now() - job.handle.startedAt),
     };
   }
@@ -1031,4 +1234,4 @@ export function createHostProcess(options: ProcessHostOptions = {}): ProcessHost
   return new ProcessHost(options);
 }
 
-export type { HostProcess, JobHandle, ProcessClass, ProcessRequest, ProcessResult } from "./types.ts";
+export type { HostProcess, JobHandle, ProcessClass, ProcessRequest, ProcessResult, ProcessSurvivor } from "./types.ts";

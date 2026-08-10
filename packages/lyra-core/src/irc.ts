@@ -35,6 +35,8 @@ export interface IrcSendRequest<T = unknown> {
   to: string;
   text?: string;
   data?: T;
+  /** `false` when this sender cannot be answered — see [`IrcMessage.reply`]. */
+  reply?: boolean;
   /** Wait for a revived recipient to acknowledge before the send resolves. */
   await?: boolean;
 }
@@ -44,6 +46,8 @@ export interface IrcPublishRequest<T = unknown> {
   channel: string;
   text?: string;
   data?: T;
+  /** `false` when this sender cannot be answered — see [`IrcMessage.reply`]. */
+  reply?: boolean;
   await?: boolean;
 }
 
@@ -223,7 +227,7 @@ export class IrcBus {
     this.assertName(request.to, "recipient name");
     this.assertContent(request.text, request.data);
     this.assertRegisteredSender(request.from);
-    const message = this.makeMessage({ from: request.from, to: request.to, text: request.text, data: request.data });
+    const message = this.makeMessage({ from: request.from, to: request.to, text: request.text, data: request.data, reply: request.reply });
     const acks: Promise<void>[] = [];
     const delivery = this.deliver(message, request.to, acks);
     return request.await === true ? Promise.all(acks).then(() => this.cloneDelivery(delivery)) : delivery;
@@ -238,7 +242,7 @@ export class IrcBus {
       this.assertRegisteredSender(request.from);
     }
     this.assertContent(request.text, request.data);
-    const message = this.makeMessage({ from: request.from ?? "system", channel: request.channel, text: request.text, data: request.data });
+    const message = this.makeMessage({ from: request.from ?? "system", channel: request.channel, text: request.text, data: request.data, reply: request.reply });
     const recipients = [...(this.channels.get(request.channel) ?? [])];
     const acks: Promise<void>[] = [];
     const output = recipients.map((peer) => this.deliver(message, peer, acks));
@@ -355,7 +359,7 @@ export class IrcBus {
     return delivery;
   }
 
-  private makeMessage<T>(parts: { from: string; to?: string | undefined; channel?: string | undefined; text?: string | undefined; data?: T | undefined }): IrcMessage<T> {
+  private makeMessage<T>(parts: { from: string; to?: string | undefined; channel?: string | undefined; text?: string | undefined; data?: T | undefined; reply?: boolean | undefined }): IrcMessage<T> {
     const message: IrcMessage<T> = {
       id: this.makeId(), from: parts.from, createdAt: this.now(),
     };
@@ -363,6 +367,7 @@ export class IrcBus {
     if (parts.channel !== undefined) message.channel = parts.channel;
     if (parts.text !== undefined) message.text = parts.text;
     if (parts.data !== undefined) message.data = this.cloneData(parts.data);
+    if (parts.reply === false) message.reply = false;
     return message;
   }
 

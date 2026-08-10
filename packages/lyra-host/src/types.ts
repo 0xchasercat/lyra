@@ -42,12 +42,43 @@ export interface ProcessRequest {
    */
   owner?: string;
 }
+/**
+ * A process still alive in the job's process group after its shell exited.
+ *
+ * A shell that backgrounds something (`node server.js &`) hands the pipe to a grandchild and
+ * then exits. Naming that grandchild is the difference between a model that knows it started
+ * a server and a model that stares at output which arrived "too fast" (§3.8: nothing about a
+ * call's outcome is dropped on the floor).
+ */
+export interface ProcessSurvivor {
+  readonly pid: number;
+  /** The argv `ps` reported. Empty when enumeration failed and only the count is known. */
+  readonly command: string;
+}
+
 export interface ProcessResult {
   stdout: string;
   stderr: string;
   exitCode: number | null;
   signal: string | null;
+  /**
+   * True only when the deadline aborted a shell that was *still running* (§11).
+   *
+   * Explicit rather than inferred, because every inference from the other fields is wrong.
+   * `signal !== null` was the old one, and it reported `timed_out: true` for a cancelled job
+   * and for a shell that exited 0 at 2s while a backgrounded grandchild held the output pipe
+   * open until the 120s deadline. A shell that reached its own exit is never timed out, no
+   * matter what its descendants are doing.
+   */
+  timedOut: boolean;
   durationMs: number;
+  /**
+   * Processes still running in the job's group once the shell exited, when there are any.
+   *
+   * Only populated for a job that reached its own natural end: a cancelled or deadline-killed
+   * job has its whole tree reaped, so by construction it leaves nothing behind.
+   */
+  survivors?: readonly ProcessSurvivor[];
 }
 export interface JobHandle {
   id: string;

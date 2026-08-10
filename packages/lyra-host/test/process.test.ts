@@ -153,6 +153,8 @@ describe("classed process execution", () => {
     const result = await host.wait(handle.id);
     expect(result?.stdout).toContain("partial");
     expect(result?.signal).toBe("SIGTERM");
+    // Cancelled is not timed out: the caller asked, no deadline expired (§11).
+    expect(result?.timedOut).toBe(false);
     expect(host.status(handle.id)?.status).toBe("cancelled");
     expect(await host.cancel(handle.id)).toBe(false);
   });
@@ -167,7 +169,7 @@ describe("classed process execution", () => {
       cwd: root,
       timeoutMs: 40,
     });
-    expect(result).toMatchObject({ stdout: "before", signal: "SIGTERM" });
+    expect(result).toMatchObject({ stdout: "before", signal: "SIGTERM", timedOut: true });
     expect(result.stdout).not.toContain("after");
   });
 
@@ -184,15 +186,87 @@ describe("classed process execution", () => {
     await expect(host.run({ command: "printf no", cwd: root })).rejects.toThrow("closed");
   });
 
-  test("reaps redirected background descendants when their shell exits", async () => {
+  /**
+   * The exact live failure, twice observed: `node server.js & sleep 1; curl …` printed
+   * everything and its shell exited in ~2s, but the orphaned server inherited the stdout pipe,
+   * EOF never came, the call ran to its full 120s deadline and then reported the impossible
+   * triple `exit_code: 0`, `timed_out: true`, `signal: SIGTERM`. The call now ends on the
+   * *shell's* exit, so none of those three can be wrong again.
+   */
+  test("returns when the shell exits rather than when a backgrounded child releases the pipe", async () => {
+    const root = await mkdtemp(join(tmpdir(), "lyra-host-process-"));
+    roots.push(root);
+    const host = new ProcessHost({ nproc: 1 });
+    // Closing the host is the teardown that kills the survivor this test deliberately leaves.
+    hosts.push(host);
+    const started = Date.now();
+    // No redirect: the backgrounded child holds the real stdout pipe, which is the bug.
+    const result = await host.run({ command: "/bin/sleep 30 & echo done", cwd: root, timeoutMs: 10_000 });
+    const elapsed = Date.now() - started;
+    expect("id" in result).toBe(false);
+    if ("id" in result) return;
+    // Well under the deadline: the old code sat on this for the full 10s.
+    expect(elapsed).toBeLessThan(3_000);
+    expect(result).toMatchObject({ exitCode: 0, signal: null, timedOut: false });
+    expect(result.stdout).toContain("done");
+    // The survivor is named, not hidden: a model reading this knows it started something.
+    const survivors = result.survivors ?? [];
+    expect(survivors.length).toBe(1);
+    expect(survivors[0]?.command).toContain("sleep 30");
+    expect(() => process.kill(survivors[0]!.pid, 0)).not.toThrow();
+  });
+
+  /**
+   * §11's "nothing is orphaned" is a *session*-level promise. Reaping per call is what limited
+   * a live session's `node server.js &` to a single call, so a job that reaches its own end
+   * leaves its descendants alone and `close` sweeps the group instead.
+   */
+  test("a completed job leaves its descendants running, and close reaps the group", async () => {
     const root = await mkdtemp(join(tmpdir(), "lyra-host-process-"));
     roots.push(root);
     const host = new ProcessHost({ nproc: 1 });
     hosts.push(host);
+    // Redirected, so this covers the other shape too: the survivor is not holding the pipe and
+    // the shell was always prompt here — it was the reap that killed it a call too early.
+    // `sleep` with a redirect operand does not parse as a bounded sleep, so it classifies
+    // heavy and comes back as a handle; the survival question is the same either way.
     const handle = await host.run({ command: "/bin/sleep 30 >/dev/null 2>&1 & echo $!", cwd: root });
-    const result = "id" in handle ? await host.wait(handle.id) : handle;
-    const pid = Number(result?.stdout.trim());
+    const first = "id" in handle ? await host.wait(handle.id) : handle;
+    const pid = Number(first?.stdout.trim());
     expect(Number.isSafeInteger(pid)).toBe(true);
+    // Still there for the next call — the start-a-server-then-poke-it pattern.
+    expect(() => process.kill(pid, 0)).not.toThrow();
+    const second = await host.run({ command: `kill -0 ${pid} && echo up`, cwd: root });
+    expect((second as { stdout: string }).stdout).toContain("up");
+
+    await host.close();
+    await Bun.sleep(250);
+    expect(() => process.kill(pid, 0)).toThrow();
+  });
+
+  /**
+   * The other half of the rule: `timed_out` is true exactly when the deadline aborted a shell
+   * that was still running, and that path still kills the whole tree, backgrounded children
+   * included — they are the shell's unfinished work, not something it chose to leave behind.
+   */
+  test("a shell that overruns its own deadline is timed out and its whole tree is reaped", async () => {
+    const root = await mkdtemp(join(tmpdir(), "lyra-host-process-"));
+    roots.push(root);
+    const host = new ProcessHost({ nproc: 1 });
+    hosts.push(host);
+    const result = await host.run({
+      command: "/bin/sleep 30 & echo $!; /usr/bin/perl -e 'select undef, undef, undef, 5'",
+      cwd: root,
+      timeoutMs: 300,
+    });
+    expect("id" in result).toBe(false);
+    if ("id" in result) return;
+    expect(result.timedOut).toBe(true);
+    expect(result.signal).toBe("SIGTERM");
+    expect(result.survivors).toBeUndefined();
+    const pid = Number(result.stdout.trim());
+    expect(Number.isSafeInteger(pid)).toBe(true);
+    await Bun.sleep(250);
     expect(() => process.kill(pid, 0)).toThrow();
   });
 
