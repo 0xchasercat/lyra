@@ -3,6 +3,11 @@ export interface RuntimeAdapters {
   exec(command: string, options: unknown | undefined, signal: AbortSignal): Promise<unknown>;
   tool(name: "read" | "write" | "edit" | "glob" | "grep", args: unknown, signal: AbortSignal): Promise<unknown>;
   irc(operation: "send" | "publish" | "wait", args: unknown, signal: AbortSignal): Promise<unknown>;
+  /**
+   * `rollback` restores a *checkpoint* (§10.2) — `{ checkpoint?, force? }`, defaulting to
+   * the newest — rather than a CoW snapshot; the two snapshot systems were unified into
+   * one. `preview` and `apply` are unchanged.
+   */
   git(operation: "preview" | "apply" | "rollback", args: unknown | undefined, signal: AbortSignal): Promise<unknown>;
   workspace(operation: "create" | "list" | "drop", args: unknown | undefined, signal: AbortSignal): Promise<unknown>;
   report(message: string, signal: AbortSignal): void | Promise<void>;

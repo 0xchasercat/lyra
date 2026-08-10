@@ -47,10 +47,15 @@ export class McpRegistry {
   private async save(): Promise<void> { await mkdir(join(this.path, ".."), { recursive: true, mode: 0o700 }); const temporary = `${this.path}.${process.pid}.tmp`; await writeFile(temporary, `${JSON.stringify(this.#configs, null, 2)}\n`, { flag: "w", mode: 0o600 }); await rename(temporary, this.path); }
 }
 
-export const MCP_DEFINITION: ToolDefinition = Object.freeze({ name: "mcp", description: "Describe one indexed MCP tool or call it with explicit server, tool, and arguments.", inputSchema: Object.freeze({ type: "object", additionalProperties: false, properties: { op: { type: "string", enum: ["describe", "call"], description: "describe returns the tool's full schema; call invokes it." }, server: { type: "string", description: "Server name from the index in this description." }, tool: { type: "string", description: "Tool name on that server." }, args: { description: "Arguments object for the call, shaped by the schema describe returns." }, arguments: { description: "Alias for args." } }, required: ["op", "server", "tool"] }) });
+export const MCP_DEFINITION: ToolDefinition = Object.freeze({ name: "mcp", description: "Describe one indexed MCP tool or call it with explicit server, tool, and arguments.", inputSchema: Object.freeze({ type: "object", additionalProperties: false, properties: { op: { type: "string", enum: ["describe", "call"], description: "describe returns the tool's full schema; call invokes it." }, server: { type: "string", description: "Server name from the index in this description." }, tool: { type: "string", description: "Tool name on that server." }, args: { description: "Arguments object for the call, shaped by the schema describe returns." } }, required: ["op", "server", "tool"] }) });
 
 const MCP_ALIASES: readonly ToolAlias[] = Object.freeze([{ canonical: "args", aliases: ["arguments"] }]);
-/** `arguments` is the MCP wire spelling of tools/call params, so models reach for it here too. */
+/**
+ * `arguments` is the MCP wire spelling of `tools/call` params, so models reach for it here
+ * too. Accepted and folded — and deliberately *not* advertised (§3.7): a strict emitter
+ * fills every declared property, so declaring both spellings taught it to send the same
+ * object twice and pay tokens for the privilege.
+ */
 export function normalizeMcpArgs(input: unknown): unknown | string { return foldToolAliases(input, MCP_ALIASES, "mcp"); }
 interface McpArtifactStore { put(content: string | Uint8Array, options?: { mimeType?: string; name?: string }): Promise<string>; }
 export class McpGateway implements McpToolLike {

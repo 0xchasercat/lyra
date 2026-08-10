@@ -1,8 +1,8 @@
 import { readdir, readFile, realpath, stat } from "node:fs/promises";
 import { basename, dirname, isAbsolute, relative, resolve, sep } from "node:path";
-import { aliasSchema, foldToolAliases, rejectedField, toolArgs, type ToolAlias } from "@lyra/core";
+import { foldToolAliases, rejectedField, toolArgs, type ToolAlias } from "@lyra/core";
 import type { ToolDefinition } from "@lyra/provider";
-import type { ArtifactStore, LyraTool, ToolExecutionResult, ToolRuntimeContext } from "./types.ts";
+import { coerceScalars, dropPadding, type ArtifactStore, type LyraTool, type ToolExecutionResult, type ToolRuntimeContext } from "./types.ts";
 import { FileArtifactStore } from "./artifacts.ts";
 import { boundText, DEFAULT_TOOL_DISPLAY_BUDGET, resolveToolPath, type FilesystemToolOptions } from "./filesystem-tools.ts";
 
@@ -89,7 +89,9 @@ async function ignoreRules(origin: string): Promise<IgnoreRule[]> {
 }
 function ignored(path: string, origin: string, rules: readonly IgnoreRule[]): boolean {
   const rel = slash(relative(origin, path));
-  if (rel === ".git" || rel.startsWith(".git/") || rel === ".lyra/artifacts" || rel.startsWith(".lyra/artifacts/")) return true;
+  // .lyra is Lyra's own state (checkpoints, sessions, artifacts) — never search
+  // results, in a git repo (where info/exclude hides it) or out of one.
+  if (rel === ".git" || rel.startsWith(".git/") || rel === ".lyra" || rel.startsWith(".lyra/")) return true;
   let result = false;
   for (const rule of rules) if (rule.regex.test(rule.basenameOnly ? basename(rel) : rel)) result = !rule.negate;
   return result;
@@ -124,7 +126,7 @@ export const GLOB_DEFINITION: ToolDefinition = Object.freeze({
   inputSchema: Object.freeze({
     type: "object",
     properties: {
-      pattern: { type: "string", minLength: 1, description: "Glob such as src/**/*.ts. ** crosses directories, * and ? do not." },
+      pattern: { type: "string", minLength: 1, description: "Glob matched against paths relative to the search directory: ** crosses directories, * and ? stop at one segment, so src/**/*.ts finds nested files and *.ts only top-level ones." },
       path: { type: "string", minLength: 1, description: "Directory to search, defaulting to cwd." },
     },
     required: ["pattern"],
@@ -137,34 +139,44 @@ export const GREP_DEFINITION: ToolDefinition = Object.freeze({
   inputSchema: Object.freeze({
     type: "object",
     properties: {
-      pattern: { type: "string", description: "JavaScript regular expression, matched against one line at a time." },
+      pattern: { type: "string", minLength: 1, description: "JavaScript regular expression, matched against one line at a time." },
       path: { type: "string", minLength: 1, description: "File or directory to search, defaulting to cwd." },
-      flags: { type: "string", description: "JavaScript RegExp flags, such as \"i\" for case-insensitive." },
+      flags: { type: "string", description: "JavaScript RegExp flags: any of d, g, i, m, s, u, v, y. \"i\" is case-insensitive." },
       glob: { type: "string", description: "Restrict the search to files matching this glob, such as **/*.ts." },
       maxResults: { type: "integer", minimum: 1, description: "Cap on matched lines, or on matched files in the other output modes. Defaults to 1000." },
       before: { type: "integer", minimum: 0, description: "Context lines to include before each match." },
       after: { type: "integer", minimum: 0, description: "Context lines to include after each match." },
       output_mode: { type: "string", enum: ["content", "files_with_matches", "count"], description: "content (default) returns path:line: text; files_with_matches returns matching paths; count returns path:count." },
-      include: aliasSchema("glob", "string"),
-      head_limit: aliasSchema("maxResults", "integer", { minimum: 1 }),
-      headLimit: aliasSchema("maxResults", "integer", { minimum: 1 }),
-      "-A": aliasSchema("after", "integer", { minimum: 0 }),
-      "-B": aliasSchema("before", "integer", { minimum: 0 }),
-      "-C": { type: "integer", minimum: 0, description: "Context lines on both sides; sets before and after together." },
-      "-i": { type: "boolean", description: "Case-insensitive; the ripgrep spelling, folded into flags." },
-      "-n": { type: "boolean", description: "Line numbers. Matches are always reported as path:line: text, so only true is meaningful." },
     },
     required: ["pattern"],
     additionalProperties: false,
   }),
 });
 
+/**
+ * ripgrep's switches and Claude Code's field names, accepted at runtime and deliberately
+ * absent from the advertised schema: declaring `-A`, `-B`, `include`, and `head_limit`
+ * alongside their canonical twins doubled grep's surface and invited a strict emitter to fill
+ * every one of them (§3.7).
+ */
 const GREP_ALIASES: readonly ToolAlias[] = Object.freeze([
-  { canonical: "glob", aliases: ["include"] },
-  { canonical: "maxResults", aliases: ["head_limit", "headLimit"] },
-  { canonical: "after", aliases: ["-A"] },
-  { canonical: "before", aliases: ["-B"] },
+  { canonical: "glob", aliases: ["include", "file_pattern", "filePattern"] },
+  { canonical: "maxResults", aliases: ["head_limit", "headLimit", "limit"] },
+  { canonical: "after", aliases: ["-A", "after_context", "afterContext"] },
+  { canonical: "before", aliases: ["-B", "before_context", "beforeContext"] },
+  { canonical: "path", aliases: ["file_path", "filePath", "directory"] },
+  { canonical: "output_mode", aliases: ["outputMode"] },
+  { canonical: "pattern", aliases: ["regex", "query"] },
 ]);
+
+/** Optional grep fields a schema-complete emitter pads. `maxResults: 0` can only be padding. */
+const GREP_PADDING = Object.freeze({ path: true as const, glob: true as const, flags: true as const, output_mode: true as const, maxResults: 1, before: 0, after: 0, "-C": 0 });
+
+/** Scalars a stringifying emitter sends as text. */
+const GREP_SCALARS = Object.freeze({ maxResults: "integer" as const, before: "integer" as const, after: "integer" as const, "-C": "integer" as const });
+
+/** Every flag the JavaScript RegExp constructor accepts; anything else is a typo worth naming. */
+const REGEXP_FLAGS = "dgimsuvy";
 
 /** ripgrep-flavoured switches fold onto grep's own fields; the ones with no honest mapping say so. */
 export function normalizeGrepArgs(input: unknown): unknown | string {
@@ -176,7 +188,7 @@ export function normalizeGrepArgs(input: unknown): unknown | string {
     const hit = rejectedField(input, field, lesson);
     if (hit !== undefined) return hit;
   }
-  const folded = foldToolAliases(input, GREP_ALIASES, "grep");
+  const folded = dropPadding(coerceScalars(foldToolAliases(input, GREP_ALIASES, "grep"), GREP_SCALARS), GREP_PADDING);
   if (typeof folded === "string") return folded;
   const args = toolArgs(folded);
   if (args === undefined) return folded;
@@ -206,6 +218,14 @@ export function normalizeGrepArgs(input: unknown): unknown | string {
     if (numbered === false) return "-n cannot be false: matches are always reported as path:line: text, so line numbers are never omitted. Use output_mode: \"files_with_matches\" for paths only.";
     delete draft()["-n"];
   }
+  // A bad flag string otherwise surfaces as "Invalid regular expression", sending the model
+  // to fix a pattern that was never wrong.
+  const flags = (output ?? args).flags;
+  if (typeof flags === "string" && flags.length > 0) {
+    const bad = [...flags].filter((flag) => !REGEXP_FLAGS.includes(flag));
+    if (bad.length > 0) return `flags may only contain ${[...REGEXP_FLAGS].join(", ")}; ${JSON.stringify(bad.join(""))} is not a regular-expression flag. Case-insensitive search is flags: "i", and filename filtering is glob.`;
+    if (new Set(flags).size !== flags.length) return `flags ${JSON.stringify(flags)} repeats a letter; each flag may appear once.`;
+  }
   return output ?? args;
 }
 
@@ -217,28 +237,98 @@ export async function globPaths(pattern: string, root: string, origin = root): P
   return files.filter((path) => regex.test(slash(relative(root, path))) || regex.test(slash(relative(origin, path)))).sort((a, b) => slash(relative(origin, a)).localeCompare(slash(relative(origin, b))));
 }
 
+const GLOB_ALIASES: readonly ToolAlias[] = Object.freeze([
+  { canonical: "pattern", aliases: ["glob", "globPattern", "glob_pattern"] },
+  { canonical: "path", aliases: ["file_path", "filePath", "directory", "dir"] },
+]);
+const GLOB_PADDING = Object.freeze({ path: true as const });
+
+/** Folds glob's foreign spellings and drops a padded path (§3.7). */
+export function normalizeGlobArgs(input: unknown): unknown | string {
+  return dropPadding(foldToolAliases(input, GLOB_ALIASES, "glob"), GLOB_PADDING);
+}
+
+function notFound(error: unknown): boolean {
+  const code = (error as { code?: unknown } | null)?.code;
+  return code === "ENOENT" || code === "ENOTDIR";
+}
+
+/**
+ * Split an absolute pattern into the literal directory it starts with and the glob that
+ * follows. A model that pastes a full path into `pattern` — the natural thing to do after
+ * reading an absolute path out of some other tool's output — then matches real files instead
+ * of getting silence, and the literal half can serve as the search root.
+ */
+function absoluteGlobParts(pattern: string): { base: string; rest: string } | undefined {
+  if (!isAbsolute(pattern)) return undefined;
+  const segments = slash(pattern).split("/");
+  const base: string[] = [];
+  let index = 0;
+  for (; index < segments.length; index += 1) {
+    if (/[*?[{]/.test(segments[index]!)) break;
+    base.push(segments[index]!);
+  }
+  if (index >= segments.length || base.length === 0) return undefined;
+  return { base: base.join("/") || "/", rest: segments.slice(index).join("/") };
+}
+
 export class GlobTool implements LyraTool {
   readonly definition = GLOB_DEFINITION;
   constructor(private readonly options: SearchToolOptions = {}) {}
-  async execute(args: unknown, context: ToolRuntimeContext): Promise<ToolExecutionResult> {
+  normalize(args: unknown): unknown | string { return normalizeGlobArgs(args); }
+  async execute(input: unknown, context: ToolRuntimeContext): Promise<ToolExecutionResult> {
     try {
-      if (!validObject(args) || !str(args.pattern) || !args.pattern) return fail("glob requires a non-empty pattern string.");
-      const { path, origin, cwd } = await searchRoot(args.path, context, this.options.root);
+      const normalized = normalizeGlobArgs(input);
+      if (typeof normalized === "string") return fail(normalized);
+      const args = normalized as Record<string, unknown>;
+      if (!validObject(args) || !str(args.pattern) || !args.pattern.trim()) return fail("glob requires pattern as a non-empty string, such as \"src/**/*.ts\".");
+      const absolute = absoluteGlobParts(args.pattern);
+      const absoluteBase = absolute === undefined ? undefined : await realpath(absolute.base).catch(() => absolute.base);
+      // An absolute pattern names its own directory, so it is also where the walk starts when
+      // no path was given.
+      const { path, origin, cwd } = await searchRoot(args.path ?? absoluteBase, context, this.options.root);
       const regex = globRegex(slash(args.pattern));
+      const absoluteRegex = absolute === undefined ? undefined : globRegex(absolute.rest);
       const rules = await ignoreRules(origin);
-      const info = await stat(path);
+      let info;
+      try { info = await stat(path); }
+      catch (error) {
+        if (!notFound(error)) throw error;
+        return fail(`No such directory: ${slash(relative(cwd, path)) || path}. glob searches an existing directory — omit path to search the working directory.`);
+      }
       const files = info.isDirectory() ? await walk(path, origin, rules) : [path];
-      const matches = files.filter((file) => {
-        if (ignored(file, origin, rules)) return false;
-        return regex.test(slash(relative(cwd, file))) || regex.test(slash(relative(origin, file)));
+      const visible = files.filter((file) => !ignored(file, origin, rules));
+      const matches = visible.filter((file) => {
+        if (regex.test(slash(relative(cwd, file))) || regex.test(slash(relative(origin, file))) || regex.test(slash(file))) return true;
+        if (absoluteRegex === undefined || absoluteBase === undefined) return false;
+        const rest = slash(relative(absoluteBase, file));
+        return !rest.startsWith("../") && absoluteRegex.test(rest);
       }).sort((a, b) => slash(relative(cwd, a)).localeCompare(slash(relative(cwd, b))));
       // An empty string cannot be read as "no matches" — it looks like a broken tool, and a
       // model that cannot tell those apart retries the same call (§3.7).
-      if (matches.length === 0) return ok(`No files match ${JSON.stringify(args.pattern)} under ${slash(relative(cwd, path)) || "."}. Widen the pattern, or check the directory with bash.`);
+      if (matches.length === 0) return ok(emptyGlob(args.pattern, slash(relative(cwd, path)) || ".", visible, cwd, origin));
       const output = matches.map((file) => slash(relative(cwd, file))).join("\n");
       return ok(await boundText(output, storeFor(context, this.options.artifactStore, this.options.root), { budget: budgetFor(this.options), mimeType: "text/plain", name: args.pattern }));
     } catch (error) { return fail(`Unable to glob files: ${errorMessage(error)} Check the directory, pattern syntax, and permissions, then retry.`); }
   }
+}
+
+/**
+ * The commonest empty result is `*.ts` where `**​/*.ts` was meant — `*` stops at a path
+ * segment. Rather than say "widen the pattern" and leave the model guessing, the recursive
+ * form is tried and, when it would have matched, named with its count.
+ */
+function emptyGlob(pattern: string, where: string, files: readonly string[], cwd: string, origin: string): string {
+  const base = `No files match ${JSON.stringify(pattern)} under ${where}.`;
+  if (!pattern.includes("**")) {
+    const recursive = `**/${slash(pattern).replace(/^\.?\//, "")}`;
+    try {
+      const regex = globRegex(recursive);
+      const count = files.filter((file) => regex.test(slash(relative(cwd, file))) || regex.test(slash(relative(origin, file)))).length;
+      if (count > 0) return `${base} ${count} file${count === 1 ? "" : "s"} match ${JSON.stringify(recursive)} — * stops at one path segment, so use **/ to search nested directories.`;
+    } catch { /* a pattern that will not compile recursively teaches nothing extra */ }
+  }
+  return `${base} Widen the pattern, or list the directory with read({ path: ${JSON.stringify(where)} }).`;
 }
 interface MatchLine { path: string; line: number; text: string; }
 function binary(bytes: Uint8Array): boolean {
@@ -254,7 +344,9 @@ export class GrepTool implements LyraTool {
       const normalized = normalizeGrepArgs(input);
       if (typeof normalized === "string") return fail(normalized);
       const args = normalized as Record<string, unknown>;
-      if (!validObject(args) || !str(args.pattern)) return fail("grep requires pattern as a regular-expression string.");
+      // An empty pattern matches every line of every file, which is never what a call meant to
+      // ask; a schema-complete emitter that pads `pattern` would otherwise dump the tree.
+      if (!validObject(args) || !str(args.pattern) || args.pattern.length === 0) return fail("grep requires pattern as a non-empty regular-expression string, such as \"createUser\\\\(\".");
       const outputMode = args.output_mode === undefined ? "content" : args.output_mode;
       if (outputMode !== "content" && outputMode !== "files_with_matches" && outputMode !== "count") return fail("output_mode must be content, files_with_matches, or count.");
       let regex: RegExp;
@@ -267,7 +359,12 @@ export class GrepTool implements LyraTool {
       if (typeof maxResults !== "number" || !Number.isSafeInteger(maxResults) || maxResults < 1) return fail("maxResults must be a positive integer.");
       const { path, origin } = await searchRoot(args.path, context, this.options.root);
       const rules = await ignoreRules(origin);
-      const info = await stat(path);
+      let info;
+      try { info = await stat(path); }
+      catch (error) {
+        if (!notFound(error)) throw error;
+        return fail(`No such file or directory: ${slash(relative(origin, path)) || path}. Omit path to search the working directory, or find the right one with glob.`);
+      }
       let files = info.isDirectory() ? await walk(path, origin, rules) : [path];
       if (str(args.glob) && args.glob) { const glob = globRegex(slash(args.glob)); files = files.filter((file) => glob.test(slash(relative(path, file))) || glob.test(slash(relative(origin, file)))); }
       files = [...new Set(files)].sort((a, b) => slash(relative(origin, a)).localeCompare(slash(relative(origin, b))));

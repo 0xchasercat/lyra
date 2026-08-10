@@ -1,9 +1,9 @@
 import { realpath } from "node:fs/promises";
 import { resolve } from "node:path";
 import type { ToolDefinition } from "@lyra/provider";
-import { aliasSchema, foldToolAliases, type ToolAlias, type ToolExecutionContext, type ToolExecutionResult } from "@lyra/core";
+import { foldToolAliases, toolArgs, type ToolAlias, type ToolExecutionContext, type ToolExecutionResult } from "@lyra/core";
 import { boundText } from "./filesystem-tools.ts";
-import type { ArtifactStore, LyraTool, ToolRuntimeContext } from "./types.ts";
+import { coerceScalars, dropPadding, type ArtifactStore, type LyraTool, type ToolRuntimeContext } from "./types.ts";
 import { createArtifactStore } from "./artifacts.ts";
 
 export interface GitToolOptions {
@@ -15,22 +15,71 @@ export interface GitToolOptions {
 
 export const GIT_DEFINITION: ToolDefinition = Object.freeze({
   name: "git",
-  description: "Run one git command in the workspace and report repository state, output, and exit status. Destructive subcommands are logged, never blocked.",
+  // §10 reversed where work happens — the main session runs in the launch directory, not a
+  // clone — so "the workspace" was the old vocabulary for a path the model now selects itself.
+  // §12 deleted the git modes, and saying so is worth the words: every other harness has one.
+  description: "Run one git command from the model-selected working directory and report its stdout, stderr, exit status, and whether the subcommand was destructive. There are no git modes: destructive subcommands are logged, never blocked.",
   inputSchema: Object.freeze({
     type: "object",
     additionalProperties: false,
     properties: {
-      args: { type: "array", minItems: 1, items: { type: "string" }, description: "Arguments after the git executable, already split: [\"commit\", \"-m\", \"fix: thing\"]. Not a single command string." },
+      args: { type: "array", minItems: 1, items: { type: "string" }, description: "Arguments after the git executable, already split, with no leading \"git\": [\"commit\", \"-m\", \"fix: thing\"]." },
       cwd: { type: "string", minLength: 1, description: "Optional absolute or cwd-relative working directory." },
       timeoutMs: { type: "integer", minimum: 1, maximum: 3_600_000, description: "Optional deadline in milliseconds." },
-      timeout: aliasSchema("timeoutMs", "integer", { minimum: 1, maximum: 3_600_000 }),
     },
     required: ["args"],
   }),
 });
 
-const GIT_ALIASES: readonly ToolAlias[] = Object.freeze([{ canonical: "timeoutMs", aliases: ["timeout"] }]);
-export function normalizeGitArgs(input: unknown): unknown | string { return foldToolAliases(input, GIT_ALIASES, "git"); }
+/** Accepted at runtime, absent from the advertised schema (§3.7). */
+const GIT_ALIASES: readonly ToolAlias[] = Object.freeze([
+  { canonical: "timeoutMs", aliases: ["timeout", "timeout_ms"] },
+  { canonical: "cwd", aliases: ["workdir", "working_directory"] },
+  { canonical: "args", aliases: ["command", "cmd", "arguments"] },
+]);
+const GIT_PADDING = Object.freeze({ cwd: true as const, timeoutMs: 1 });
+
+/** Split a git command line the way a shell would, so a quoted commit message survives. */
+export function splitGitCommand(line: string): string[] {
+  const parts: string[] = [];
+  let current = "";
+  let quote: '"' | "'" | undefined;
+  let started = false;
+  for (let index = 0; index < line.length; index += 1) {
+    const char = line[index]!;
+    if (quote !== undefined) {
+      if (char === quote) { quote = undefined; continue; }
+      if (char === "\\" && quote === '"' && index + 1 < line.length) { current += line[++index]; continue; }
+      current += char;
+      continue;
+    }
+    if (char === '"' || char === "'") { quote = char; started = true; continue; }
+    if (char === "\\" && index + 1 < line.length) { current += line[++index]; started = true; continue; }
+    if (/\s/.test(char)) { if (started || current.length > 0) { parts.push(current); current = ""; started = false; } continue; }
+    current += char;
+    started = true;
+  }
+  if (started || current.length > 0) parts.push(current);
+  return parts;
+}
+
+/**
+ * Two first calls this tool used to refuse outright, both of which have one honest reading:
+ * `args: "status --short"` (or a one-element array holding the whole line) is a command line,
+ * so it is split like one; a leading `"git"` is the executable this tool already runs, so it
+ * is dropped rather than passed to git as a subcommand.
+ */
+export function normalizeGitArgs(input: unknown): unknown | string {
+  const folded = dropPadding(coerceScalars(foldToolAliases(input, GIT_ALIASES, "git"), { timeoutMs: "integer" }), GIT_PADDING);
+  if (typeof folded === "string") return folded;
+  const source = toolArgs(folded);
+  if (source === undefined) return folded;
+  let args = source.args;
+  if (typeof args === "string") args = splitGitCommand(args);
+  if (Array.isArray(args) && args.length === 1 && typeof args[0] === "string" && /\s/.test(args[0])) args = splitGitCommand(args[0]);
+  if (Array.isArray(args) && args.length > 1 && typeof args[0] === "string" && args[0].trim().toLowerCase() === "git") args = args.slice(1);
+  return args === source.args ? source : { ...source, args };
+}
 
 function errorResult(message: string): ToolExecutionResult { return { content: message, isError: true }; }
 function runtime(context: ToolExecutionContext, root?: string): { cwd: string; origin: string; store: ArtifactStore } {

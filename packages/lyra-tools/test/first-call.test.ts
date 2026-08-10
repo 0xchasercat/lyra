@@ -1,6 +1,6 @@
 import { ProcessHost } from "@lyra/host";
 import { describe, expect, test } from "bun:test";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createArtifactStore, createDefaultToolRegistry, type ToolRegistry } from "../src/index.ts";
@@ -197,13 +197,119 @@ describe("first-call ergonomics", () => {
     } finally { await close(); }
   });
 
-  test("bash still refuses a real job id sent alongside a command", async () => {
+  /**
+   * Verbatim from the live session that made this rule: the model held a real job id and, being
+   * unable to leave `command` out, sent `job-000005` beside a padded `"true"`. The old rule
+   * refused the pair, fired twice, and the job's output was never collected. Both fields filled
+   * now means the job wins, and the ignored command is named so a model that meant to run
+   * something can resend it alone.
+   */
+  test("bash collects the job when a real job id arrives beside a padded command", async () => {
     const { registry, context, close } = await fixture();
     try {
-      const result = await registry.execute("bash", { command: "printf 'hi'", job: "job-000001" }, context);
+      const started = await registry.execute("bash", { command: "printf 'collected'", run_in_background: true }, context);
+      const jobId = String(started.metadata?.jobId);
+      expect(jobId).toStartWith("job-");
+
+      const collected = await registry.execute("bash", { command: "true", job: jobId, cwd: null, description: "Collect the job", timeoutMs: 30_000 }, context);
+      expect(collected.isError).not.toBe(true);
+      expect(text(collected)).toContain("collected");
+      expect(text(collected)).toContain(`command ignored: collecting ${jobId}`);
+      expect(text(collected)).toContain("send it with no job");
+      expect(collected.metadata?.ignoredCommand).toBe("true");
+    } finally { await close(); }
+  });
+
+  /**
+   * The other spelling of the same padding, and the one that used to be unreachable.
+   *
+   * `command: ""` beside a real job id is what the emitter above sends when it has nothing to
+   * put in a field it cannot omit. `minLength: 1` refused it in the validator — before
+   * `parseArgs` could notice the job and collect it — so the collect path the `job` description
+   * documents did not exist for the very caller the padding machinery is there to absorb.
+   */
+  test("bash collects the job when a blank command is padded beside a real job id", async () => {
+    const { registry, context, close } = await fixture();
+    try {
+      const started = await registry.execute("bash", { command: "printf 'padded'", run_in_background: true }, context);
+      const jobId = String(started.metadata?.jobId);
+
+      const collected = await registry.execute("bash", { command: "", cwd: "", timeoutMs: 0, description: "", run_in_background: false, job: jobId }, context);
+      expect(collected.isError).not.toBe(true);
+      expect(text(collected)).toContain("padded");
+      // A blank command was never a command, so there is nothing to report as ignored.
+      expect(text(collected)).not.toContain("command ignored");
+    } finally { await close(); }
+  });
+
+  /** A blank command with no job is a call with nothing to run, and says so in those terms. */
+  test("bash teaches instead of failing schema validation on a padded empty command", async () => {
+    const { registry, context, close } = await fixture();
+    try {
+      const result = await registry.execute("bash", { command: "", cwd: "", description: "" }, context);
       expect(result.isError).toBe(true);
-      expect(text(result)).toContain("job-000001");
-      expect(text(result)).toContain("command");
+      expect(text(result)).toContain("command must be a non-empty string");
+      expect(text(result)).toContain("pass job to collect the output");
+      expect(text(result)).not.toContain("must not be empty —");
+    } finally { await close(); }
+  });
+
+  test("bash says the command was ignored even when the job id is unknown", async () => {
+    const { registry, context, close } = await fixture();
+    try {
+      const result = await registry.execute("bash", { command: "printf 'hi'", job: "job-000999" }, context);
+      expect(result.isError).toBe(true);
+      expect(text(result)).toContain("job-000999");
+      expect(text(result)).toContain("command ignored");
+    } finally { await close(); }
+  });
+
+  /** Backgrounding a command the model expected to block is a surprise unless it says why. */
+  test("bash names the pattern that sent a command to the background", async () => {
+    const { registry, context, close } = await fixture();
+    try {
+      const heavy = await registry.execute("bash", { command: "sleep 3600; printf 'after'" }, context);
+      expect(heavy.isError).not.toBe(true);
+      expect(text(heavy)).toContain("backgrounded: matched heavy pattern \"sleep\"");
+      expect(String(heavy.metadata?.reason)).toContain("sleep");
+      // The hour-long job is the classification's proof; collect with a short
+      // deadline and expect the still-running answer rather than the output.
+      const pending = await registry.execute("bash", { job: String(heavy.metadata?.jobId), timeoutMs: 50 }, context);
+      expect(text(pending)).toContain("still running");
+
+      const asked = await registry.execute("bash", { command: "printf 'asked'", run_in_background: true }, context);
+      expect(text(asked)).toContain("backgrounded: run_in_background was set");
+      await registry.execute("bash", { job: String(asked.metadata?.jobId) }, context);
+    } finally { await close(); }
+  });
+
+  /** JSON-mode emitters stringify scalars; "$args.timeoutMs must be integer" teaches nothing. */
+  test("numbers and booleans that arrive as strings are read as what they are", async () => {
+    const { root, registry, context, close } = await fixture();
+    try {
+      await writeFile(join(root, "numbers.txt"), Array.from({ length: 8 }, (_, index) => `line ${index + 1}`).join("\n"));
+      const ranged = await registry.execute("read", { path: "numbers.txt", startLine: "2", endLine: "3" }, context);
+      expect(ranged.isError).not.toBe(true);
+      expect(text(ranged)).toContain("line 2");
+      expect(text(ranged)).not.toContain("line 4");
+
+      const ran = await registry.execute("bash", { command: "printf 'stringy'", timeout: "30000", run_in_background: "false" }, context);
+      expect(ran.isError).not.toBe(true);
+      expect(text(ran)).toContain("stringy");
+
+      const grepped = await registry.execute("grep", { pattern: "line", path: root, maxResults: "2" }, context);
+      expect(grepped.isError).not.toBe(true);
+      expect(text(grepped).split("\n")).toHaveLength(2);
+    } finally { await close(); }
+  });
+
+  /** A cosmetic UI label must never cost the model its command. */
+  test("bash truncates an over-long description instead of refusing the call", async () => {
+    const { registry, context, close } = await fixture();
+    try {
+      const result = await registry.execute("bash", { command: "printf 'labelled'", description: "x".repeat(500) }, context);
+      expect(result.isError).not.toBe(true);
+      expect(text(result)).toContain("labelled");
     } finally { await close(); }
   });
 
@@ -228,6 +334,106 @@ describe("first-call ergonomics", () => {
       const overwrite = await registry.execute("write", { path: "blank-tag.txt", content: "again\n", tag: "#000000" }, context);
       expect(overwrite.isError).toBe(true);
       expect(text(overwrite)).toContain("read it first");
+      // ... and the error names the call that produces the tag it is asking for.
+      expect(text(overwrite)).toContain('read({ path: "blank-tag.txt" })');
+    } finally { await close(); }
+  });
+
+  /** Creation takes path and content only; the contract says so and the schema agrees. */
+  test("write states that tag is only for overwriting a file already read", async () => {
+    const { registry, close } = await fixture();
+    try {
+      const write = registry.definitions().find((definition) => definition.name === "write")!;
+      const tag = (write.inputSchema as { properties: Record<string, { description: string }> }).properties.tag;
+      expect((write.inputSchema as { required: string[] }).required).toEqual(["path", "content"]);
+      expect(tag.description).toContain("omit it when creating");
+      expect(write.description).toContain("tag is required just for overwriting");
+    } finally { await close(); }
+  });
+
+  /**
+   * A schema-complete emitter fills every mode's fields at once. Inferring the mode before
+   * dropping that padding read `symbol: ""` as a request for an AST edit and refused the
+   * search/replace the model actually sent.
+   */
+  test("edit ignores the other modes' padded fields when inferring the mode", async () => {
+    const { root, registry, context, close } = await fixture();
+    try {
+      await writeFile(join(root, "padded.ts"), "const value = 1;\n");
+      const read = await registry.execute("read", { path: "padded.ts" }, context);
+      const tag = text(read).match(/(#[a-f0-9]+)/i)?.[1];
+      const result = await registry.execute("edit", {
+        mode: "", path: "padded.ts", tag, search: "const value = 1;", replace: "const value = 2;",
+        symbol: "", language: "", startLine: 0, endLine: null,
+      }, context);
+      expect(result.isError).not.toBe(true);
+      expect(text(result)).toContain("search_replace");
+      expect(await readFile(join(root, "padded.ts"), "utf8")).toBe("const value = 2;\n");
+    } finally { await close(); }
+  });
+
+  test("grep survives a schema-complete emitter and names a bad flag", async () => {
+    const { root, registry, context, close } = await fixture();
+    try {
+      await writeFile(join(root, "padded.txt"), "needle here\n");
+      const padded = await registry.execute("grep", { pattern: "needle", path: "", flags: "", glob: "", output_mode: "", maxResults: 0, before: 0, after: 0 }, context);
+      expect(padded.isError).not.toBe(true);
+      expect(text(padded)).toContain("padded.txt:1");
+
+      // "Invalid regular expression" would send the model to fix a pattern that was never wrong.
+      const bad = await registry.execute("grep", { pattern: "needle", flags: "gx" }, context);
+      expect(bad.isError).toBe(true);
+      expect(text(bad)).toContain("\"x\" is not a regular-expression flag");
+
+      // An empty pattern matches every line of every file; no call ever means that, and the
+      // refusal carries the field's own documentation instead of a character count.
+      const empty = await registry.execute("grep", { pattern: "", path: root }, context);
+      expect(empty.isError).toBe(true);
+      expect(text(empty)).toContain("$args.pattern must not be empty");
+      expect(text(empty)).toContain("regular expression");
+    } finally { await close(); }
+  });
+
+  /** `*.ts` where `**​/*.ts` was meant is the commonest empty glob; the fix is named, not hinted. */
+  test("glob explains a non-recursive pattern that matched nothing", async () => {
+    const { root, registry, context, close } = await fixture();
+    try {
+      await mkdir(join(root, "src"));
+      await writeFile(join(root, "src", "deep.ts"), "export const deep = 1;\n");
+      const shallow = await registry.execute("glob", { pattern: "*.ts", path: root }, context);
+      expect(shallow.isError).not.toBe(true);
+      expect(text(shallow)).toContain("**/*.ts");
+      expect(text(shallow)).toContain("* stops at one path segment");
+
+      // A pasted absolute pattern is matched against the absolute path too.
+      const absolute = await registry.execute("glob", { pattern: `${root}/**/*.ts`, path: root }, context);
+      expect(absolute.isError).not.toBe(true);
+      expect(text(absolute)).toContain("deep.ts");
+
+      const missing = await registry.execute("glob", { pattern: "**/*.ts", path: "no-such-dir" }, context);
+      expect(missing.isError).toBe(true);
+      expect(text(missing)).toContain("No such directory");
+    } finally { await close(); }
+  });
+
+  /** `["git", "status"]` and `"status --short"` both have one honest reading. */
+  test("git drops a duplicated executable and splits a command line", async () => {
+    const { root, registry, context, close } = await fixture();
+    try {
+      await Bun.spawn(["git", "init", "-q", root], { stdout: "ignore", stderr: "ignore" }).exited;
+      const duplicated = await registry.execute("git", { args: ["git", "status", "--short"] }, context);
+      expect(duplicated.isError).not.toBe(true);
+      expect(text(duplicated)).toContain("args: git status --short");
+
+      const line = await registry.execute("git", { args: "status --short" }, context);
+      expect(line.isError).not.toBe(true);
+      expect(text(line)).toContain("exit_code: 0");
+
+      // The quoted value stays one argument rather than splitting on its space.
+      const set = await registry.execute("git", { command: 'config --local user.name "Lyra Tester"' }, context);
+      expect(set.isError).not.toBe(true);
+      const got = await registry.execute("git", { args: ["config", "--local", "--get", "user.name"] }, context);
+      expect(text(got)).toContain("Lyra Tester");
     } finally { await close(); }
   });
 
@@ -361,19 +567,126 @@ describe("first-call ergonomics", () => {
     } finally { await close(); }
   });
 
-  test("every alias is declared in the schema the model is shown", async () => {
+  /**
+   * The reverse of the rule this suite used to assert. Declaring every alias legitimized the
+   * model's own spelling, but a model on a strict proxy emits *every* declared property, so
+   * `path`, `file_path`, and `filePath` side by side taught it to fill all three — its own
+   * words: "In my calls I passed multiple aliases defensively... A smaller, stricter API will
+   * lead to better tool-call accuracy." The advertised schema is now canonical-only.
+   */
+  test("no alias is advertised in the schema the model is shown", async () => {
     const { registry, close } = await fixture();
     try {
       const declared = new Map(registry.definitions().map((definition) => [definition.name, Object.keys((definition.inputSchema as { properties?: Record<string, unknown> }).properties ?? {})]));
-      const expected: Record<string, readonly string[]> = {
-        read: ["file_path", "filePath", "start_line", "end_line", "offset", "limit"],
-        write: ["file_path", "filePath"],
-        edit: ["file_path", "filePath", "old_string", "oldString", "new_string", "newString", "start_line", "end_line"],
-        bash: ["timeout", "timeout_ms", "workdir", "description", "run_in_background", "runInBackground", "job"],
-        grep: ["include", "head_limit", "headLimit", "-A", "-B", "-C", "-i", "-n", "output_mode"],
-        git: ["timeout"],
+      const canonical: Record<string, readonly string[]> = {
+        read: ["path", "startLine", "endLine"],
+        write: ["path", "content", "tag"],
+        edit: ["mode", "path", "tag", "search", "replace", "symbol", "language", "startLine", "endLine"],
+        bash: ["command", "cwd", "timeoutMs", "description", "run_in_background", "job"],
+        grep: ["pattern", "path", "flags", "glob", "maxResults", "before", "after", "output_mode"],
+        glob: ["pattern", "path"],
+        git: ["args", "cwd", "timeoutMs"],
       };
-      for (const [tool, fields] of Object.entries(expected)) for (const field of fields) expect(declared.get(tool)).toContain(field);
+      for (const [tool, fields] of Object.entries(canonical)) expect(declared.get(tool)).toEqual([...fields]);
+
+      const aliases = ["file_path", "filePath", "start_line", "end_line", "offset", "limit", "view_range", "file_text", "contents", "old_string", "oldString", "old_str", "new_string", "newString", "new_str", "timeout", "timeout_ms", "workdir", "runInBackground", "background", "cmd", "include", "head_limit", "headLimit", "-A", "-B", "-C", "-i", "-n", "outputMode", "directory", "arguments", "command"];
+      for (const [tool, fields] of declared) for (const field of fields) {
+        if (tool === "bash" && field === "command") continue;
+        expect({ tool, field, advertised: aliases.includes(field) }).toEqual({ tool, field, advertised: false });
+      }
+    } finally { await close(); }
+  });
+
+  /** The aliases left the schema; they did not leave the tool. */
+  test("foreign spellings still land even though the schema never mentions them", async () => {
+    const { root, registry, context, close } = await fixture();
+    try {
+      await writeFile(join(root, "kept.ts"), "const value = 1;\n");
+      const read = await registry.execute("read", { file_path: "kept.ts" }, context);
+      expect(read.isError).not.toBe(true);
+      const tag = text(read).match(/(#[a-f0-9]+)/i)?.[1];
+
+      const edited = await registry.execute("edit", { filePath: "kept.ts", old_str: "1", new_str: "2", tag }, context);
+      expect(edited.isError).not.toBe(true);
+
+      // The text-editor tool's create spelling for whole-file content.
+      const created = await registry.execute("write", { file_path: "made.ts", file_text: "export const made = true;\n" }, context);
+      expect(created.isError).not.toBe(true);
+      expect(await readFile(join(root, "made.ts"), "utf8")).toContain("made");
+
+      const grepped = await registry.execute("grep", { regex: "value", directory: root, file_pattern: "**/*.ts", limit: 5 }, context);
+      expect(grepped.isError).not.toBe(true);
+      expect(text(grepped)).toContain("kept.ts");
+
+      const globbed = await registry.execute("glob", { glob: "**/*.ts", dir: root }, context);
+      expect(globbed.isError).not.toBe(true);
+      expect(text(globbed)).toContain("kept.ts");
+
+      const ran = await registry.execute("bash", { cmd: "printf 'aliased'", working_directory: root }, context);
+      expect(ran.isError).not.toBe(true);
+      expect(text(ran)).toContain("aliased");
+    } finally { await close(); }
+  });
+
+  /** The Anthropic text-editor tool spells a range as view_range: [start, end]. */
+  test("read accepts view_range and applies a range to artifact text", async () => {
+    const { root, registry, context, close } = await fixture();
+    try {
+      await writeFile(join(root, "ranged.txt"), Array.from({ length: 20 }, (_, index) => `line ${index + 1}`).join("\n"));
+      const ranged = await registry.execute("read", { path: "ranged.txt", view_range: [3, 4] }, context);
+      expect(ranged.isError).not.toBe(true);
+      expect(text(ranged)).toContain("line 3");
+      expect(text(ranged)).not.toContain("line 5");
+
+      const open = await registry.execute("read", { path: "ranged.txt", view_range: [19, -1] }, context);
+      expect(open.isError).not.toBe(true);
+      expect(text(open)).toContain("line 20");
+
+      // A range against an artifact used to be accepted and silently ignored (§3.7.5).
+      const store = createArtifactStore(root);
+      const id = await store.put(new TextEncoder().encode("alpha\nbeta\ngamma\n"), { mimeType: "text/plain", name: "three.txt" });
+      const sliced = await registry.execute("read", { path: id, startLine: 2, endLine: 2 }, context);
+      expect(sliced.isError).not.toBe(true);
+      expect(text(sliced)).toContain("beta");
+      expect(text(sliced)).not.toContain("gamma");
+    } finally { await close(); }
+  });
+
+  /**
+   * Observed live: read of a directory returned bare names, indistinguishable from a file's
+   * contents, and a line range on it was accepted and ignored.
+   */
+  test("read labels a directory listing and says the range does not apply", async () => {
+    const { root, registry, context, close } = await fixture();
+    try {
+      await writeFile(join(root, "one.ts"), "one\n");
+      await mkdir(join(root, "nested"));
+      const listed = await registry.execute("read", { path: root, startLine: 1, endLine: 2 }, context);
+      expect(listed.isError).not.toBe(true);
+      expect(text(listed)).toContain(`directory: ${root}`);
+      expect(text(listed)).toContain("- one.ts");
+      expect(text(listed)).toContain("- nested/");
+      expect(text(listed)).toContain("do not apply");
+      // Nothing here can be mistaken for the numbered, #TAG-prefixed body of a file.
+      expect(text(listed)).not.toMatch(/#[a-f0-9]{6}/i);
+    } finally { await close(); }
+  });
+
+  /** §3.7.1: ENOENT is not an actionable failure; the near-miss sibling is. */
+  test("read and edit name the closest path instead of reporting ENOENT", async () => {
+    const { root, registry, context, close } = await fixture();
+    try {
+      await writeFile(join(root, "auth.ts"), "export const auth = 1;\n");
+      const missing = await registry.execute("read", { path: "authh.ts" }, context);
+      expect(missing.isError).toBe(true);
+      expect(text(missing)).toContain("File not found: authh.ts");
+      expect(text(missing)).toContain("Did you mean auth.ts?");
+      expect(text(missing)).not.toContain("ENOENT");
+
+      const edited = await registry.execute("edit", { path: "authh.ts", tag: "#abc123", search: "a", replace: "b" }, context);
+      expect(edited.isError).toBe(true);
+      expect(text(edited)).toContain("Did you mean auth.ts?");
+      expect(text(edited)).toContain("write(");
     } finally { await close(); }
   });
 });

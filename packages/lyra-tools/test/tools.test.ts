@@ -110,11 +110,12 @@ describe("core tool behavior", () => {
       const bad = await bash.execute({ command: "printf 'bad' >&2; exit 7" }, context);
       expect(bad.isError).toBe(true);
       expect(bad.content.toString()).toContain("exit_code: 7");
-      const heavy = await bash.execute({ command: "sleep 0.01" }, context);
+      const heavy = await bash.execute({ command: "sleep 3600" }, context);
       expect(heavy.metadata).toMatchObject({ heavy: true });
       const jobId = String(heavy.metadata?.jobId);
       expect(jobId).toStartWith("job-");
-      await processes.wait(jobId);
+      // An hour-long job proves the classification; nobody waits for it.
+      await processes.cancel(jobId);
       await command(["git", "init", "-q", root]);
       await command(["git", "init", "-q", outside]);
       await writeFile(join(root, "tracked.txt"), "tracked\n");

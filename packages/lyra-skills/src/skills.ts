@@ -70,12 +70,17 @@ export class SkillRegistry {
   }
 }
 
-export const SKILL_DEFINITION: ToolDefinition = Object.freeze({ name: "skill", description: "Load one discovered skill's full instructions only when needed.", inputSchema: Object.freeze({ type: "object", additionalProperties: false, properties: { name: { type: "string", pattern: NAME.source, description: "Name of a skill from the discovered index." }, skill: { type: "string", pattern: NAME.source, description: "Alias for name." } }, required: ["name"] }) });
+export const SKILL_DEFINITION: ToolDefinition = Object.freeze({ name: "skill", description: "Load one discovered skill's full instructions only when needed.", inputSchema: Object.freeze({ type: "object", additionalProperties: false, properties: { name: { type: "string", pattern: NAME.source, description: "Name of a skill from the discovered index." } }, required: ["name"] }) });
 
 /**
  * Claude Code's skill tool spells the name `skill` and carries an `args` field; the first
  * folds onto `name`, the second has no honest meaning here (§16 — a skill is instructions,
  * not a command). Written out rather than imported so this module stays loadable on its own.
+ *
+ * `skill` is accepted and deliberately unadvertised (§3.7): the schema is the smallest true
+ * statement of what the tool takes, and declaring an alias beside its canonical field taught
+ * a strict emitter to fill both. Folding happens before validation, so a call spelled the
+ * foreign way still lands.
  */
 export function normalizeSkillArgs(input: unknown): unknown | string {
   if (input === null || typeof input !== "object" || Array.isArray(input)) return input;

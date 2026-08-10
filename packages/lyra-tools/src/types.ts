@@ -26,6 +26,57 @@ export interface LyraTool {
   close?(): void | Promise<void>;
 }
 
+/**
+ * Drop the padding a schema-complete emitter sends for fields it has nothing to say about.
+ *
+ * Strict structured output puts the whole schema in the grammar, so *every* declared property
+ * is emitted on every call: an optional string arrives as `""`, `null`, or `"?"`, and an
+ * optional integer arrives as `0`. Observed live (LYRA.md §3.7). A blank optional field means
+ * exactly what an absent one means, and a number below the field's own documented minimum can
+ * only be padding, because no real call could have produced it. Both are deleted here so the
+ * schema validator never fails a call over a hole the model was forced to fill.
+ *
+ * `fields` maps a property name to `true` (blank strings and null) or to the minimum the
+ * schema documents (blank, null, and anything numerically below it). Strings pass through so
+ * this composes with the normalizers that return a lesson instead of arguments.
+ */
+export function dropPadding(input: unknown | string, fields: Readonly<Record<string, number | true>>): unknown | string {
+  if (typeof input === "string" || input === null || typeof input !== "object" || Array.isArray(input)) return input;
+  const args = input as Record<string, unknown>;
+  let output: Record<string, unknown> | undefined;
+  for (const [name, rule] of Object.entries(fields)) {
+    if (!(name in args)) continue;
+    const value = args[name];
+    const padded = value === null
+      || (typeof value === "string" && value.trim().length === 0)
+      || (typeof rule === "number" && typeof value === "number" && (!Number.isFinite(value) || value < rule));
+    if (padded) { output ??= { ...args }; delete output[name]; }
+  }
+  return output ?? args;
+}
+
+/**
+ * Read a number or a boolean that arrived as a string.
+ *
+ * JSON-mode and function-calling emitters routinely stringify scalars — `timeoutMs: "30000"`,
+ * `run_in_background: "false"` — and `$args.timeoutMs must be integer` teaches nothing a model
+ * can act on when it believes it sent 30000. Only unambiguous spellings convert; anything else
+ * is left for the validator to name.
+ */
+export function coerceScalars(input: unknown | string, fields: Readonly<Record<string, "integer" | "boolean">>): unknown | string {
+  if (typeof input === "string" || input === null || typeof input !== "object" || Array.isArray(input)) return input;
+  const args = input as Record<string, unknown>;
+  let output: Record<string, unknown> | undefined;
+  for (const [name, kind] of Object.entries(fields)) {
+    const value = args[name];
+    if (typeof value !== "string") continue;
+    const trimmed = value.trim();
+    if (kind === "integer" && /^[+-]?\d+$/.test(trimmed)) { output ??= { ...args }; output[name] = Number(trimmed); continue; }
+    if (kind === "boolean" && /^(true|false)$/i.test(trimmed)) { output ??= { ...args }; output[name] = trimmed.toLowerCase() === "true"; }
+  }
+  return output ?? args;
+}
+
 export interface ToolRuntimeContext extends ToolExecutionContext {
   readonly cwd: string;
   readonly origin: string;
@@ -225,11 +276,16 @@ function schemaIssue(value: unknown, schema: Readonly<Record<string, unknown>>, 
     if (!allowed.some((type) => matchesType(value, type))) return `${path} must be ${allowed.join(" or ")}.`;
   }
   if (typeof value === "string") {
-    if (typeof schema.minLength === "number" && value.length < schema.minLength) return `${path} must contain at least ${schema.minLength} characters.`;
-    if (typeof schema.maxLength === "number" && value.length > schema.maxLength) return `${path} must contain at most ${schema.maxLength} characters.`;
+    // A length or pattern failure carries the field's own documentation for the same reason a
+    // missing required field does: the model should never have to re-read the schema (§3.7).
+    const detail = typeof schema.description === "string" ? ` — ${schema.description}` : ".";
+    if (typeof schema.minLength === "number" && value.length < schema.minLength) {
+      return schema.minLength === 1 ? `${path} must not be empty${detail}` : `${path} must contain at least ${schema.minLength} characters${detail}`;
+    }
+    if (typeof schema.maxLength === "number" && value.length > schema.maxLength) return `${path} must contain at most ${schema.maxLength} characters${detail}`;
     if (typeof schema.pattern === "string") {
       try {
-        if (!new RegExp(schema.pattern).test(value)) return `${path} does not match the required pattern.`;
+        if (!new RegExp(schema.pattern).test(value)) return `${path} does not match ${schema.pattern}${detail}`;
       } catch {
         return `${path} uses an invalid schema pattern.`;
       }
