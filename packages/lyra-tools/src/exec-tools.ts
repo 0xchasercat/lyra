@@ -229,6 +229,20 @@ function parseArgs(input: unknown): BashCall | string {
 
 function errorResult(message: string): ToolExecutionResult { return { content: message, isError: true }; }
 
+/**
+ * A nested `lyra --prompt` run from inside a session is delegation that went around the
+ * delegation primitive — it works, but forfeits status, steering, lifecycle events, and
+ * checkpoint attribution. Observed live: a model probed its model reference by CLI, then ran
+ * its whole subagent that way. Never gated (§1) — one line on the result, so the next
+ * delegation goes through `spawn`.
+ */
+const NESTED_LYRA = /(^|[\s;&|(])lyra\s+(?:[^\n;|&]*\s)?(?:--prompt\b|-p\b)/;
+
+function nestedLyraNote(command: string): string {
+  if (!NESTED_LYRA.test(command)) return "";
+  return "\nnote: this ran a nested Lyra CLI. spawn { task } is the built-in subagent — observable, steerable via hub, and its model reference is validated at the call itself.";
+}
+
 function isJobHandle(value: ProcessResult | JobHandle): value is JobHandle { return "id" in value; }
 
 /**
@@ -315,7 +329,8 @@ export class BashTool implements LyraTool {
         return { content: `Started bash job ${launched.id} — ${why}. Call bash({ job: ${JSON.stringify(launched.id)} }) to wait for it and read the complete output.`, metadata: { jobId: launched.id, command: request.command, cwd, heavy: launched.class === "heavy", execution, reason: why } };
       }
       this.#options.activity?.({ type: "bash_finished", command: request.command, cwd, exitCode: launched.exitCode });
-      return { content: await present(launched, base.store, this.#options.displayBudget), ...(launched.exitCode === 0 ? {} : { isError: true }) };
+      const body = await present(launched, base.store, this.#options.displayBudget);
+      return { content: `${body}${nestedLyraNote(request.command)}`, ...(launched.exitCode === 0 ? {} : { isError: true }) };
     } catch (error) { return errorResult(`Bash failed: ${error instanceof Error ? error.message : String(error)}`); }
   }
 

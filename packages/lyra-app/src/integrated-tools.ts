@@ -61,8 +61,8 @@ const SPAWN_DEFINITION: ToolDefinition = Object.freeze({
   // The first 180 characters are what the system prompt's tool list shows, so the loop's
   // four verbs come first and stand on their own; the rest is read from the schema.
   description:
-    "Delegate to a subagent and then watch it: spawn { task } starts one, spawn { id } collects its result, spawn { id, op: \"status\" } reports on it, spawn { id, op: \"cancel\" } stops it. " +
-    "Starting returns { id, peer, status } at once — peer is the name to address it by. " +
+    "The only way to run a subagent (never a nested CLI via bash): spawn { task } starts one, spawn { id } collects it, op: \"status\" reports, op: \"cancel\" stops. " +
+    "Starting returns { id, peer, status } at once — peer is the name to address it by — and a bad model reference fails right here, at the call, naming the valid candidates (no need to probe a model by hand first). " +
     "Steer a running child with hub { op: \"send\", to: peer }: it arrives at the child's next tool boundary, and its reply reaches you the same way. " +
     "hub { op: \"wait\", channel: \"agents\" } streams every child starting and finishing. " +
     "A shared-tree child's result names the files it changed; an isolated one carries a merge recipe under integration.hint. " +

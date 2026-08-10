@@ -307,6 +307,21 @@ describe("first-call ergonomics", () => {
     } finally { await close(); }
   });
 
+  /** Delegation that routes around spawn loses the whole observability stack (§3.7). */
+  test("a nested lyra --prompt run gets a one-line pointer at spawn", async () => {
+    const { registry, context, close } = await fixture();
+    try {
+      const nested = await registry.execute("bash", { command: "echo lyra --prompt 'PONG' && true" }, context);
+      expect(text(nested)).toContain("spawn { task } is the built-in subagent");
+
+      const plain = await registry.execute("bash", { command: "printf 'no note here'" }, context);
+      expect(text(plain)).not.toContain("built-in subagent");
+      // The word alone is not the pattern: reading about lyra is not running it.
+      const mention = await registry.execute("bash", { command: "grep -c lyra README.md 2>/dev/null; true" }, context);
+      expect(text(mention)).not.toContain("built-in subagent");
+    } finally { await close(); }
+  });
+
   /** JSON-mode emitters stringify scalars; "$args.timeoutMs must be integer" teaches nothing. */
   test("numbers and booleans that arrive as strings are read as what they are", async () => {
     const { root, registry, context, close } = await fixture();
