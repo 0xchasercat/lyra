@@ -276,7 +276,11 @@ export class EditEngine {
       before = await this.filesystem.read(path);
       existed = true;
     } catch (cause) {
-      if (!known && tag === undefined && isNotFound(cause)) {
+      // No file and no snapshot this engine ever issued: a tag sent anyway cannot be describing
+      // anything, so it is padding rather than a claim about existing bytes, and creating the
+      // file is exactly what the same call without it would do. Refusing here would strand the
+      // model — "re-read and retry" is impossible advice for a path that does not exist.
+      if (!known && isNotFound(cause)) {
         existed = false;
       } else {
         return error(path, "write", "read_failed", `Unable to verify ${path} before writing: ${String(cause)}. Re-read and retry.`);
