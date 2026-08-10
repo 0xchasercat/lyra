@@ -149,8 +149,8 @@ describe("the git tool's checkpoint operations", () => {
     const runtime = await runtimeFor(root, "git-ops", [textRound("ready")]);
     const context = { signal: new AbortController().signal, sessionId: "git-ops", workspace: runtime.app.cwd, callId: "c" };
     try {
-      // Thirteen tools, still: checkpoints are git, so they live on the git tool.
-      expect(runtime.app.tools.definitions()).toHaveLength(13);
+      // Checkpoints are git, so they live on the git tool rather than on a tool of their own.
+      expect(runtime.app.tools.definitions()).toHaveLength(14);
       const definition = runtime.app.tools.definitions().find((entry) => entry.name === "git")!;
       expect(Object.keys((definition.inputSchema as { properties: Record<string, unknown> }).properties)).toContain("op");
 

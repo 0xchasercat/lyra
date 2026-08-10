@@ -31,6 +31,12 @@ export interface AgentSpawnExecutorOptions {
    * runs without asides.
    */
   asides?(context: SpawnExecutorContext, steering: SteerQueue): (() => void) | undefined;
+  /**
+   * Told which files each of this child's tool calls changed. The code map listens here, so
+   * a child's edits reach the graph of the tree it edited without anyone re-indexing by hand.
+   * Anything it throws is swallowed by the dispatcher; it can never fail the child's call.
+   */
+  onFilesModified?(context: SpawnExecutorContext, files: readonly string[]): void;
   origin: string;
   defaultModel: string | (() => string);
   system(context: { workspace: string; session: string; model: string; tools: ReturnType<ToolRegistry["definitions"]> }): string;
@@ -101,7 +107,7 @@ export function createAgentSpawnExecutor(options: AgentSpawnExecutorOptions): Sp
       checkpoints = await options.checkpoints?.(childContext);
       tools = await options.tools(childContext, checkpoints?.access);
       const contextWindow = options.contextWindow ?? 200_000;
-      const loop = new AgentLoop({ provider, store, tools, model, system: options.system({ workspace: childContext.workspace, session, model, tools: tools.definitions() }), contextWindow, workspace: childContext.workspace, ...(options.turnTimeoutMs === undefined ? {} : { turnTimeoutMs: options.turnTimeoutMs }), ...(options.toolTimeouts === undefined ? {} : { toolTimeouts: options.toolTimeouts }), compactor: new Compactor({ transcript: store, summaryGenerator: new ProviderSummaryGenerator({ provider, model }), contextWindow, ...(options.compactAt === undefined ? {} : { threshold: options.compactAt }) }), loopDetector: new LoopDetector(), ...(checkpoints === undefined ? {} : { checkpointer: checkpoints.checkpointer }) });
+      const loop = new AgentLoop({ provider, store, tools, model, system: options.system({ workspace: childContext.workspace, session, model, tools: tools.definitions() }), contextWindow, workspace: childContext.workspace, ...(options.turnTimeoutMs === undefined ? {} : { turnTimeoutMs: options.turnTimeoutMs }), ...(options.toolTimeouts === undefined ? {} : { toolTimeouts: options.toolTimeouts }), compactor: new Compactor({ transcript: store, summaryGenerator: new ProviderSummaryGenerator({ provider, model }), contextWindow, ...(options.compactAt === undefined ? {} : { threshold: options.compactAt }) }), loopDetector: new LoopDetector(), ...(checkpoints === undefined ? {} : { checkpointer: checkpoints.checkpointer }), ...(options.onFilesModified === undefined ? {} : { onFilesModified: (report) => options.onFilesModified!(childContext, report.filesModified) }) });
       // Attached only for the duration of the turn: a message that arrives while the child
       // is running folds into it, and one that arrives after it parks revives it instead.
       detachAsides = options.asides?.(childContext, steering);

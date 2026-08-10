@@ -36,6 +36,24 @@ export interface ToolDispatcherOptions {
   waitTools?: readonly string[];
   /** Snapshots the working tree before a state-changing call. See [`ToolCheckpointer`]. */
   checkpointer?: ToolCheckpointer;
+  /**
+   * A second, independent reader of the paths a call reported changing.
+   *
+   * The checkpointer already receives them, and threading a second consumer through it would
+   * make the undo history responsible for things that are not undo — a code index, a watcher,
+   * whatever comes next — and give each of them a way to break a checkpoint. This is the
+   * smallest honest seam instead: one optional observer, called after the checkpointer, on
+   * exactly the same event. It cannot fail a tool call (every throw is swallowed) and it is
+   * never called for a call that changed nothing.
+   */
+  onFilesModified?: (report: FilesModifiedReport) => void;
+}
+
+/** What one completed tool call says it changed, as an observer sees it. */
+export interface FilesModifiedReport {
+  readonly tool: string;
+  readonly callId: string;
+  readonly filesModified: readonly string[];
 }
 
 /**
@@ -97,6 +115,7 @@ export class ToolDispatcher {
 
   private readonly knownTools: ReadonlySet<string>;
   private readonly checkpointer: ToolCheckpointer | undefined;
+  private readonly onFilesModified: ((report: FilesModifiedReport) => void) | undefined;
   private readonly toolTimeouts: ReadonlyMap<string, number>;
 
   constructor(
@@ -116,6 +135,7 @@ export class ToolDispatcher {
     this.knownTools = new Set(toolNames);
     this.waitTools = new Set(options.waitTools ?? DEFAULT_WAIT_CLASS_TOOLS);
     this.checkpointer = options.checkpointer;
+    this.onFilesModified = options.onFilesModified;
   }
 
   /** The deadline one tool call runs under. Public so a caller can report it honestly. */
@@ -224,10 +244,16 @@ export class ToolDispatcher {
    * a rule whose job is protecting work Lyra did not do.
    */
   private report(call: ToolUseBlock, result: ToolExecutionResult): void {
-    const checkpointer = this.checkpointer;
-    if (checkpointer === undefined) return;
     const modified = result.progress?.filesModified ?? [];
-    try { checkpointer.after({ tool: call.name, callId: call.id, filesModified: modified.map((entry) => entry.path) }); } catch { /* bookkeeping never fails a tool */ }
+    const paths = modified.map((entry) => entry.path);
+    if (this.checkpointer !== undefined) {
+      try { this.checkpointer.after({ tool: call.name, callId: call.id, filesModified: paths }); } catch { /* bookkeeping never fails a tool */ }
+    }
+    // Second, and independently: an observer that throws must not cost the checkpointer its
+    // attribution, and neither of them may reach the model's result.
+    if (this.onFilesModified !== undefined && paths.length > 0) {
+      try { this.onFilesModified({ tool: call.name, callId: call.id, filesModified: paths }); } catch { /* observation never fails a tool */ }
+    }
   }
 }
 

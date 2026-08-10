@@ -56,13 +56,13 @@ describe("Lyra application composition", () => {
     expect(calls).toEqual(["loop:until tests pass", "rollback:cp-4-ab:false", "rollback:cp-4-ab:true", "rollback::false"]);
   });
 
-  test("boots zero-config infrastructure with all thirteen stable tools", async () => {
+  test("boots zero-config infrastructure with all fourteen stable tools", async () => {
     const root = await mkdtemp(join(tmpdir(), "lyra-app-"));
     try {
       await git(root, ["init", "-q", "-b", "main"]); await writeFile(join(root, ".gitignore"), ".lyra/\n"); await writeFile(join(root, "file.txt"), "base\n"); await git(root, ["add", "."]); await git(root, ["commit", "-q", "-m", "base"]);
       const app = await LyraApplication.boot({ origin: root, session: "main-agent", spawnExecutor: async (request) => `done:${request.task}`, sessions: sessionServices(), home: join(root, "home") });
       try {
-        expect(app.tools.definitions().map((definition) => definition.name)).toEqual(["read", "write", "edit", "bash", "grep", "glob", "lsp", "spawn", "hub", "skill", "jit", "mcp", "git"]);
+        expect(app.tools.definitions().map((definition) => definition.name)).toEqual(["read", "write", "edit", "bash", "grep", "glob", "map", "lsp", "spawn", "hub", "skill", "jit", "mcp", "git"]);
         // The main session runs where it was launched: no clone, and the path the model
         // sees is the path the user typed.
         expect(app.cwd).toBe(app.origin);

@@ -151,6 +151,10 @@ export class LyraRuntime {
             allowedTools: context.tools, bus: live.bus, peer: context.peer,
             agents: { status: (name) => live.spawn.status(name) },
             skills: live.skills, runtime: live.runtime, mcp: live.mcpTool,
+            // Same tree, same graph — the parent's instance, whose writes are already
+            // serialized. A child in its own workspace is looking at a different tree, so it
+            // gets its own, built lazily by whatever it asks the map first.
+            map: live.maps.get(context.workspace),
             ...(checkpoints === undefined ? {} : { checkpoints }),
             ...(context.writeScope === undefined ? {} : { writeScope: context.writeScope, writeScopeRoot: context.workspace, onScopeViolation: (path: string) => context.activity({ scopeViolation: path }) }),
             filesystem: { root: context.workspace }, bash: { root: context.workspace, processHost: live.processes }, git: { root: context.workspace },
@@ -168,6 +172,10 @@ export class LyraRuntime {
         deliver: (message) => { steering.aside({ from: message.from, ...(message.text === undefined ? {} : { text: message.text }), ...(message.data === undefined ? {} : { data: message.data }), messageId: message.id, reply: message.reply ?? app?.bus.getPeer(message.from) !== undefined }); },
         consume: (ids) => { steering.consume(ids); },
       }),
+      // A child's edits reach the graph of the tree it edited, through the same dispatcher
+      // hook the main session uses. Without this a shared-tree child could rewrite half the
+      // repository and leave the parent's map answering from before the refactor.
+      onFilesModified: (context, files) => { app?.maps.get(context.workspace).noteModified(files); },
       origin,
       defaultModel: () => currentEnvironment.model,
       system: ({ workspace, session, tools }) => {
@@ -1522,7 +1530,10 @@ function createLoop(app: LyraApplication, environment: EnvironmentProvider, stor
   // The checkpointer reads the transcript head at the moment it snapshots, so a pre-tool
   // checkpoint is anchored to the assistant message that asked for the tool call — which is
   // what makes "rewind the conversation and the code together" one operation.
-  return new AgentLoop({ provider: environment.provider, store, tools: app.tools, model: environment.model, system: systemPrompt(app, app.cwd, store.descriptor.name), contextWindow, maxOutputTokens: resolveMaxOutputTokens(modelMaxOutputTokens(models, environment.model)), workspace: app.cwd, checkpointer: app.checkpointer(() => store.head.id), turnTimeoutMs: durationMs(app.config.reliability.turn_timeout), compactor: new Compactor({ transcript: store, summaryGenerator: new ProviderSummaryGenerator({ provider: environment.provider, model: environment.model }), contextWindow, threshold: app.config.reliability.compact_at }), loopDetector: new LoopDetector() });
+  // The map hears about every changed file from the same place the checkpointer does, one
+  // observer beside it rather than through it: an edit lands in the graph ~500ms later, and
+  // the next question about the code is answered from what the code says now.
+  return new AgentLoop({ provider: environment.provider, store, tools: app.tools, model: environment.model, system: systemPrompt(app, app.cwd, store.descriptor.name), contextWindow, onFilesModified: (report) => { app.map.noteModified(report.filesModified); }, maxOutputTokens: resolveMaxOutputTokens(modelMaxOutputTokens(models, environment.model)), workspace: app.cwd, checkpointer: app.checkpointer(() => store.head.id), turnTimeoutMs: durationMs(app.config.reliability.turn_timeout), compactor: new Compactor({ transcript: store, summaryGenerator: new ProviderSummaryGenerator({ provider: environment.provider, model: environment.model }), contextWindow, threshold: app.config.reliability.compact_at }), loopDetector: new LoopDetector() });
 }
 
 /** The published output ceiling for a model, when the active provider's catalogue knows one. */

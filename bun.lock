@@ -19,12 +19,16 @@
     "packages/lyra-app": {
       "name": "@lyra/app",
       "version": "0.1.0",
+      "bin": {
+        "lyra": "./src/cli.ts",
+      },
       "dependencies": {
         "@lyra/acp": "workspace:*",
         "@lyra/core": "workspace:*",
         "@lyra/git": "workspace:*",
         "@lyra/host": "workspace:*",
         "@lyra/lsp": "workspace:*",
+        "@lyra/map": "workspace:*",
         "@lyra/mcp": "workspace:*",
         "@lyra/provider": "workspace:*",
         "@lyra/runtime": "workspace:*",
@@ -73,6 +77,18 @@
       "dependencies": {
         "@lyra/core": "workspace:*",
         "@lyra/tools": "workspace:*",
+      },
+    },
+    "packages/lyra-map": {
+      "name": "@lyra/map",
+      "version": "0.1.0",
+      "dependencies": {
+        "@lyra/edit": "workspace:*",
+        "tree-sitter": "^0.25.0",
+        "tree-sitter-go": "^0.25.0",
+        "tree-sitter-python": "^0.25.0",
+        "tree-sitter-rust": "^0.24.0",
+        "tree-sitter-typescript": "^0.23.2",
       },
     },
     "packages/lyra-mcp": {
@@ -136,6 +152,8 @@
     "@lyra/host": ["@lyra/host@workspace:packages/lyra-host"],
 
     "@lyra/lsp": ["@lyra/lsp@workspace:packages/lyra-lsp"],
+
+    "@lyra/map": ["@lyra/map@workspace:packages/lyra-map"],
 
     "@lyra/mcp": ["@lyra/mcp@workspace:packages/lyra-mcp"],
 

@@ -21,6 +21,8 @@ import { SkillRegistry, SkillTool } from "@lyra/skills";
 import { McpGateway } from "@lyra/mcp";
 import { ToolRegistry, coerceScalars, createDefaultToolRegistry, dropPadding, type DefaultToolRegistryOptions, type LyraTool } from "@lyra/tools";
 import type { CheckpointDiff, CheckpointRecord, CheckpointRestoreResult } from "@lyra/git";
+import type { CodeMap } from "@lyra/map";
+import { mapQueryVerbs, vocabularySuggestions, type MapAccess, type SnippetTarget } from "./code-map.ts";
 
 /**
  * The advertised schemas below carry canonical fields only (LYRA.md §3.7).
@@ -146,6 +148,41 @@ const JIT_DEFINITION: ToolDefinition = Object.freeze({
 });
 
 /**
+ * The code graph, as one tool.
+ *
+ * The first 180 characters are the whole of what the system prompt's tool index shows, and
+ * they have one job: make a model reach here *before* it greps. That is the spawn-vs-nested-
+ * CLI lesson applied again — a capability a model has to be persuaded to use loses to the
+ * habit it arrived with unless its one line says plainly that it is the cheaper path.
+ *
+ * The constrained-vocabulary rule lives in this description rather than in the prompt (§14
+ * stays an index), because it is a rule about *this* tool's arguments: the index holds
+ * identifiers, so a query invented out of English synonyms searches for words that were
+ * never in the code.
+ */
+const MAP_DEFINITION: ToolDefinition = Object.freeze({
+  name: "map",
+  description:
+    "The codebase graph: instant architecture, symbol search, who-calls-what, and change impact — cheaper than grep-and-read exploration. Explore here first; grep only for text. " +
+    "ops: overview (the default) is the repository's shape; search { query } finds symbols by name; explain { symbol } gives one symbol's definition, callers, and callees; impact { symbol, depth } is what changing it would reach; path { from, to } is how two symbols connect; snippet { symbol } returns that symbol's exact source, read from disk. " +
+    "The graph indexes identifiers, not prose: widen a query only with tokens the graph itself has shown you — names it printed, path segments it listed — never with an invented synonym. " +
+    "Answers are budget-bounded and budget moves that bound. When files have changed since indexing, the answer ends with a stale line naming them; those files are ground truth, so read them.",
+  inputSchema: {
+    type: "object",
+    properties: {
+      op: { type: "string", enum: ["overview", "search", "explain", "impact", "path", "snippet"], description: "Which question to ask. Defaults to overview, or is inferred from the fields sent." },
+      query: { type: "string", minLength: 1, description: "search: identifier fragments to look for, in the graph's own vocabulary." },
+      symbol: { type: "string", minLength: 1, description: "explain, impact, snippet: a symbol name, a qualified name, or a file path." },
+      from: { type: "string", minLength: 1, description: "path: the symbol the connection starts at." },
+      to: { type: "string", minLength: 1, description: "path: the symbol the connection ends at." },
+      depth: { type: "integer", minimum: 1, description: "impact: how many hops of callers to follow. Small numbers answer the question; large ones bury it." },
+      budget: { type: "integer", minimum: 1, description: "Rough ceiling on the size of the answer. Omit for the default, which is sized for a normal turn." },
+    },
+    additionalProperties: false,
+  },
+});
+
+/**
  * Foreign spellings accepted at runtime and deliberately absent from the advertised schemas:
  * Claude Code's `prompt` / `description` / `timeout`, the camelCase and snake_case variants
  * of Lyra's own names, and the handle spellings a model reaches for when it wants to name a
@@ -175,6 +212,21 @@ const LSP_ALIASES: readonly ToolAlias[] = Object.freeze([
   { canonical: "params", aliases: ["arguments", "args"] },
   { canonical: "op", aliases: ["operation", "method"] },
 ]);
+/**
+ * `map` is the tool a model has the strongest priors about, because every harness it has
+ * seen spells "look something up in the code" differently: `q`, `pattern`, `file_path`,
+ * `max_depth`. Each of these is a first call that would otherwise be refused by
+ * `additionalProperties: false` for saying the right thing in the wrong dialect.
+ */
+const MAP_ALIASES: readonly ToolAlias[] = Object.freeze([
+  { canonical: "op", aliases: ["operation", "mode", "action", "verb", "command", "kind"] },
+  { canonical: "query", aliases: ["q", "search", "term", "text", "pattern", "keyword", "keywords"] },
+  { canonical: "symbol", aliases: ["name", "qn", "target", "identifier", "symbol_name", "symbolName", "file_path", "filePath", "path", "file"] },
+  { canonical: "from", aliases: ["source", "start", "src"] },
+  { canonical: "to", aliases: ["destination", "dest", "end", "dst"] },
+  { canonical: "depth", aliases: ["levels", "maxDepth", "max_depth", "hops"] },
+  { canonical: "budget", aliases: ["maxTokens", "max_tokens", "tokens", "limit", "maxBytes"] },
+]);
 
 /** Optional fields a schema-complete emitter pads. A number below a documented minimum is padding. */
 const SPAWN_PADDING = Object.freeze({ context: true as const, model: true as const, workspace: true as const, label: true as const, acp: true as const, schema_mode: true as const, id: true as const, op: true as const, task: true as const, timeoutMs: 1, depth: 0 });
@@ -183,6 +235,92 @@ const HUB_PADDING = Object.freeze({ to: true as const, peer: true as const, chan
 const HUB_SCALARS = Object.freeze({ timeoutMs: "integer" as const, await: "boolean" as const });
 const JIT_PADDING = Object.freeze({ name: true as const, source: true as const });
 const LSP_PADDING = Object.freeze({ language: true as const });
+/** Every `map` field is optional, so a schema-complete emitter pads all seven of them. */
+const MAP_PADDING = Object.freeze({ op: true as const, query: true as const, symbol: true as const, from: true as const, to: true as const, depth: 1, budget: 1 });
+const MAP_SCALARS = Object.freeze({ depth: "integer" as const, budget: "integer" as const });
+
+/**
+ * The op a model meant, from the word it used.
+ *
+ * Every spelling here was reachable from the tool's own description or from another
+ * harness's vocabulary — `callers` for impact, `source` for snippet, `find` for search.
+ * Refusing them would be refusing a call that named the right operation.
+ */
+const MAP_OPS: Readonly<Record<string, string>> = Object.freeze({
+  overview: "overview", architecture: "overview", summary: "overview", outline: "overview", structure: "overview", tree: "overview", map: "overview", repo: "overview",
+  search: "search", find: "search", lookup: "search", query: "search", symbols: "search", grep: "search",
+  explain: "explain", describe: "explain", info: "explain", detail: "explain", details: "explain", symbol: "explain", definition: "explain",
+  impact: "impact", callers: "impact", caller: "impact", who_calls: "impact", whocalls: "impact", dependents: "impact", usages: "impact", references: "impact", blast: "impact", blast_radius: "impact",
+  path: "path", path_between: "path", pathbetween: "path", between: "path", connect: "path", route: "path", trace: "path",
+  snippet: "snippet", source: "snippet", code: "snippet", body: "snippet", show: "snippet", read: "snippet",
+});
+
+/**
+ * `map` takes no required field, so the call has to be *read* rather than validated: a call
+ * carrying only `symbol` is an explain, one carrying `from` and `to` is a path, and a bare
+ * call is the overview. Inference happens after padding is dropped, for the same reason
+ * `edit`'s mode inference does — an emitter that filled every field with `""` would
+ * otherwise be read as asking for the op whose field it padded first.
+ */
+export function normalizeMapArgs(input: unknown): unknown | string {
+  const folded = dropPadding(coerceScalars(foldToolAliases(input, MAP_ALIASES, "map"), MAP_SCALARS), MAP_PADDING);
+  if (typeof folded === "string") return folded;
+  const args = toolArgs(folded);
+  if (args === undefined) return folded;
+  const output: Record<string, unknown> = { ...args };
+  if (output.op !== undefined) {
+    if (typeof output.op !== "string") return "op must be a string: overview, search, explain, impact, path, or snippet.";
+    const canonical = MAP_OPS[output.op.trim().toLowerCase().replace(/[\s-]+/g, "_")];
+    if (canonical === undefined) return `map op ${JSON.stringify(output.op)} is not one of overview, search, explain, impact, path, or snippet. Omit op entirely for the repository overview.`;
+    output.op = canonical;
+  } else {
+    // A call that named two endpoints wanted a path; one that named a symbol wanted that
+    // symbol explained; one that named nothing wanted the repository. `from` *without* `to`
+    // still infers a path, so the answer is "a path needs both ends" rather than an overview
+    // that quietly ignored the one end the call did name.
+    output.op = output.from !== undefined || output.to !== undefined ? "path"
+      : output.query !== undefined ? "search"
+      : output.symbol !== undefined ? "explain"
+      : "overview";
+  }
+  // One subject, two field names: a search that put its words in `symbol` and an explain that
+  // put its symbol in `query` both said something unambiguous, so both are taken at their word.
+  if (output.op === "search" && output.query === undefined && typeof output.symbol === "string") { output.query = output.symbol; delete output.symbol; }
+  if ((output.op === "explain" || output.op === "impact" || output.op === "snippet") && output.symbol === undefined && typeof output.query === "string") { output.symbol = output.query; delete output.query; }
+  if (output.op === "path" && (output.from === undefined || output.to === undefined)) {
+    return `map op "path" needs both from and to — the two symbols to connect. Use op "impact" for everything one symbol reaches.`;
+  }
+  if (output.op === "search" && output.query === undefined) return `map op "search" needs query: the identifier fragments to look for.`;
+  if ((output.op === "explain" || output.op === "impact" || output.op === "snippet") && output.symbol === undefined) {
+    return `map op ${JSON.stringify(output.op)} needs symbol: a symbol name, a qualified name, or a file path. Run map { op: "search", query: "..." } to find the name first.`;
+  }
+  // A field belonging to another op is neither dropped nor refused here: dropping it would be
+  // §3.7.5's accept-and-ignore, and refusing a call that is otherwise answerable would cost a
+  // round trip to say something the answer can carry. It reaches the handler, which names it.
+  return output;
+}
+
+/** Which fields each op reads. Anything else the call carried is reported, never ignored. */
+const MAP_OP_FIELDS: Readonly<Record<string, readonly string[]>> = Object.freeze({
+  overview: [], search: ["query"], explain: ["symbol"], impact: ["symbol", "depth"], path: ["from", "to"], snippet: ["symbol"],
+});
+
+/** The §3.8 sentence for a field the chosen op does not read: said, rather than swallowed. */
+function unusedMapFields(op: string, value: Record<string, unknown>): string | undefined {
+  const used = new Set([...(MAP_OP_FIELDS[op] ?? []), "op", "budget"]);
+  const extra = Object.keys(value).filter((field) => !used.has(field));
+  if (extra.length === 0) return undefined;
+  return `note: ${extra.join(" and ")} ${extra.length === 1 ? "is not read" : "are not read"} by op ${JSON.stringify(op)}, so ${extra.length === 1 ? "it was" : "they were"} ignored — ${extra.map((field) => `${field} belongs to ${describeMapField(field)}`).join(", ")}.`;
+}
+function describeMapField(field: string): string {
+  switch (field) {
+    case "query": return `op "search"`;
+    case "symbol": return `ops "explain", "impact", and "snippet"`;
+    case "depth": return `op "impact"`;
+    case "from": case "to": return `op "path"`;
+    default: return "another op";
+  }
+}
 
 /** Lyra has one delegation primitive, so a named agent type has nothing to select (§7). */
 export function normalizeSpawnArgs(input: unknown): unknown | string {
@@ -275,6 +413,147 @@ export class LspTool implements LyraTool {
   normalize(args: unknown): unknown | string { return normalizeLspArgs(args); }
   async execute(input: unknown, _context: ToolExecutionContext): Promise<ToolExecutionResult> { try { const value = objectInput(input, "lsp"); const op = stringField(value, "op"); if (!("params" in value)) throw new Error("lsp requires params."); const language = typeof value.language === "string" ? value.language : undefined; let result: unknown; switch (op) { case "definition": result = await this.manager.definition(value.params, language); break; case "references": result = await this.manager.references(value.params, language); break; case "hover": result = await this.manager.hover(value.params, language); break; case "rename": result = await this.manager.rename(value.params, language); break; case "diagnostics": result = await this.manager.diagnostics(value.params, language); break; case "codeAction": result = await this.manager.codeAction(value.params, language); break; default: throw new Error("lsp op must be definition, references, hover, rename, diagnostics, or codeAction."); } return { content: JSON.stringify(result) }; } catch (error) { return failed("LSP", error); } }
   async close(): Promise<void> { if (this.owned) await this.manager.close(); }
+}
+
+/**
+ * The `map` tool: six questions against one graph, and one sentence of truth about drift.
+ *
+ * Two properties are load-bearing and neither is in the query verbs:
+ *
+ * - **Every answer ends with the staleness line when the tree has moved on.** A code graph
+ *   that quietly answers from yesterday's parse is the failure mode that makes indexes
+ *   untrustworthy, and §3.8 forbids the silent version of it. The line names the files and
+ *   says what to do about them.
+ * - **`snippet` reads from disk, through `read`.** The graph stores line ranges and never
+ *   source text, so the exact bytes must come from the file — and going through the read
+ *   tool rather than around it is what makes a 4 MB generated file spill to an artifact here
+ *   exactly as it would anywhere else, instead of landing whole in the context window.
+ */
+export class MapTool implements LyraTool {
+  readonly definition = MAP_DEFINITION;
+  constructor(private readonly service: MapAccess | undefined, private readonly read: LyraTool) {}
+  normalize(args: unknown): unknown | string { return normalizeMapArgs(args); }
+
+  async execute(input: unknown, context: ToolExecutionContext): Promise<ToolExecutionResult> {
+    try {
+      const normalized = normalizeMapArgs(input);
+      if (typeof normalized === "string") return { content: `Invalid map arguments: ${normalized}`, isError: true };
+      const value = objectInput(normalized, "map");
+      const op = typeof value.op === "string" ? value.op : "overview";
+      const service = this.service;
+      if (service === undefined) {
+        return { content: "The code graph is not available in this session, so map has nothing to answer from. Explore with grep, glob, and read.", isError: true };
+      }
+      // Lazily for an isolated child: the first question is what builds its workspace's graph.
+      service.ensureStarted();
+      const status = service.status();
+      if (status.phase === "unavailable") {
+        return { content: `The code graph is unavailable for this session: ${status.reason ?? "the index could not be opened."} It will not recover before a restart. Explore with grep, glob, and read instead.`, isError: true };
+      }
+      const graph = service.graph();
+      if (graph === undefined) {
+        return {
+          content: `The code graph is still being built: indexing — ${status.indexed} of ${status.total} files. Nothing is queryable yet, and no answer is better than a wrong one. Ask again in a few seconds, or explore with grep and read now.`,
+        };
+      }
+      const budget = typeof value.budget === "number" ? value.budget : undefined;
+      const answer = op === "snippet"
+        ? await this.snippet(graph, stringField(value, "symbol"), context)
+        : await this.query(graph, op, value, budget);
+      if (answer.isError === true || typeof answer.content !== "string") return answer;
+      const trailer = [unusedMapFields(op, value), await service.staleLine()].filter((line) => line !== undefined);
+      return trailer.length === 0 ? answer : { ...answer, content: `${answer.content}\n${trailer.join("\n")}` };
+    } catch (error) { return failed("Map", error); }
+  }
+
+  /** The five TOON-answering verbs, each bound at call time from `@lyra/map`. */
+  private async query(graph: CodeMap, op: string, value: Record<string, unknown>, budget: number | undefined): Promise<ToolExecutionResult> {
+    const verbs = mapQueryVerbs();
+    const options = budget === undefined ? undefined : { budget };
+    let answer: unknown;
+    switch (op) {
+      case "overview": {
+        if (typeof verbs.overview !== "function") return notWired("overview", "overview");
+        answer = await verbs.overview(graph, options);
+        break;
+      }
+      case "search": {
+        if (typeof verbs.search !== "function") return notWired("search", "search");
+        answer = await verbs.search(graph, stringField(value, "query"), options);
+        break;
+      }
+      case "explain": {
+        if (typeof verbs.explain !== "function") return notWired("explain", "explain");
+        answer = await verbs.explain(graph, stringField(value, "symbol"), options);
+        break;
+      }
+      case "impact": {
+        if (typeof verbs.impact !== "function") return notWired("impact", "impact");
+        const depth = typeof value.depth === "number" ? value.depth : undefined;
+        answer = await verbs.impact(graph, stringField(value, "symbol"), { ...(options ?? {}), ...(depth === undefined ? {} : { depth }) });
+        break;
+      }
+      case "path": {
+        if (typeof verbs.pathBetween !== "function") return notWired("path", "pathBetween");
+        answer = await verbs.pathBetween(graph, stringField(value, "from"), stringField(value, "to"), options);
+        break;
+      }
+      default: return { content: `map op must be overview, search, explain, impact, path, or snippet; received ${JSON.stringify(op)}.`, isError: true };
+    }
+    const text = typeof answer === "string" ? answer : JSON.stringify(answer);
+    if (text.trim().length > 0) return { content: text };
+    // An empty answer is a real result — the graph knows nothing by that name — and the one
+    // useful thing to say next is which names it *does* know (§3.7.1: never a dead end).
+    const term = typeof value.query === "string" ? value.query : typeof value.symbol === "string" ? value.symbol : undefined;
+    return { content: `${op} found nothing for ${JSON.stringify(term ?? "")} in the graph.${suggestionLine(graph, term)}` };
+  }
+
+  /**
+   * A symbol's exact source: the graph resolves the range, the file provides the bytes.
+   *
+   * Three answers, and the two that are not source text are the point of resolving through
+   * the graph at all — an ambiguous name comes back as the candidates to choose between, and
+   * an unknown one comes back with the vocabulary that would have worked.
+   */
+  private async snippet(graph: CodeMap, symbol: string, context: ToolExecutionContext): Promise<ToolExecutionResult> {
+    const verb = mapQueryVerbs().snippetTarget;
+    if (typeof verb !== "function") return notWired("snippet", "snippetTarget");
+    const located = verb(graph, symbol);
+    if (located === undefined) {
+      return { content: `No symbol named ${JSON.stringify(symbol)} is in the graph.${suggestionLine(graph, symbol)} Run map { op: "search", query: "..." } to find the name the code uses.` };
+    }
+    if (!isSnippetTarget(located)) {
+      const names = located.candidates.map((candidate) => typeof candidate === "string" ? candidate : candidate.qn ?? candidate.file ?? "").filter((name) => name.length > 0);
+      return { content: `${JSON.stringify(symbol)} names ${names.length} symbols in this repository: ${names.join(", ")}. Ask again with the qualified name of the one you meant.` };
+    }
+    const path = resolve(graph.root, located.file);
+    const result = await this.read.execute({ path, startLine: located.start, endLine: located.end }, context);
+    if (typeof result.content !== "string") return result;
+    // The read tool's own display budget and artifact spill already applied; the header is
+    // added rather than substituted so the #TAG it printed still guards a following edit.
+    return { ...result, content: `${located.file}:${located.start}-${located.end} — ${located.qn}\n${result.content}` };
+  }
+}
+
+function isSnippetTarget(value: SnippetTarget | { candidates: unknown }): value is SnippetTarget {
+  return typeof (value as SnippetTarget).file === "string";
+}
+
+/**
+ * A verb wave 2 has not exported yet. Said as a fact about the build rather than as a
+ * failure of the call, because there is nothing the model could have sent that would work.
+ */
+function notWired(op: string, verb: string): ToolExecutionResult {
+  return {
+    content: `map op ${JSON.stringify(op)} is not yet wired: @lyra/map exports no ${verb}(). The other ops still work, and grep, glob, and read answer this question the long way.`,
+    isError: true,
+  };
+}
+
+/** The graph's own words for what the caller was reaching for, when it has any. */
+function suggestionLine(graph: CodeMap, term: string | undefined): string {
+  const words = vocabularySuggestions(graph, term);
+  return words.length === 0 ? "" : ` The graph does know: ${words.join(", ")} — widen the query with those, not with synonyms.`;
 }
 
 /** How long a collect waits before it answers with a status report instead (§3.4). */
@@ -700,7 +979,7 @@ const CHECKPOINT_DIFF_DEFAULT = 20;
 /**
  * The `git` tool, extended with the checkpoint history rather than joined by a new tool.
  *
- * The thirteen-tool budget is the reason: checkpoints *are* git — a second repository whose
+ * The tool budget is the reason: checkpoints *are* git — a second repository whose
  * work tree is this directory — so `git` is where a model already looks for "what changed"
  * and "put it back". Omitting `op` runs a git command exactly as before, so nothing a model
  * already knows how to do changes shape.
@@ -808,9 +1087,15 @@ function summarize(record: CheckpointRecord): Record<string, unknown> {
 function optionalText(value: Record<string, unknown>, name: string): string | undefined { const field = value[name]; return typeof field === "string" && field.trim().length > 0 ? field.trim() : undefined; }
 function optionalCount(value: Record<string, unknown>, name: string): number | undefined { const field = value[name]; return typeof field === "number" && Number.isSafeInteger(field) && field > 0 ? Math.min(field, 500) : undefined; }
 
-export const INTEGRATED_TOOL_NAMES = ["read", "write", "edit", "bash", "grep", "glob", "lsp", "spawn", "hub", "skill", "jit", "mcp", "git"] as const;
+export const INTEGRATED_TOOL_NAMES = ["read", "write", "edit", "bash", "grep", "glob", "map", "lsp", "spawn", "hub", "skill", "jit", "mcp", "git"] as const;
 export interface IntegratedToolOptions extends DefaultToolRegistryOptions {
   lsp: LspManager; ownLsp?: boolean; spawn: SpawnManager; parent?: SpawnParentContext;
+  /**
+   * The code graph for the tree these tools operate on. Absent only where a caller builds a
+   * registry with no session behind it; `map` then says so rather than disappearing, because
+   * a tool array that varies between sessions is a cache invalidation waiting to happen (§13).
+   */
+  map?: MapAccess;
   allowedTools?: readonly string[]; bus: IrcBus; peer: string; skills: SkillRegistry;
   runtime: RuntimeManager; mcp: McpGateway; checkpoints?: CheckpointAccess;
   /** What `hub list` asks about each peer that is a spawned child. */
@@ -836,7 +1121,10 @@ export function createIntegratedToolRegistry(options: IntegratedToolOptions): To
     : builtins.slice(0, 6).map((tool) => WRITE_SCOPED_TOOLS.has(tool.definition.name)
       ? new ScopedWriteTool(tool, options.writeScope!, scopeRoot(options), options.onScopeViolation)
       : tool);
-  const assembled: LyraTool[] = [...guarded, new LspTool(options.lsp, options.ownLsp), new SpawnTool(options.spawn, options.parent), new HubTool(options.bus, options.peer, options.agents), new SkillTool(options.skills), new JitTool(options.runtime), options.mcp, git];
+  // `map` sits with the other exploration tools rather than at the end of the list: the tool
+  // index a model reads is in this order, and the answer to "how do I find things here" should
+  // be next to grep and glob, not eleven rows below them.
+  const assembled: LyraTool[] = [...guarded, new MapTool(options.map, builtins[0]!), new LspTool(options.lsp, options.ownLsp), new SpawnTool(options.spawn, options.parent), new HubTool(options.bus, options.peer, options.agents), new SkillTool(options.skills), new JitTool(options.runtime), options.mcp, git];
   if (options.allowedTools === undefined) return new ToolRegistry(assembled);
   const allowed = new Set(options.allowedTools);
   const filtered = assembled.filter((tool) => allowed.has(tool.definition.name));

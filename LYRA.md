@@ -36,7 +36,7 @@ in order:
 | Should this ship, or be an extension point? | **Ship it finished, or not at all.** There is no hook-and-hope tier (§2). |
 | Should this be configurable? | **No.** Pick the right default. Add config only when reasonable users genuinely disagree, and the default must work with zero config (§2). |
 | Should the model be told how to do this? | **No.** Give it the capability and the environment facts. If it misuses a tool, the tool is wrong (§3.7). |
-| Should this be a new tool? | **Almost never.** Thirteen tools (§15). New surface must justify itself against unbounded reach (§2's three hatches). |
+| Should this be a new tool? | **Almost never.** Fourteen tools (§15). New surface must justify itself against unbounded reach (§2's three hatches). |
 | Should this be a new primitive alongside an existing one? | **No.** Look for the unification — `spawn` (§7) is the worked example. |
 | How much should go in the system prompt? | **Less.** Environment facts and a capability index. Never instructions (§14). |
 | Fail loudly or degrade silently? | **Loudly, with an actionable message.** Never silently (§3.7, §3.8). |
@@ -1438,6 +1438,26 @@ session dies.
 - Boundaries are visible in the TUI with the token delta. Never silent.
 - `/compact` forces it; `/clear` sets a hard boundary without summarizing.
 
+### The code graph is context discipline
+
+`map` (§15) belongs to this section as much as to the tool list. Exploration is where a
+context window goes: reading six files to learn that `resolveSymbol` is called from three
+places spends thousands of tokens to derive a fact the repository already knows — and
+spends them again in the next session, and in every child agent, because nothing kept it.
+
+The graph is where that fact persists. It is derived once, incrementally maintained by the
+edits that would have invalidated it, and answered from in bounded, budgeted form. The
+saving is not the tokens of one grep against one `map` call; it is that the derivation
+happens once per repository instead of once per question.
+
+Two rules keep it from becoming the thing it replaces:
+
+- **Bounded answers.** Every verb renders under a budget. An index that could dump the
+  whole graph into the window would be a worse `grep`, not a better one.
+- **Never silently behind.** An answer from a graph that no longer matches the tree is the
+  failure mode that makes an index untrustworthy, so drift is named on the answer that
+  carries it (§3.8) and the files it names are ground truth.
+
 ### Everything is inspectable
 
 `/context` shows the exact payload: system prompt, tool array, every message, every repair
@@ -1464,6 +1484,7 @@ edit    — content-anchored search/replace patch
 bash    — run a command; heavy commands return a job handle
 grep    — regex search
 glob    — file patterns
+map     — the codebase graph: architecture, symbol search, who-calls-what, change impact
 lsp     — definition, references, rename, diagnostics
 spawn   — delegate to a subagent; add output_schema for a typed contract
 hub     — messaging, channels, job control
@@ -1494,7 +1515,7 @@ turn preamble where it cannot break the cache.
 
 ## 15. Tools
 
-Thirteen. Each finished.
+Fourteen. Each finished.
 
 | Tool | Notes |
 |---|---|
@@ -1504,13 +1525,14 @@ Thirteen. Each finished.
 | `bash` | Semaphore-classed (§11), and separately classed for blocking: builds and test suites run inline, installs and servers hand back a job id. |
 | `grep` | Regex, ripgrep-backed, `io`-classed. |
 | `glob` | Patterns, gitignore-aware. |
+| `map` | The code graph (§13): `overview` for a repository's shape, `search` for symbols, `explain` for one symbol's callers and callees, `impact` for what a change reaches, `path` for how two symbols connect, `snippet` for exact source — read from disk through `read`, so its display budget and artifact spill apply unchanged. Indexed in the background at boot and kept current by the tool dispatcher: every call that reports changed files feeds a debounced incremental update, so nobody re-indexes anything. Every answer ends with a staleness line when the tree has moved on (§3.8) — those files are ground truth. Its vocabulary is the code's identifiers, not English, and the description says so: a query is widened with tokens the graph printed, never with synonyms. One honest boundary from the index itself: a renamed *package* (a `package.json` `name` change) re-resolves only on a full index, so cross-package edges can lag a rename until then. |
 | `lsp` | definition, references, hover, rename, diagnostics, code actions. **Auto-started per detected language** (§2). Degrades to text tools on timeout, warns once. |
 | `spawn` | §7. |
 | `hub` | §9. |
 | `skill` | §16. |
 | `jit` | §8. |
 | `mcp` | §17. |
-| `git` | One git command in the session directory; destructive ops logged, never blocked. With `op`, the checkpoint history instead: `checkpoint`, `list`, `diff`, `restore` (§10.2). Checkpoints *are* git — a shadow repository over this directory — so they belong here rather than on a fourteenth tool. |
+| `git` | One git command in the session directory; destructive ops logged, never blocked. With `op`, the checkpoint history instead: `checkpoint`, `list`, `diff`, `restore` (§10.2). Checkpoints *are* git — a shadow repository over this directory — so they belong here rather than on a tool of their own. |
 
 No `web_search` built in — it arrives via Draco's MCP (§17), which is the correct layer.
 
@@ -1557,8 +1579,11 @@ Client only. Never a host, no server-authoring surface.
 
 A model cannot call a tool absent from the API's `tools` array. So "index the built-ins and
 hydrate on demand" costs a round trip on every first use *and* mutates the tool array,
-which breaks prompt caching (§13). Thirteen built-in schemas are ~1.5k tokens — that is the
-harness contract, not bloat.
+which breaks prompt caching (§13). The fourteen built-in schemas measure ~17.5k characters
+of JSON — call it 4–5k tokens, cached after the first turn — and that is the harness
+contract, not bloat. (The figure quoted here used to be ~1.5k tokens; it was never
+re-measured as the descriptions grew, and a number nobody checks is a number that lies.
+This one is `JSON.stringify(registry.definitions()).length`.)
 
 MCP is the unbounded surface, and a single enterprise server can inject 10k–17k tokens of
 schema. So MCP gets exactly two stable tools:

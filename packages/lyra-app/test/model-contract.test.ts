@@ -134,12 +134,25 @@ const FOREIGN_SPELLINGS: Readonly<Record<string, Record<string, unknown>>> = Obj
   lsp: { operation: "definition", uri: "file:///tmp/a.ts", line: 1, character: 2 },
   skill: { skill: "reviewer" },
   mcp: { op: "describe", server: "s", tool: "t", arguments: { probe: true } },
+  // Every harness spells "look it up in the code" differently; each of these is a first call
+  // that says the right thing in another tool's dialect.
+  map: { q: "resolveSymbol", max_depth: 2 },
 });
 
 /** Calls that mean two different things at once, so a bare "required + one field" cannot work. */
 const BASE_ARGS: Readonly<Record<string, Record<string, unknown>>> = Object.freeze({
   spawn: { task: "audit the parser" },
 });
+/**
+ * Fields that only mean something beside another one. `map`'s two path endpoints are the
+ * whole list: `from` alone is not half a path, it is a call that named one end and forgot
+ * the other, and the tool says so rather than answering a question nobody asked.
+ */
+const COMPANIONS: Readonly<Record<string, Record<string, unknown>>> = Object.freeze({
+  "map.from": { to: "sample-map-to" },
+  "map.to": { from: "sample-map-from" },
+});
+
 /** Properties whose presence excludes the tool's ordinary base call, or needs a specific value. */
 const EXCLUSIVE: Readonly<Record<string, unknown>> = Object.freeze({
   // `id` addresses a child that exists; `task` starts a new one. Sending both is refused by name.
@@ -149,7 +162,7 @@ const EXCLUSIVE: Readonly<Record<string, unknown>> = Object.freeze({
 });
 
 describe("the schema a model reads and the handler that serves it", () => {
-  test("the advertised surface is exactly the thirteen tools, in the documented order", async () => {
+  test("the advertised surface is exactly the fourteen tools, in the documented order", async () => {
     const { registry } = await surface();
     expect(registry.definitions().map((definition) => definition.name)).toEqual([...INTEGRATED_TOOL_NAMES]);
   });
@@ -188,6 +201,7 @@ describe("the schema a model reads and the handler that serves it", () => {
         }
         args[name] = key in EXCLUSIVE ? EXCLUSIVE[key] : sample(property, definition.name, name);
         if (args[name] === undefined) args[name] = sample(property, definition.name, name);
+        Object.assign(args, COMPANIONS[key] ?? {});
 
         const probe = boundary(tool);
         const result = await probe.registry.execute(definition.name, args, context(root));

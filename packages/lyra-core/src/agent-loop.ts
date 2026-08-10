@@ -12,7 +12,7 @@ import type { Compactor } from "./compaction.ts";
 import { deriveContext } from "./context.ts";
 import type { LoopDetector } from "./loop-detection.ts";
 import { renderHubAside, type SteerQueue } from "./steering.ts";
-import { ToolDispatcher, type ToolCheckpointer } from "./tool-dispatch.ts";
+import { ToolDispatcher, type FilesModifiedReport, type ToolCheckpointer } from "./tool-dispatch.ts";
 import type {
   AgentEvent,
   AgentTurnResult,
@@ -54,6 +54,12 @@ export interface AgentLoopOptions {
    * boundaries, so a conversation and the code it produced rewind together.
    */
   checkpointer?: ToolCheckpointer;
+  /**
+   * Told which files each tool call changed, right after the checkpointer is. The code map
+   * listens here so an edit reaches the graph without anyone having to re-index by hand;
+   * anything it throws is swallowed by the dispatcher (see [`ToolDispatcherOptions`]).
+   */
+  onFilesModified?: (report: FilesModifiedReport) => void;
 }
 
 export type UserTurnContent = string | ContentBlock[];
@@ -106,6 +112,7 @@ export class AgentLoop {
         ...(options.toolTimeouts === undefined ? {} : { toolTimeouts: options.toolTimeouts }),
         ...(options.waitTools === undefined ? {} : { waitTools: options.waitTools }),
         ...(options.checkpointer === undefined ? {} : { checkpointer: options.checkpointer }),
+        ...(options.onFilesModified === undefined ? {} : { onFilesModified: options.onFilesModified }),
       },
     );
     this.checkpointer = options.checkpointer;

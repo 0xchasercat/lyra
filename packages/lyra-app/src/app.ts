@@ -9,6 +9,7 @@ import { DracoInstaller, McpGateway, McpRegistry } from "@lyra/mcp";
 import { RuntimeManager, type RuntimeAdapters } from "@lyra/runtime";
 import { SkillRegistry } from "@lyra/skills";
 import { createArtifactStore, type ToolRegistry } from "@lyra/tools";
+import { CodeMapRegistry, type CodeMapService } from "./code-map.ts";
 import { loadConfig, durationMs, type LyraConfig } from "./config.ts";
 import { SLASH_COMMAND_CATALOG, SlashCommandRouter, type SlashServices } from "./commands.ts";
 import { createIntegratedToolRegistry, INTEGRATED_TOOL_NAMES, type CheckpointAccess } from "./integrated-tools.ts";
@@ -38,7 +39,7 @@ export interface LyraApplicationOptions {
   home?: string;
 }
 interface ApplicationParts {
-  config: LyraConfig; origin: string; cwd: string; sessionName: string; checkpoints: CheckpointStore; workspaces: WorkspaceManager; processes: ProcessHost; bus: IrcBus; spawn: SpawnManager; lsp: LspManager; git: GitPipeline; mcp: McpRegistry; mcpTool: McpGateway; draco: DracoInstaller; skills: SkillRegistry; runtime: RuntimeManager; tools: ToolRegistry; metrics: MetricsStore; commands: SlashCommandRouter; acp: AcpDaemon;
+  config: LyraConfig; origin: string; cwd: string; sessionName: string; checkpoints: CheckpointStore; workspaces: WorkspaceManager; processes: ProcessHost; bus: IrcBus; spawn: SpawnManager; lsp: LspManager; git: GitPipeline; mcp: McpRegistry; mcpTool: McpGateway; draco: DracoInstaller; skills: SkillRegistry; runtime: RuntimeManager; tools: ToolRegistry; metrics: MetricsStore; commands: SlashCommandRouter; acp: AcpDaemon; maps: CodeMapRegistry; map: CodeMapService;
 }
 
 export class LyraApplication {
@@ -73,10 +74,17 @@ export class LyraApplication {
   readonly metrics: MetricsStore;
   readonly commands: SlashCommandRouter;
   readonly acp: AcpDaemon;
+  /**
+   * One code graph per tree. The main session's is [`map`]; an isolated child's workspace
+   * gets its own from here, lazily, the first time that child asks the graph anything.
+   */
+  readonly maps: CodeMapRegistry;
+  /** This directory's code graph: opened at boot, indexed in the background, never waited on. */
+  readonly map: CodeMapService;
   readonly #sessions: SessionServices;
 
   private constructor(parts: ApplicationParts, sessions: SessionServices) {
-    this.config = parts.config; this.origin = parts.origin; this.cwd = parts.cwd; this.sessionName = parts.sessionName; this.checkpoints = parts.checkpoints; this.workspaces = parts.workspaces; this.processes = parts.processes; this.bus = parts.bus; this.spawn = parts.spawn; this.lsp = parts.lsp; this.git = parts.git; this.mcp = parts.mcp; this.mcpTool = parts.mcpTool; this.draco = parts.draco; this.skills = parts.skills; this.runtime = parts.runtime; this.tools = parts.tools; this.metrics = parts.metrics; this.commands = parts.commands; this.acp = parts.acp; this.#sessions = sessions;
+    this.config = parts.config; this.origin = parts.origin; this.cwd = parts.cwd; this.sessionName = parts.sessionName; this.checkpoints = parts.checkpoints; this.workspaces = parts.workspaces; this.processes = parts.processes; this.bus = parts.bus; this.spawn = parts.spawn; this.lsp = parts.lsp; this.git = parts.git; this.mcp = parts.mcp; this.mcpTool = parts.mcpTool; this.draco = parts.draco; this.skills = parts.skills; this.runtime = parts.runtime; this.tools = parts.tools; this.metrics = parts.metrics; this.commands = parts.commands; this.acp = parts.acp; this.maps = parts.maps; this.map = parts.map; this.#sessions = sessions;
   }
 
   static async boot(options: LyraApplicationOptions): Promise<LyraApplication> {
@@ -104,6 +112,17 @@ export class LyraApplication {
     // `.lyra` now sits inside the user's own checkout, because the session runs there. Best
     // effort, and silent in a directory that is not a repository — there is nothing to hide it from.
     void excludeLyraState(origin).catch(() => undefined);
+    // The code graph. Opening is a file handle; building it is not, so the build runs in the
+    // background and boot never waits for it — a session must not get slower the more code it
+    // is pointed at. A first boot indexes the tree; a later one only catches up on what
+    // drifted. Neither can fail the boot: an indexing crash disables the `map` tool for the
+    // session, warns once, and leaves everything else exactly as it was.
+    const maps = new CodeMapRegistry({
+      onWarning: (message) => { void options.onReport?.(message); },
+      onReport: (message) => { void options.onReport?.(message); },
+    });
+    const map = maps.get(cwd);
+    map.ensureStarted();
     const processes = new ProcessHost({ heavyLimit: config.exec.heavy, ioLimit: config.exec.io, cgroup: config.exec.cgroup });
     const bus = new IrcBus(); bus.register(options.session);
     // `reservedPeers` is what keeps a child's label from shadowing a name that already
@@ -135,15 +154,15 @@ export class LyraApplication {
       report: async (message, signal) => { throwIfAborted(signal); await options.onReport?.(message); },
     };
     const runtime = new RuntimeManager({ origin, session: options.session, adapters: runtimeAdapters, runTimeoutMs: durationMs(config.reliability.turn_timeout) });
-    tools = createIntegratedToolRegistry({ lsp, spawn, bus, peer: options.session, agents: { status: (name) => spawn.status(name) }, skills, runtime, mcp: mcpGateway, checkpoints: checkpointAccess, filesystem: { root: cwd }, bash: { root: cwd, processHost: processes } });
-    const services = makeSlashServices(options.sessions, { workspaces, processes, bus, spawn, git, checkpoints, skills, mcp, draco, metrics, config });
+    tools = createIntegratedToolRegistry({ lsp, spawn, bus, peer: options.session, agents: { status: (name) => spawn.status(name) }, skills, runtime, mcp: mcpGateway, checkpoints: checkpointAccess, map, filesystem: { root: cwd }, bash: { root: cwd, processHost: processes } });
+    const services = makeSlashServices(options.sessions, { workspaces, processes, bus, spawn, git, checkpoints, skills, mcp, draco, metrics, config, map });
     const handlers = makeAcpHandlers(options.sessions, { workspaces, spawn, bus, sessionName: options.session, git, checkpoints, metrics, config });
     // The turn-class deadline is the *configured* one, so `reliability.turn_timeout` bounds
     // the ACP request that carries a turn exactly as it bounds the loop running inside it.
     // Both stdio paths — `--acp` and the TUI's private pipe pair — are this one daemon.
     const acp = new AcpDaemon({ handlers, turnTimeoutMs: durationMs(config.reliability.turn_timeout) });
     const commands = new SlashCommandRouter(services);
-    return new LyraApplication({ config, origin, cwd, sessionName: options.session, checkpoints, workspaces, processes, bus, spawn, lsp, git, mcp, mcpTool: mcpGateway, draco, skills, runtime, tools, metrics, commands, acp }, options.sessions);
+    return new LyraApplication({ config, origin, cwd, sessionName: options.session, checkpoints, workspaces, processes, bus, spawn, lsp, git, mcp, mcpTool: mcpGateway, draco, skills, runtime, tools, metrics, commands, acp, maps, map }, options.sessions);
   }
 
   /** A checkpointer bound to this session's store, for one agent loop. */
@@ -152,7 +171,7 @@ export class LyraApplication {
   }
 
   slash(command: string): Promise<unknown> { return this.commands.execute(command); }
-  async close(): Promise<void> { await this.acp.close(); await this.spawn.close(); await Promise.allSettled([this.mcp.close(), this.lsp.close(), this.tools.close(), this.runtime.close(), this.processes.close(), this.checkpoints.close(), releaseSessionDirectory(this.origin)]); this.bus.close(); }
+  async close(): Promise<void> { await this.acp.close(); await this.spawn.close(); await Promise.allSettled([this.mcp.close(), this.lsp.close(), this.tools.close(), this.runtime.close(), this.processes.close(), this.checkpoints.close(), this.maps.close(), releaseSessionDirectory(this.origin)]); this.bus.close(); }
 }
 
 /**
@@ -231,7 +250,7 @@ function makeAcpHandlers(sessions: SessionServices, parts: { workspaces: Workspa
     "settings/get": () => parts.config, "settings/set": (params) => sessions.settings(runtimeStrings(params, "args")),
   };
 }
-function makeSlashServices(sessions: SessionServices, parts: { workspaces: WorkspaceManager; processes: ProcessHost; bus: IrcBus; spawn: SpawnManager; git: GitPipeline; checkpoints: CheckpointStore; skills: SkillRegistry; mcp: McpRegistry; draco: DracoInstaller; metrics: MetricsStore; config: LyraConfig }): SlashServices {
+function makeSlashServices(sessions: SessionServices, parts: { workspaces: WorkspaceManager; processes: ProcessHost; bus: IrcBus; spawn: SpawnManager; git: GitPipeline; checkpoints: CheckpointStore; skills: SkillRegistry; mcp: McpRegistry; draco: DracoInstaller; metrics: MetricsStore; config: LyraConfig; map: CodeMapService }): SlashServices {
   return {
     copy: async (target) => report(`Copied ${textLength(await sessions.copy(target))} characters of the assistant's reply to the clipboard.`),
     dump: async () => report(`Copied the full transcript to the clipboard as ${textLength(await sessions.dump())} characters of JSON.`),
@@ -297,7 +316,10 @@ function makeSlashServices(sessions: SessionServices, parts: { workspaces: Works
     sessions: async (operation, value) => operation === "list" ? { sessions: await sessions.sessions("list") }
       : operation === "resume" ? report(`Loaded session ${value ?? ""}.`, await sessions.sessions(operation, value))
       : report(value === undefined ? "Forked the transcript at its head." : `Forked the transcript at ${value}.`, await sessions.sessions(operation, value)),
-    health: async () => parts.metrics.health({ processes: parts.processes.list().length, workspaces: await workspaceCount(parts.workspaces) }),
+    // The map has no slash command of its own — it is a tool the model calls, and a user
+    // asking about the index is asking a health question. The row says how big it is, how
+    // stale it is, and what it costs on disk: the three things a cache must answer for.
+    health: async () => ({ ...await parts.metrics.health({ processes: parts.processes.list().length, workspaces: await workspaceCount(parts.workspaces) }), map: await parts.map.info() }),
   };
 }
 /**
@@ -377,7 +399,7 @@ async function integrableWorkspaces(manager: WorkspaceManager, origin: string): 
  * checkpoint history thinned by age and count. One command, because they are one question —
  * "reclaim what this session no longer needs" — and three would be three things to remember.
  */
-async function cleanup(parts: { workspaces: WorkspaceManager; git: GitPipeline; checkpoints: CheckpointStore }, minimumAgeMs: number): Promise<unknown> {
+async function cleanup(parts: { workspaces: WorkspaceManager; git: GitPipeline; checkpoints: CheckpointStore; map: CodeMapService }, minimumAgeMs: number): Promise<unknown> {
   const dropped: WorkspaceRecord[] = [];
   const cutoff = Date.now() - minimumAgeMs;
   try {
@@ -388,7 +410,12 @@ async function cleanup(parts: { workspaces: WorkspaceManager; git: GitPipeline; 
   const previews = await parts.git.cleanupPreviews(minimumAgeMs).catch(() => [] as string[]);
   let checkpoints: CheckpointGcResult = { kept: 0, dropped: 0, checkpoints: [] };
   try { checkpoints = await parts.checkpoints.collect(); } catch { /* thinning is best effort; the history stays as it was */ }
-  return { workspaces: dropped, previews, checkpoints: { kept: checkpoints.kept, dropped: checkpoints.dropped } };
+  // The index is never deleted here: dropping it would only mean paying to rebuild it on the
+  // next boot, which is the opposite of reclaiming anything. What it reclaims is the rows of
+  // files that no longer exist, and the drift nobody reported.
+  let map = { removed: 0, updated: 0 };
+  try { map = await parts.map.collect(); } catch { /* an index that cannot catch up stays stale, and says so on every answer */ }
+  return { workspaces: dropped, previews, checkpoints: { kept: checkpoints.kept, dropped: checkpoints.dropped }, map };
 }
 
 function runtimeWorkspaces(value: unknown): Array<{ name: string; path: string; task: string }> { if (!Array.isArray(value)) throw new Error("workspaces must be an array."); return value.map((entry) => { if (!isRecord(entry) || typeof entry.name !== "string" || typeof entry.path !== "string" || typeof entry.task !== "string") throw new Error("Each workspace needs name, path, and task."); return { name: entry.name, path: entry.path, task: entry.task }; }); }

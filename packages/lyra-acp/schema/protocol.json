@@ -1216,6 +1216,72 @@
         "workspaces": {
           "type": "integer",
           "minimum": 0
+        },
+        "map": {
+          "description": "The code graph over this directory: what state it is in, how big it is, how far behind the working tree, and what it costs on disk. A gauge like `processes`, present only when the session has an index.",
+          "type": "object",
+          "required": [
+            "root",
+            "state"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "root": {
+              "type": "string",
+              "minLength": 1
+            },
+            "state": {
+              "type": "string",
+              "enum": [
+                "cold",
+                "indexing",
+                "ready",
+                "unavailable"
+              ]
+            },
+            "reason": {
+              "type": "string",
+              "minLength": 1
+            },
+            "files": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "symbols": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "edges": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "indexing": {
+              "type": "object",
+              "required": [
+                "indexed",
+                "total"
+              ],
+              "additionalProperties": false,
+              "properties": {
+                "indexed": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "total": {
+                  "type": "integer",
+                  "minimum": 0
+                }
+              }
+            },
+            "staleFiles": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "bytes": {
+              "type": "integer",
+              "minimum": 0
+            }
+          }
         }
       }
     },

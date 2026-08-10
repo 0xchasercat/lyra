@@ -11,6 +11,7 @@
     "@lyra/git": "workspace:*",
     "@lyra/host": "workspace:*",
     "@lyra/lsp": "workspace:*",
+    "@lyra/map": "workspace:*",
     "@lyra/mcp": "workspace:*",
     "@lyra/provider": "workspace:*",
     "@lyra/runtime": "workspace:*",
