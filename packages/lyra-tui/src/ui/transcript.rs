@@ -854,7 +854,7 @@ mod tests {
 
     #[test]
     fn thinking_lives_in_the_live_region_and_commits_as_one_line() {
-        let mut transcript = transcript(60);
+        let mut transcript = transcript(60).with_thinking(ThinkingMode::Collapsed);
         transcript.thinking_delta("weighing it up");
         assert!(
             transcript.thinking_live(),
@@ -874,8 +874,9 @@ mod tests {
     #[test]
     fn a_thinking_commit_closes_the_answer_above_it_first() {
         // Order is the whole point: a trace committed above unflushed prose
-        // would put the reasoning before the sentence it came after.
-        let mut transcript = transcript(60);
+        // would put the reasoning before the sentence it came after. Collapsed
+        // mode keeps the assertion exact — one line, in order.
+        let mut transcript = transcript(60).with_thinking(ThinkingMode::Collapsed);
         let _ = transcript.assistant_delta("a line with no newline yet");
         transcript.thinking_delta("second thoughts");
         let rows = texts(&transcript.end_thinking("second thoughts", Some(2)));
@@ -917,7 +918,7 @@ mod tests {
 
     #[test]
     fn a_replayed_trace_needs_a_duration_or_the_mode_that_asked_for_it() {
-        let mut collapsed = transcript(60);
+        let mut collapsed = transcript(60).with_thinking(ThinkingMode::Collapsed);
         assert!(
             collapsed.replayed_thinking("a private musing", None).is_empty(),
             "no duration survives a persisted transcript, so there is no line to draw"

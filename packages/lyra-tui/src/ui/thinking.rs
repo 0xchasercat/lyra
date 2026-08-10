@@ -25,14 +25,15 @@
 //!
 //! ```toml
 //! [tui]
-//! thinking = "collapsed"   # default: dim while it streams, one line after
-//! # thinking = "full"      # commit the trace itself, dim, for model debugging
+//! thinking = "full"        # default: the trace streams dim and stays, dim
+//! # thinking = "collapsed" # dim while it streams, one `∴ thought for 23s` line after
 //! # thinking = "off"       # render none of it, live or committed
 //! ```
 //!
-//! Someone reading a model's output and someone debugging a model's *reasoning*
-//! want opposite things from the same bytes, and no default serves both. The
-//! default serves the reader; `full` serves the builder and is the reason this
+//! The default is `full`: thinking is where a model goes down the wrong path,
+//! and a trace that vanishes into a one-liner the moment it ends cannot be
+//! reviewed — transparency is the point (§13). `collapsed` serves whoever
+//! prefers dense scrollback over reviewable reasoning, and is the reason this
 //! is a setting rather than a rule.
 //!
 //! # What is never rendered
@@ -73,12 +74,19 @@ pub const LIVE_ROWS: usize = 5;
 pub const LIVE_CHARS: usize = 4_000;
 
 /// What the TUI does with thinking traces.
+///
+/// `Full` is the default (owner decision, 2026-08-11): thinking is where a
+/// model goes down the wrong path, and §13's "everything is inspectable"
+/// applies to it exactly as much as to the answer — a trace that collapses to
+/// one line the moment it ends cannot be reviewed. The trace commits dim, so
+/// scrollback density survives; `collapsed` remains for those who want the
+/// one-liner, `off` for none at all.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ThinkingMode {
     /// Dim in the live region while it streams; one dim line once it ends.
-    #[default]
     Collapsed,
     /// As `collapsed`, and the trace itself commits to scrollback, dim.
+    #[default]
     Full,
     /// Nothing, on any surface.
     Off,
@@ -245,8 +253,9 @@ mod tests {
     }
 
     #[test]
-    fn the_default_is_collapsed_and_the_names_all_parse() {
-        assert_eq!(ThinkingMode::default(), ThinkingMode::Collapsed);
+    fn the_default_is_full_and_the_names_all_parse() {
+        // Owner decision 2026-08-11: reviewable reasoning beats dense scrollback.
+        assert_eq!(ThinkingMode::default(), ThinkingMode::Full);
         for name in ThinkingMode::NAMES {
             assert!(ThinkingMode::from_value(name).is_some(), "{name}");
         }
@@ -257,8 +266,8 @@ mod tests {
     #[test]
     fn the_config_is_read_from_the_tui_table_and_never_costs_a_session() {
         assert_eq!(
-            ThinkingMode::from_document("[tui]\nthinking = \"full\"\n"),
-            ThinkingMode::Full
+            ThinkingMode::from_document("[tui]\nthinking = \"collapsed\"\n"),
+            ThinkingMode::Collapsed
         );
         assert_eq!(
             ThinkingMode::from_document("thinking = \"off\"\n"),
@@ -273,7 +282,7 @@ mod tests {
         ] {
             assert_eq!(
                 ThinkingMode::from_document(source),
-                ThinkingMode::Collapsed,
+                ThinkingMode::Full,
                 "{source:?}"
             );
         }

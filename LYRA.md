@@ -1776,7 +1776,8 @@ archive_after = "7d"   # retention for child agent workspaces, and for /cleanup
 [tui]
 theme    = "default"
 accent   = "#7aa2f7"
-thinking = "collapsed"   # reasoning traces: dim while live, `∴ thought for 23s` after.
+thinking = "full"        # reasoning traces stream dim and stay dim in scrollback;
+                         # "collapsed" leaves one `∴ thought for 23s` line, "off" hides them.
                          # "full" commits the trace itself; "off" renders none of it.
 
 [reliability]

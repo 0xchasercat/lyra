@@ -718,8 +718,13 @@ fn a_thinking_delta_never_reaches_the_markdown_stream_or_the_answer_text() {
     // The routing bug this guards: `Delta` dispatched on the *field*, so a
     // thinking chunk that fell through to `assistant_delta` would be parsed as
     // markdown, published at its line boundaries, and committed to scrollback as
-    // the model's reply — with the reasoning inside the answer.
-    let (mut app, mut daemon, (tx, rx)) = (app(), ScriptedDaemon::default(), wire());
+    // the model's reply — with the reasoning inside the answer. Collapsed mode
+    // is the sharpest lens: any trace text in scrollback at all is the bug.
+    let (mut app, mut daemon, (tx, rx)) = (
+        app().with_thinking(ThinkingMode::Collapsed),
+        ScriptedDaemon::default(),
+        wire(),
+    );
     let start = Instant::now();
     press_at(&mut app, &mut daemon, &rx, b"think about it\r", start);
     // The user band is already in scrollback; what follows is about the thought.
@@ -760,7 +765,11 @@ fn a_thinking_delta_never_reaches_the_markdown_stream_or_the_answer_text() {
 
 #[test]
 fn a_thinking_part_ending_collapses_to_one_dim_line_with_its_duration() {
-    let (mut app, mut daemon, (tx, rx)) = (app(), ScriptedDaemon::default(), wire());
+    let (mut app, mut daemon, (tx, rx)) = (
+        app().with_thinking(ThinkingMode::Collapsed),
+        ScriptedDaemon::default(),
+        wire(),
+    );
     let start = Instant::now();
     press_at(&mut app, &mut daemon, &rx, b"think about it\r", start);
     let _ = scrollback(&mut app);
@@ -3254,7 +3263,14 @@ fn at(text: &str, needle: &str) -> usize {
 
 #[test]
 fn loading_a_session_renders_its_history_through_a_snapshot_it_asks_for_itself() {
-    let (mut app, mut daemon, (tx, rx)) = (app(), ScriptedDaemon::default(), wire());
+    // Collapsed mode so the thinking entry stays out of the way: this test is
+    // about the load→snapshot→history plumbing; the thinking mode matrix is
+    // `a_resumed_session_replays_thinking_under_the_same_rule_the_live_path_used`.
+    let (mut app, mut daemon, (tx, rx)) = (
+        app().with_thinking(ThinkingMode::Collapsed),
+        ScriptedDaemon::default(),
+        wire(),
+    );
     press(&mut app, &mut daemon, &rx, b"/sessions\r");
     assert_eq!(daemon.sent, vec![Call::Sessions], "{:?}", daemon.methods());
     daemon.answers.push(Reply {
@@ -3301,9 +3317,9 @@ fn loading_a_session_renders_its_history_through_a_snapshot_it_asks_for_itself()
         at(&committed, "compacted") < at(&committed, "resumed · purple-falcon · 3 messages"),
         "{committed}"
     );
-    // Thinking never reaches scrollback live, so a replay must not put it there
-    // either; running totals belong to the footer; an unknown entry type is a
-    // newer daemon talking, and says nothing.
+    // Collapsed mode was asked for above, so the trace stays out of replay too;
+    // running totals belong to the footer; an unknown entry type is a newer
+    // daemon talking, and says nothing.
     assert!(!committed.contains("private musing"), "{committed}");
     assert!(!committed.contains("telemetry"), "{committed}");
     assert!(!committed.contains("inputTokens"), "{committed}");
