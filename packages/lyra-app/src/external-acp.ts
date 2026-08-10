@@ -12,7 +12,7 @@ export async function runExternalAcpAgent(command: string, request: SpawnRequest
     if (method === "session/update") {
       const text = updateText(params);
       if (text !== undefined) chunks.push(text);
-      await bus.send({ from: context.id, to: context.parentId ?? mainPeer, data: params });
+      await bus.send({ from: context.peer, to: context.parentId ?? mainPeer, data: params });
     }
   });
   const abort = (): void => { void client.close(context.signal.reason); };
@@ -37,7 +37,7 @@ export async function runExternalAcpAgent(command: string, request: SpawnRequest
 
 async function bridgeInbox(client: ExternalAcpClient, bus: IrcBus, context: SpawnExecutorContext): Promise<void> {
   while (!context.signal.aborted && !client.closed) {
-    const messages = await bus.wait({ peer: context.id, timeoutMs: 100, signal: context.signal }).catch(() => []);
+    const messages = await bus.wait({ peer: context.peer, timeoutMs: 100, signal: context.signal }).catch(() => []);
     for (const message of messages) await client.notify("session/update", { message });
   }
 }

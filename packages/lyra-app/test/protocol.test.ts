@@ -3,8 +3,8 @@ import { ProtocolValidator, type SessionUpdate } from "@lyra/acp";
 import { describe, expect, test } from "bun:test";
 import { mkdir, mkdtemp, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
-import { LyraRuntime, SLASH_COMMAND_CATALOG } from "../src/index.ts";
+import { dirname, join, resolve } from "node:path";
+import { LyraRuntime, SLASH_COMMAND_CATALOG, SLASH_COMMANDS } from "../src/index.ts";
 import type { MessageEntry, TranscriptEntry } from "@lyra/session";
 
 const validator = new ProtocolValidator();
@@ -329,16 +329,27 @@ async function seed(root: string, files: Readonly<Record<string, string>>): Prom
   }
 }
 
-/** Issues ACP requests against a live daemon and returns each result. */
+/**
+ * Issues ACP requests against a live daemon and returns each result.
+ *
+ * Polls for the reply rather than sleeping a fixed interval: several of these commands do
+ * real work on disk — opening a workspace manager, walking a checkpoint history — and a
+ * fixed sleep turns a slow machine into a failing assertion about the wrong thing.
+ */
 function caller(runtime: LyraRuntime, writer: Writer): (method: string, params?: unknown) => Promise<unknown> {
   let id = 100;
   return async (method, params) => {
     const current = (id += 1);
     await runtime.app.acp.handleLine(JSON.stringify({ jsonrpc: "2.0", id: current, method, ...(params === undefined ? {} : { params }) }));
-    await new Promise((resolve) => setTimeout(resolve, 10));
-    const message = writer.messages().find((entry) => entry.id === current);
-    if (message?.error !== undefined) throw new Error(JSON.stringify(message.error));
-    return message?.result;
+    const deadline = Date.now() + 20_000;
+    let message = writer.messages().find((entry) => entry.id === current);
+    while (message === undefined && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      message = writer.messages().find((entry) => entry.id === current);
+    }
+    if (message === undefined) throw new Error(`ACP request ${method} produced no reply within 20s.`);
+    if (message.error !== undefined) throw new Error(JSON.stringify(message.error));
+    return message.result;
   };
 }
 
@@ -350,6 +361,10 @@ describe("slash command surface", () => {
     try {
       await runtime.app.acp.handleLine(JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize" }), writer);
       const call = caller(runtime, writer);
+
+      // One real turn first: the rewind assertions below are about what a turn leaves
+      // behind, and a daemon that has never run one honestly has nothing to list.
+      await call("session/prompt", { prompt: "say hello" });
 
       const listing = await call("session/commands") as { commands: Array<{ name: string; resultKind: string; usage?: string }> };
       validator.assert(listing, "#/$defs/requests/session~1commands/result", "session/commands result");
@@ -374,11 +389,57 @@ describe("slash command surface", () => {
         validator.assert(result.output, `#/$defs/${kind}Result`, `${command} output`);
       }
 
-      // A free-form command reports one printable line and keeps its payload beside it.
-      const gitmode = await call("session/command", { command: "/gitmode stage" }) as { resultKind: string; output: unknown };
-      expect(gitmode.resultKind).toBe("report");
-      validator.assert(gitmode.output, "#/$defs/reportResult", "/gitmode output");
-      expect((gitmode.output as { report: string }).report).toContain("stage");
+      // The rewind surface names its own shapes: a checkpoint listing and a per-file diff
+      // are structure, so they are declared kinds rather than prose with a payload stapled
+      // to it, and a client dispatches to a renderer without sniffing `detail`.
+      const checkpoints = await call("session/command", { command: "/checkpoints" }) as { resultKind: string; output: unknown };
+      expect(checkpoints.resultKind).toBe("checkpoints");
+      validator.assert(checkpoints.output, "#/$defs/checkpointsResult", "/checkpoints output");
+      const listed = (checkpoints.output as { checkpoints: Array<{ id: string; kind: string }> }).checkpoints;
+      // The turn that just ran left its boundary checkpoints behind.
+      expect(listed.length).toBeGreaterThan(0);
+      for (const record of listed) validator.assert(record, "#/$defs/checkpoint", "checkpoint record");
+
+      const review = await call("session/command", { command: "/review" }) as { resultKind: string; output: unknown };
+      expect(review.resultKind).toBe("review");
+      validator.assert(review.output, "#/$defs/reviewResult", "/review output");
+      validator.assert((review.output as { diff: unknown }).diff, "#/$defs/checkpointDiffResult", "/review diff");
+
+      // Moving the head back is its own method, and the only one that reports itself as a
+      // rewind: nothing is deleted, so the entry it lands on is echoed and what stopped
+      // being an ancestor of the head is counted.
+      const anchored = listed.find((record) => (record as { entryId?: string }).entryId !== undefined) as { id: string; entryId: string } | undefined;
+      expect(anchored).toBeDefined();
+      const before = await call("session/snapshot") as { entries: unknown[] };
+      // With no entryId the daemon picks the newest anchored checkpoint itself — never the
+      // entry the head is already on, because landing where you already are is not a rewind.
+      const defaulted = await call("session/rewind") as { descriptor: { headId: string }; entryId: string };
+      validator.assert(defaulted, "#/$defs/requests/session~1rewind/result", "session/rewind default");
+      expect(defaulted.descriptor.headId).toBe(defaulted.entryId);
+
+      const rewound = await call("session/rewind", { entryId: anchored!.entryId }) as { descriptor: { headId: string }; entryId: string; removedMessages?: number };
+      validator.assert(rewound, "#/$defs/requests/session~1rewind/result", "session/rewind result");
+      expect(rewound.entryId).toBe(anchored!.entryId);
+      expect(rewound.descriptor.headId).toBe(anchored!.entryId);
+      // Nothing is deleted: the transcript is a DAG on disk, so the entries stay in the
+      // file and only the head moved. That is what makes the rewind itself reversible.
+      const after = await call("session/snapshot") as { entries: unknown[] };
+      expect(after.entries.length).toBe(before.entries.length);
+
+      // Rewinding is the same mechanism, reported as a sentence plus the structure.
+      const rolled = await call("session/command", { command: `/rollback ${listed.at(-1)!.id}` }) as { resultKind: string; output: unknown; error?: string };
+      expect(rolled.error).toBeUndefined();
+      validator.assert(rolled.output, "#/$defs/reportResult", "/rollback output");
+      validator.assert((rolled.output as { detail: unknown }).detail, "#/$defs/checkpointRestoreResult", "/rollback detail");
+
+      // The three rewind methods answer in their declared shapes over the wire too.
+      validator.assert(await call("checkpoint/list", { limit: 5 }), "#/$defs/requests/checkpoint~1list/result", "checkpoint/list result");
+      validator.assert(await call("checkpoint/diff", { patches: true }), "#/$defs/requests/checkpoint~1diff/result", "checkpoint/diff result");
+      validator.assert(await call("checkpoint/restore", { checkpoint: listed[0]!.id }), "#/$defs/requests/checkpoint~1restore/result", "checkpoint/restore result");
+
+      // /gitmode is gone with the modes it set; an unlisted name is not routed.
+      const retired = await call("session/command", { command: "/gitmode auto" }) as { error?: string };
+      expect(retired.error).toContain("Unknown command /gitmode");
 
       // Selecting a model answers with the same shape listing does, so a client renders
       // one view instead of branching on the arguments it happened to send.
@@ -401,7 +462,7 @@ describe("workspace file completion", () => {
     const root = await fixture();
     const runtime = await LyraRuntime.create({ origin: root, session: "completion", environment: environment(scripted([textRound("hello")])), home: join(root, "home") });
     const writer = new Writer();
-    const workspace = runtime.app.workspace.path;
+    const workspace = runtime.app.cwd;
     const sessionId = runtime.session.descriptor.sessionId;
     try {
       await runtime.app.acp.handleLine(JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize" }), writer);
@@ -558,4 +619,27 @@ describe("session listing previews", () => {
       expect(huge.updatedAtMs).toBeGreaterThan(0);
     } finally { await runtime.close(); await rm(root, { recursive: true, force: true }); }
   }, 30_000);
+});
+
+/**
+ * The Rust TUI ships a hard-coded copy of the command names so `/` works on the first
+ * keystroke of a session, before `session/commands` has answered — and on a daemon that
+ * never declares a registry at all. It is a *fallback*, replaced the moment the real
+ * registry lands, so a stale entry costs only a missing description; but it went stale
+ * once already (it still offered `/gitmode` a release after the modes it set were
+ * deleted, and offered nothing for the rewind surface that had replaced them), and a
+ * fallback that offers a command the daemon will refuse is worse than no fallback.
+ *
+ * This is the tripwire. It reads the constant out of the Rust source rather than
+ * restating it, because a restatement is a third copy with its own drift.
+ */
+describe("the client's pre-hydration command list", () => {
+  test("names exactly the commands this daemon routes", async () => {
+    const source = await Bun.file(resolve(import.meta.dir, "..", "..", "lyra-tui", "src", "app.rs")).text();
+    const block = /pub const SLASH_COMMANDS: \[&str; (\d+)\] = \[([^\]]*)\];/.exec(source);
+    expect(block).not.toBeNull();
+    const names = [...block![2]!.matchAll(/"([^"]+)"/g)].map((match) => match[1]!);
+    expect(names.length).toBe(Number(block![1]));
+    expect([...names].sort()).toEqual([...SLASH_COMMANDS].sort());
+  });
 });

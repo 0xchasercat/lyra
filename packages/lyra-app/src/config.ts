@@ -5,12 +5,35 @@ import { join, resolve } from "node:path";
 export interface LyraConfig {
   roles: { default?: string; fast?: string; merge?: string };
   exec: { heavy: number; io: number; cgroup: boolean };
-  git: { mode: "observe" | "stage" | "auto"; gui: string };
-  workspace: { enabled: boolean; archive_after: string };
+  git: { gui: string };
+  /** Retention for the agent workspaces isolated children run in; `/cleanup` reads it. */
+  workspace: { archive_after: string };
   tui: { theme: "graphite" | "paper" | "forest"; accent: string };
   reliability: { stream_stall_timeout: string; turn_timeout: string; max_retries: number; compact_at: number };
+  /**
+   * Settings that were read, accepted, and no longer do anything, one sentence each.
+   *
+   * Retired keys are not errors. `workspace.enabled = false` in particular is what the
+   * benchmark harness writes, and a config that suddenly refuses to parse would break every
+   * such caller to make a point about tidiness. They are surfaced once at boot instead.
+   */
+  deprecations: string[];
 }
-const DEFAULT_VALUES: LyraConfig = { roles: {}, exec: { heavy: Math.min(navigator.hardwareConcurrency || 1, 8), io: 4, cgroup: false }, git: { mode: "observe", gui: "auto" }, workspace: { enabled: true, archive_after: "7d" }, tui: { theme: "graphite", accent: "#7aa2f7" }, reliability: { stream_stall_timeout: "45s", turn_timeout: "30m", max_retries: 8, compact_at: 0.8 } };
+const DEFAULT_VALUES: LyraConfig = { roles: {}, exec: { heavy: Math.min(navigator.hardwareConcurrency || 1, 8), io: 4, cgroup: false }, git: { gui: "auto" }, workspace: { archive_after: "7d" }, tui: { theme: "graphite", accent: "#7aa2f7" }, reliability: { stream_stall_timeout: "45s", turn_timeout: "30m", max_retries: 8, compact_at: 0.8 }, deprecations: [] };
+
+/**
+ * Keys that were removed by the workspace/git redesign, and what to say about each.
+ *
+ * `workspace.enabled` toggled whether the *main* session ran in a copy-on-write clone.
+ * There is no clone any more — the main session runs in the launch directory, always — so
+ * the flag has nothing left to switch, and `false` (what the harness sets) is now simply
+ * what Lyra does. `git.mode` selected between observe/stage/auto; integration is the
+ * model's job through ordinary tool calls now, so there is no mode to be in.
+ */
+const RETIRED_KEYS: Readonly<Record<string, string>> = Object.freeze({
+  "workspace.enabled": "workspace.enabled no longer does anything: the main session always runs in the launch directory, and reversibility comes from checkpoints (/rollback). Remove the key when convenient.",
+  "git.mode": "git.mode no longer does anything: observe/stage/auto are gone, and integrating an agent workspace is now something the model does with the git tool. Remove the key when convenient.",
+});
 export const DEFAULT_CONFIG: LyraConfig = Object.freeze(DEFAULT_VALUES);
 export async function loadConfig(workspace: string, home = homedir()): Promise<LyraConfig> {
   let output = structuredClone(DEFAULT_CONFIG);
@@ -45,9 +68,7 @@ function applyConfig(config: LyraConfig, values: Map<string, unknown>, path: str
       case "exec.heavy": requireInteger(key, value, path, 1); if (value > 8) throw new Error(`${key} in ${path} must not exceed 8.`); output.exec.heavy = value; break;
       case "exec.io": requireInteger(key, value, path, 1); output.exec.io = value; break;
       case "exec.cgroup": requireBoolean(key, value, path); output.exec.cgroup = value; break;
-      case "git.mode": if (value !== "observe" && value !== "stage" && value !== "auto") throw new Error(`${key} in ${path} must be observe, stage, or auto.`); output.git.mode = value; break;
       case "git.gui": requireString(key, value, path); output.git.gui = value; break;
-      case "workspace.enabled": requireBoolean(key, value, path); output.workspace.enabled = value; break;
       case "workspace.archive_after": requireDuration(key, value, path); output.workspace.archive_after = value; break;
       case "tui.theme": if (value !== "graphite" && value !== "paper" && value !== "forest") throw new Error(`${key} in ${path} must be graphite, paper, or forest.`); output.tui.theme = value; break;
       case "tui.accent": requireString(key, value, path); if (!/^#[0-9a-f]{6}$/i.test(value)) throw new Error(`${key} in ${path} must be a six-digit hex color.`); output.tui.accent = value; break;
@@ -55,7 +76,13 @@ function applyConfig(config: LyraConfig, values: Map<string, unknown>, path: str
       case "reliability.turn_timeout": requireDuration(key, value, path); output.reliability.turn_timeout = value; break;
       case "reliability.max_retries": requireInteger(key, value, path, 1); output.reliability.max_retries = value; break;
       case "reliability.compact_at": if (typeof value !== "number" || value <= 0 || value >= 1) throw new Error(`${key} in ${path} must be between 0 and 1.`); output.reliability.compact_at = value; break;
-      default: throw new Error(`Unknown Lyra config key ${key} in ${path}; remove the typo or use a documented setting.`);
+      default: {
+        const retired = RETIRED_KEYS[key];
+        if (retired === undefined) throw new Error(`Unknown Lyra config key ${key} in ${path}; remove the typo or use a documented setting.`);
+        const notice = `${path}: ${retired}`;
+        if (!output.deprecations.includes(notice)) output.deprecations.push(notice);
+        break;
+      }
     }
   }
   return output;

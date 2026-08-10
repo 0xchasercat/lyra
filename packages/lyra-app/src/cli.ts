@@ -23,7 +23,7 @@ import { LyraRuntime } from "./runtime.ts";
  * removed. Every picker and wizard is now an ACP flow inside the TUI.
  */
 
-interface CliOptions { origin: string; session?: string; model?: string; prompt?: string; acp: boolean; help: boolean; allowAutoGit: boolean; }
+interface CliOptions { origin: string; session?: string; model?: string; prompt?: string; acp: boolean; help: boolean; }
 
 /** The live runtime a signal must close. */
 let shutdownTarget: { close(): Promise<void> } | undefined;
@@ -59,7 +59,7 @@ async function main(): Promise<void> {
   const options = parseArgs(argv);
   if (options.help) { process.stdout.write(helpText()); return; }
   installShutdownHandlers();
-  const runtimeOptions = { ...options, confirmAuto: async () => options.allowAutoGit };
+  const runtimeOptions = options;
   if (options.acp) {
     const runtime = await LyraRuntime.create(runtimeOptions);
     shutdownTarget = runtime;
@@ -97,7 +97,7 @@ async function main(): Promise<void> {
  * ends `serve()` and closes the daemon; the daemon ending closes the child's
  * stdin, which the TUI sees as EOF and treats as a clean disconnect.
  */
-async function runInteractive(cli: CliOptions & { confirmAuto(): Promise<boolean> }): Promise<void> {
+async function runInteractive(cli: CliOptions): Promise<void> {
   const binary = await resolveTuiBinary();
   const child = Bun.spawn([binary], { cwd: process.cwd(), stdin: "pipe", stdout: "pipe", stderr: "inherit" });
   let runtime: LyraRuntime;
@@ -155,17 +155,23 @@ async function resolveTuiBinary(): Promise<string> {
   );
 }
 
-function parseArgs(args: string[]): CliOptions { const parsed: CliOptions = { origin: process.cwd(), acp: false, help: false, allowAutoGit: false }; for (let index = 0; index < args.length; index += 1) { const arg = args[index]!; if (arg === "--help" || arg === "-h") parsed.help = true; else if (arg === "--acp") parsed.acp = true; else if (arg === "--yes-auto-git") parsed.allowAutoGit = true; else if (arg === "--origin" || arg === "--session" || arg === "--model" || arg === "--prompt") { const value = args[++index]; if (!value) throw new Error(`${arg} requires a value.`); if (arg === "--origin") parsed.origin = resolve(value); else if (arg === "--session") parsed.session = value; else if (arg === "--model") parsed.model = value; else parsed.prompt = value; } else throw new Error(`Unknown argument ${arg}. Use --help.`); } return parsed; }
+function parseArgs(args: string[]): CliOptions { const parsed: CliOptions = { origin: process.cwd(), acp: false, help: false }; for (let index = 0; index < args.length; index += 1) { const arg = args[index]!; if (arg === "--help" || arg === "-h") parsed.help = true; else if (arg === "--acp") parsed.acp = true; else if (arg === "--yes-auto-git") throw new Error("--yes-auto-git is gone: there is no auto Git mode to consent to. Lyra runs in the launch directory and every state-changing tool call is checkpointed, so /rollback is the undo. Integrating an agent workspace is something you ask the model to do."); else if (arg === "--origin" || arg === "--session" || arg === "--model" || arg === "--prompt") { const value = args[++index]; if (!value) throw new Error(`${arg} requires a value.`); if (arg === "--origin") parsed.origin = resolve(value); else if (arg === "--session") parsed.session = value; else if (arg === "--model") parsed.model = value; else parsed.prompt = value; } else throw new Error(`Unknown argument ${arg}. Use --help.`); } return parsed; }
 function assistantText(result: AgentTurnResult): string { return result.assistant.content.flatMap((block) => block.type === "text" ? [block.text] : []).join(""); }
 async function exists(path: string): Promise<boolean> { try { await access(path); return true; } catch { return false; } }
 async function firstAccessible(paths: readonly string[]): Promise<string | undefined> { for (const path of paths) { if (await exists(path)) return path; } return undefined; }
 function helpText(): string { return `Lyra — autonomous coding agent
 
-Usage: lyra [--origin PATH] [--session NAME] [--model PROVIDER/MODEL] [--prompt TEXT] [--acp] [--yes-auto-git]
+Usage: lyra [--origin PATH] [--session NAME] [--model PROVIDER/MODEL] [--prompt TEXT] [--acp]
        lyra plugins <install|list|update|remove|login> …
 
 Interactive launch starts the Lyra TUI and connects it to the agent daemon over a
 private pipe. Configure a provider first (Lyra prints instructions if none exists).
+
+Lyra works in the directory you launch it from — no clone, no copy, the paths you see are
+the real ones. Every state-changing tool call is checkpointed into .lyra/checkpoints (a
+shadow repository that never touches your own .git), so /checkpoints lists them and
+/rollback puts the tree back. A rollback never reverts a file you changed yourself unless
+you pass --force.
 
 Interactive controls:
   Enter       send, or queue a follow-up while a turn is streaming

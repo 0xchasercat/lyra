@@ -41,6 +41,9 @@ const TIER_ANY = 5;
 
 function slash(value: string): string { return value.split(sep).join("/"); }
 
+/** Lyra's own state directory, never a completion candidate. */
+const LYRA_STATE_DIRECTORY = ".lyra";
+
 /**
  * The file list for one workspace, cached and invalidated by directory mtimes.
  *
@@ -93,7 +96,11 @@ export class WorkspaceFileIndex {
   }
 
   async #build(): Promise<void> {
-    const paths = await globPaths("**/*", this.root, this.root);
+    const walked = await globPaths("**/*", this.root, this.root);
+    // The session now runs in the launch directory, so Lyra's own state sits inside the
+    // tree being completed. `.git/info/exclude` hides it from a repository, but a plain
+    // directory has no such thing, and nobody has ever wanted to @-mention a transcript.
+    const paths = walked.filter((path) => !slash(relative(this.root, path)).startsWith(`${LYRA_STATE_DIRECTORY}/`));
     const files = await Promise.all(paths.map(async (path): Promise<IndexedFile> => {
       const relativePath = slash(relative(this.root, path));
       const mtimeMs = await stat(path).then((info) => info.mtimeMs, () => 0);

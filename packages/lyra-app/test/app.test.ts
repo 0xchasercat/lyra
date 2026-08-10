@@ -39,13 +39,21 @@ describe("Lyra application composition", () => {
 
   test("slash router exposes only the documented compact command surface", async () => {
     const calls: string[] = []; const hit = async (name: string) => { calls.push(name); return name; };
-    const services: SlashServices = { copy: () => hit("copy"), dump: () => hit("dump"), settings: () => hit("settings"), provider: () => hit("provider"), model: () => hit("model"), loop: (spec) => hit(`loop:${spec}`), context: () => hit("context"), compact: (clear) => hit(clear ? "clear" : "compact"), agents: (op) => hit(`agents:${op}`), workspaces: (op) => hit(`workspaces:${op}`), git: (op, value) => hit(`git:${op}:${value ?? ""}`), skills: () => hit("skills"), mcp: () => hit("mcp"), install: (tool) => hit(`install:${tool}`), sessions: (op) => hit(`sessions:${op}`), health: () => hit("health") };
+    const services: SlashServices = { copy: () => hit("copy"), dump: () => hit("dump"), settings: () => hit("settings"), provider: () => hit("provider"), model: () => hit("model"), loop: (spec) => hit(`loop:${spec}`), context: () => hit("context"), compact: (clear) => hit(clear ? "clear" : "compact"), agents: (op) => hit(`agents:${op}`), workspaces: (op) => hit(`workspaces:${op}`), checkpoints: () => hit("checkpoints"), review: (from) => hit(`review:${from ?? ""}`), rollback: (checkpoint, force) => hit(`rollback:${checkpoint ?? ""}:${force}`), apply: (preview) => hit(`apply:${preview ?? ""}`), skills: () => hit("skills"), mcp: () => hit("mcp"), install: (tool) => hit(`install:${tool}`), sessions: (op) => hit(`sessions:${op}`), health: () => hit("health") };
     const router = new SlashCommandRouter(services);
     expect((await router.execute('/loop until "tests pass"')).output).toBe("loop:until tests pass");
-    expect((await router.execute("/gitmode auto")).output).toBe("git:mode:auto");
+    // Rewinding is opt-in destructive: the bare form never reverts foreign edits, and the
+    // checkpoint id is positional so a flag can never be mistaken for one.
+    expect((await router.execute("/rollback cp-4-ab")).output).toBe("rollback:cp-4-ab:false");
+    expect((await router.execute("/rollback cp-4-ab --force")).output).toBe("rollback:cp-4-ab:true");
+    expect((await router.execute("/rollback")).output).toBe("rollback::false");
+    // /gitmode died with the observe/stage/auto modes it set.
+    expect((await router.execute("/gitmode auto")).error).toContain("Unknown command");
     expect((await router.execute("/todo")).error).toContain("Unknown command");
     expect(new Set<string>(SLASH_COMMANDS).has("todo")).toBe(false);
-    expect(calls).toEqual(["loop:until tests pass", "git:mode:auto"]);
+    expect(new Set<string>(SLASH_COMMANDS).has("gitmode")).toBe(false);
+    expect(new Set<string>(SLASH_COMMANDS).has("checkpoints")).toBe(true);
+    expect(calls).toEqual(["loop:until tests pass", "rollback:cp-4-ab:false", "rollback:cp-4-ab:true", "rollback::false"]);
   });
 
   test("boots zero-config infrastructure with all thirteen stable tools", async () => {
@@ -55,7 +63,10 @@ describe("Lyra application composition", () => {
       const app = await LyraApplication.boot({ origin: root, session: "main-agent", spawnExecutor: async (request) => `done:${request.task}`, sessions: sessionServices(), home: join(root, "home") });
       try {
         expect(app.tools.definitions().map((definition) => definition.name)).toEqual(["read", "write", "edit", "bash", "grep", "glob", "lsp", "spawn", "hub", "skill", "jit", "mcp", "git"]);
-        expect(app.workspace.path).toContain(join(".lyra", "workspaces", "main-agent"));
+        // The main session runs where it was launched: no clone, and the path the model
+        // sees is the path the user typed.
+        expect(app.cwd).toBe(app.origin);
+        expect(app.checkpoints.available).toBe(true);
         expect((await app.commands.execute("/health")).error).toBeUndefined();
         expect(app.skills.list().map((skill) => skill.name)).toContain("adversarial-review");
       } finally { await app.close(); }
@@ -72,23 +83,37 @@ describe("Lyra application composition", () => {
     try {
       expect((await runtime.prompt("prove assembly")).assistant.content).toEqual([{ type: "text", text: "assembled" }]);
       expect(runtime.session.entries().filter((entry) => entry.type === "message")).toHaveLength(2);
-      const spawned = await runtime.app.tools.execute("spawn", { task: "child proof", blocking: true, model: "@fast" }, { signal: new AbortController().signal, sessionId: "runtime-test", workspace: runtime.app.workspace.path, callId: "spawn-proof" });
+      // Isolation is the model's decision, and the default is to share: a plain child runs
+      // in the parent's own directory and creates no workspace at all.
+      const shared = await runtime.app.tools.execute("spawn", { task: "help here", blocking: true, model: "@fast" }, { signal: new AbortController().signal, sessionId: "runtime-test", workspace: runtime.app.cwd, callId: "spawn-shared" });
+      expect(shared.isError).not.toBe(true);
+      expect(JSON.parse(shared.content.toString()) as { workspace: string }).toMatchObject({ workspace: runtime.app.cwd });
+      expect(await runtime.app.workspaces.list()).toHaveLength(0);
+      expect(seenModels).toContain("fast-model");
+
+      // Asking for isolation is what makes a clone, and a finished isolated child hands the
+      // parent the path and the commands that integrate it.
+      const spawned = await runtime.app.tools.execute("spawn", { task: "child proof", blocking: true, isolated: true }, { signal: new AbortController().signal, sessionId: "runtime-test", workspace: runtime.app.cwd, callId: "spawn-proof" });
       expect(spawned.isError).not.toBe(true);
       expect(spawned.content.toString()).toContain("assembled");
-      expect(seenModels).toContain("fast-model");
-      const scoped = await runtime.app.tools.execute("spawn", { task: "inspect outside the default apply root", blocking: true, workspace: runtime.app.workspace.path, tools: ["read", "glob"] }, { signal: new AbortController().signal, sessionId: "runtime-test", workspace: runtime.app.workspace.path, callId: "spawn-scoped" });
+      const integration = (JSON.parse(spawned.content.toString()) as { integration: { path: string; hint: string[] } }).integration;
+      expect(integration.path).toContain(join(".lyra", "workspaces"));
+      expect(integration.hint[0]).toContain("git fetch");
+      const scoped = await runtime.app.tools.execute("spawn", { task: "inspect outside the default apply root", blocking: true, workspace: runtime.app.cwd, tools: ["read", "glob"] }, { signal: new AbortController().signal, sessionId: "runtime-test", workspace: runtime.app.cwd, callId: "spawn-scoped" });
       expect(scoped.isError).not.toBe(true);
       expect(scoped.content.toString()).toContain("assembled");
-      const childWorkspace = (await runtime.app.workspaces.list()).find((workspace) => workspace.name !== runtime.app.workspace.name && workspace.state === "archived");
+      const childWorkspace = (await runtime.app.workspaces.list()).find((workspace) => workspace.state === "archived");
       expect(childWorkspace?.task).toBe("child proof");
-      // /review has no declared result shape, so it answers with the free-form report
-      // shape: one printable line, with the preview it computed intact beside it.
-      const review = await runtime.command("/review") as { error?: string; resultKind?: string; output?: { report?: string; detail?: { path?: string; workspaces?: unknown[] } } };
+      // /review is the diff surface now: what changed since a checkpoint, plus every agent
+      // workspace still holding work — with the exact commands that integrate each one.
+      const review = await runtime.command("/review") as { error?: string; resultKind?: string; output?: { diff?: { available?: boolean }; agents?: Array<{ name: string; integration: { hint: string[] } }> } };
       expect(review.error).toBeUndefined();
-      expect(review.resultKind).toBe("report");
-      expect(review.output?.report).toContain("merge preview");
-      expect(review.output?.detail?.path).toContain(join(".lyra", "previews"));
-      expect(review.output?.detail?.workspaces).toHaveLength(1);
+      // A declared kind, not a report: the diff has structure, so it names it.
+      expect(review.resultKind).toBe("review");
+      expect(review.output?.diff?.available).toBe(true);
+      const agents = review.output?.agents ?? [];
+      expect(agents).toHaveLength(1);
+      expect(agents[0]!.integration.hint[0]).toContain("git fetch");
       expect((await runtime.session.context() as { payload: { messages: unknown[] } }).payload.messages.length).toBeGreaterThan(0);
     } finally { await runtime.close(); await rm(root, { recursive: true, force: true }); }
   }, 30_000);
@@ -120,18 +145,29 @@ describe("Lyra application composition", () => {
   // Opening the workspace manager probes Git. With workspaces disabled nothing needs a
   // clone, so a plain directory has to boot and run; the Git requirement belongs to the
   // operation that actually wants isolation, where the error names something to fix.
-  test("runs in a plain directory when workspaces are disabled and defers the Git demand to isolation", async () => {
+  test("runs in a plain directory, still checkpoints, and defers the Git demand to isolation", async () => {
     const root = await mkdtemp(join(tmpdir(), "lyra-plain-"));
     await mkdir(join(root, ".lyra"), { recursive: true });
-    await writeFile(join(root, ".lyra", "config.toml"), "[workspace]\nenabled = false\n");
+    // The retired flag is accepted and reported, never fatal: the benchmark harness writes
+    // it, and a config that refused to parse would break every such caller to make a point.
+    await writeFile(join(root, ".lyra", "config.toml"), "[workspace]\nenabled = false\n[git]\nmode = 'observe'\n");
     const transport: ProviderTransport = { id: "fixture", apiType: "openai_completions", async *stream() { yield { type: "text_delta", text: "ran without git" }; yield { type: "complete", stopReason: "end_turn" }; } };
     const environment = { provider: new ReliableProvider(transport), providerName: "fixture", model: "fixture-model", config: { providers: { fixture: { base_url: "http://fixture.invalid/v1", api_type: "openai_completions" as const, auth: { type: "none" as const }, models: ["fixture-model"] } }, roles: { default: "fixture/fixture-model" } } };
-    const runtime = await LyraRuntime.create({ origin: root, session: "plain-dir", environment, home: join(root, "home") });
+    const reports: string[] = [];
+    const runtime = await LyraRuntime.create({ origin: root, session: "plain-dir", environment, home: join(root, "home"), onReport: (message) => { reports.push(message); } });
     try {
-      expect(runtime.app.workspace.path).toBe(runtime.app.origin);
+      expect(runtime.app.cwd).toBe(runtime.app.origin);
+      expect(runtime.app.config.deprecations).toHaveLength(2);
+      expect(reports.some((message) => message.includes("workspace.enabled no longer does anything"))).toBe(true);
+      expect(reports.some((message) => message.includes("git.mode no longer does anything"))).toBe(true);
       expect((await runtime.prompt("prove it boots")).assistant.content).toEqual([{ type: "text", text: "ran without git" }]);
       expect((await runtime.command("/health")).error).toBeUndefined();
-      const isolated = await runtime.app.tools.execute("spawn", { task: "needs its own clone", blocking: true, isolated: true }, { signal: new AbortController().signal, sessionId: "plain-dir", workspace: runtime.app.workspace.path, callId: "spawn-isolated" });
+      // Checkpoints do not need the surrounding directory to be a repository at all: the
+      // shadow repository is its own, which is why a plain directory is still undoable.
+      const checkpoints = await runtime.app.checkpoints.list();
+      expect(checkpoints.length).toBeGreaterThan(0);
+      expect(await Bun.file(join(root, ".git", "HEAD")).exists()).toBe(false);
+      const isolated = await runtime.app.tools.execute("spawn", { task: "needs its own clone", blocking: true, isolated: true }, { signal: new AbortController().signal, sessionId: "plain-dir", workspace: runtime.app.cwd, callId: "spawn-isolated" });
       expect(isolated.isError).toBe(true);
       expect(isolated.content.toString()).toContain("not a Git working repository");
     } finally { await runtime.close(); await rm(root, { recursive: true, force: true }); }

@@ -6,12 +6,16 @@ import {
   Compactor,
   LoopDetector,
   ProviderSummaryGenerator,
+  SPAWN_LIFECYCLE_CHANNEL,
+  SPAWN_TERMINAL_STATES,
   SteerQueue,
   buildSystemPrompt,
   deriveContext,
   inspectContext,
+  renderHubAside,
   type AgentEvent,
   type AgentTurnResult,
+  type SpawnLifecycleEvent,
 } from "@lyra/core";
 import {
   SessionUpdateEncoder,
@@ -25,7 +29,9 @@ import {
 import { LspManager } from "@lyra/lsp";
 import { discoverModels, loadProviderConfig, mergeModelLists, resolveModelRole, resolveProvider, type ModelInfo, type ProviderUsage } from "@lyra/provider";
 import { TranscriptStore, type MessageEntry, type TranscriptEntry } from "@lyra/session";
-import { LyraApplication, type SessionServices } from "./app.ts";
+import { CheckpointStore } from "@lyra/git";
+import { createCheckpointAccess, LyraApplication, type SessionServices } from "./app.ts";
+import { SessionCheckpointer } from "./checkpoints.ts";
 import { createAgentSpawnExecutor } from "./agent-executor.ts";
 import { assertProviderUsable, createConfiguredProvider, createEnvironmentProvider, createUnconfiguredEnvironment, describeProviderFailure, NO_PROVIDER_MESSAGE, type EnvironmentProvider } from "./provider.ts";
 import { createIntegratedToolRegistry } from "./integrated-tools.ts";
@@ -52,7 +58,6 @@ export interface LyraRuntimeOptions {
   environment?: EnvironmentProvider;
   home?: string;
   contextWindow?: number;
-  confirmAuto?: () => boolean | Promise<boolean>;
   onReport?: (message: string) => void | Promise<void>;
   onEvent?: (event: AgentEvent) => void | Promise<void>;
   onUpdate?: (update: SessionUpdate) => void;
@@ -116,14 +121,52 @@ export class LyraRuntime {
         if (currentEnvironment.unconfigured === undefined && resolved.startsWith(prefix)) return { provider: currentEnvironment.provider, model: resolved.slice(prefix.length) };
         return { ...createConfiguredProvider(currentEnvironment.config, { model: resolved, maxAttempts: runtimeConfig.reliability.max_retries, streamStallTimeoutMs: durationMs(runtimeConfig.reliability.stream_stall_timeout), turnTimeoutMs: durationMs(runtimeConfig.reliability.turn_timeout), ...(options.home === undefined ? {} : { home: options.home }) }), owned: true };
       },
-      tools: async (context) => {
-        if (!app) throw new Error("Lyra application tools are not initialized.");
-        const ownsLsp = context.workspace !== app.workspace.path && context.tools.includes("lsp");
-        const lsp = ownsLsp ? await LspManager.create({ workspace: context.workspace }) : app.lsp;
-        return createIntegratedToolRegistry({ lsp, ownLsp: ownsLsp, spawn: app.spawn, parent: { id: context.id, ...(context.parentId === undefined ? {} : { parentId: context.parentId }), depth: context.depth, workspace: context.workspace, ...(context.model === undefined ? {} : { model: context.model }), tools: context.tools }, allowedTools: context.tools, bus: app.bus, peer: context.id, skills: app.skills, runtime: app.runtime, mcp: app.mcpTool, filesystem: { root: context.workspace }, bash: { root: context.workspace, processHost: app.processes }, git: { root: context.workspace } });
+      // A child without `isolated` runs in the parent's directory — which is now the launch
+      // directory itself — and shares its checkpoint stream. A child with its own workspace
+      // gets a store rooted there, so its undo history lives beside its work and survives
+      // the parent session that spawned it.
+      checkpoints: async (context) => {
+        const live = app;
+        if (!live) return undefined;
+        if (resolve(context.workspace) === live.cwd) return { checkpointer: live.checkpointer(), access: createCheckpointAccess(live.checkpoints, () => live.checkpointer()) };
+        const store = await CheckpointStore.open({ root: context.workspace, onWarning: (message) => context.report(message) });
+        const checkpointer = new SessionCheckpointer({ store });
+        return { checkpointer, access: createCheckpointAccess(store, () => checkpointer), close: () => store.close() };
       },
-      externalAcp: async (command, request, context) => { if (!app) throw new Error("Lyra application is not initialized."); return runExternalAcpAgent(command, request, context, app.bus, app.workspace.name); },
-      peerLifecycle: { register: (id, label) => { if (!app) throw new Error("Lyra IRC bus is not initialized."); app.bus.register(id, label === undefined ? {} : { label }); }, unregister: (id) => { app?.bus.unregister(id); } },
+      tools: async (context, checkpoints) => {
+        if (!app) throw new Error("Lyra application tools are not initialized.");
+        const live = app;
+        const ownsLsp = context.workspace !== live.cwd && context.tools.includes("lsp");
+        const lsp = ownsLsp ? await LspManager.create({ workspace: context.workspace }) : live.lsp;
+        // The registry refuses a child that asked for tools this session does not have, and
+        // the language server started for it a line ago would otherwise be a leaked child
+        // process per rejected spawn.
+        try {
+          return createIntegratedToolRegistry({
+            lsp, ownLsp: ownsLsp, spawn: live.spawn,
+            // The child's own identity, so a grandchild it spawns inherits the right depth
+            // and knows whose peer name to answer to.
+            parent: { id: context.id, peer: context.peer, ...(context.parentId === undefined ? {} : { parentId: context.parentId }), depth: context.depth, workspace: context.workspace, ...(context.model === undefined ? {} : { model: context.model }), tools: context.tools },
+            allowedTools: context.tools, bus: live.bus, peer: context.peer,
+            agents: { status: (name) => live.spawn.status(name) },
+            skills: live.skills, runtime: live.runtime, mcp: live.mcpTool,
+            ...(checkpoints === undefined ? {} : { checkpoints }),
+            ...(context.writeScope === undefined ? {} : { writeScope: context.writeScope, writeScopeRoot: context.workspace, onScopeViolation: (path: string) => context.activity({ scopeViolation: path }) }),
+            filesystem: { root: context.workspace }, bash: { root: context.workspace, processHost: live.processes }, git: { root: context.workspace },
+          });
+        } catch (error) {
+          if (ownsLsp) await lsp.close().catch(() => undefined);
+          throw error;
+        }
+      },
+      externalAcp: async (command, request, context) => { if (!app) throw new Error("Lyra application is not initialized."); return runExternalAcpAgent(command, request, context, app.bus, app.sessionName); },
+      // A message addressed to a *running* child is folded into its next turn as a marked
+      // aside (§9). It stays in the inbox too, so `hub inbox` still reads it explicitly and
+      // `consume` is what stops the same sentence arriving twice.
+      asides: (context, steering) => app?.bus.attach(context.peer, {
+        deliver: (message) => { steering.aside({ from: message.from, ...(message.text === undefined ? {} : { text: message.text }), ...(message.data === undefined ? {} : { data: message.data }), messageId: message.id }); },
+        consume: (ids) => { steering.consume(ids); },
+      }),
       origin,
       defaultModel: () => currentEnvironment.model,
       system: ({ workspace, session, tools }) => {
@@ -139,9 +182,6 @@ export class LyraRuntime {
       session: sessionName,
       spawnExecutor,
       sessions: services,
-      // With no local confirmer the daemon asks the connected ACP client instead of
-      // silently declining: bidirectional permission is the only human gate in a turn.
-      confirmAuto: () => confirmAutoGit(origin, options.confirmAuto ?? (() => requestGitPermission(app, main?.descriptor.sessionId ?? sessionName))),
       onReport: async (message) => {
         main?.report(message);
         emitUpdate({ sessionUpdate: "report", message });
@@ -149,6 +189,7 @@ export class LyraRuntime {
       },
       ...(options.home === undefined ? {} : { home: options.home }),
     });
+    attachAgentLifecycle(app, emitUpdate);
     main = await MainSession.create({
       app,
       environment: currentEnvironment,
@@ -263,7 +304,7 @@ export class MainSession {
     await mkdir(sessionRoot, { recursive: true, mode: 0o700 });
     const path = join(sessionRoot, `${validName(options.sessionName)}.jsonl`);
     let store: TranscriptStore;
-    try { store = TranscriptStore.create({ path, name: options.sessionName, origin: options.app.origin, workspace: options.app.workspace.path, provider: options.environment.providerName, model: options.environment.model }); }
+    try { store = TranscriptStore.create({ path, name: options.sessionName, origin: options.app.origin, workspace: options.app.cwd, provider: options.environment.providerName, model: options.environment.model }); }
     catch (error) { if (!(error instanceof Error && "code" in error && (error as { code?: unknown }).code === "EEXIST")) throw error; store = TranscriptStore.open(path); }
     const loop = createLoop(options.app, options.environment, store, options.contextWindow);
     const session = new MainSession(options, store, path, loop);
@@ -340,9 +381,12 @@ export class MainSession {
       // implementation detail, and putting it on the wire would read as a real answer.
       ...(configured ? { apiType: this.#environment.provider.transport.apiType } : {}),
       providerConfigured: configured,
-      workspace: this.app.workspace.path,
+      workspace: this.app.cwd,
       turnActive: this.#activeTurn !== undefined,
       pendingSteer: this.#steering?.size ?? 0,
+      // A client that attaches mid-session sees the children that already exist, so its
+      // presence strip is populated by hydration rather than only by the next transition.
+      agents: this.app.spawn.statusList(),
       usage: {
         session: {
           inputTokens: usage.sessionInputTokens,
@@ -375,7 +419,7 @@ export class MainSession {
     await this.#waitForIdle();
     const sessionName = validName(name ?? `session-${Date.now()}`);
     const path = join(this.#sessionRoot, `${sessionName}.jsonl`);
-    const store = TranscriptStore.create({ path, name: sessionName, origin: this.app.origin, workspace: this.app.workspace.path, provider: this.#environment.providerName, model: this.#environment.model });
+    const store = TranscriptStore.create({ path, name: sessionName, origin: this.app.origin, workspace: this.app.cwd, provider: this.#environment.providerName, model: this.#environment.model });
     this.#replaceStore(store, path, "new");
     return store.descriptor;
   }
@@ -396,6 +440,48 @@ export class MainSession {
     this.#contextTokens = undefined;
     this.#emit([{ sessionUpdate: "session_changed", descriptor: { ...this.#store.descriptor }, reason: "fork" }]);
     return { descriptor: this.#store.descriptor, head };
+  }
+
+  /**
+   * Move the head back to an entry. Nothing is deleted: the transcript is a DAG on disk and
+   * every entry stays in the file, so the turns after `entryId` simply stop being ancestors
+   * of the head and stop being sent to the model.
+   *
+   * The machinery is `fork`'s — moving a head is moving a head — but the *intent* differs,
+   * and the intent is what a client renders: a fork branches away from a conversation and a
+   * rewind takes one back, so this reports `reason: "rewind"` and `fork` reports `"fork"`.
+   *
+   * With no `entryId` it rewinds to the entry the newest checkpoint is anchored to, which is
+   * the boundary before the last state-changing thing that happened — the same anchor
+   * `checkpoint/restore` would take the working directory back to. When no checkpoint carries
+   * an anchor there is nothing to guess at, and the call says so rather than picking a turn.
+   */
+  async rewind(entryId?: string): Promise<unknown> {
+    await this.#waitForIdle();
+    const target = entryId ?? await this.#newestAnchor();
+    if (target === undefined) throw new Error("No checkpoint anchors a transcript entry, so there is nothing to rewind to. Pass an entryId, or run /checkpoints to see what is recorded.");
+    const before = this.#messagesInLineage();
+    this.#store.fork(target);
+    this.#loop = createLoop(this.app, this.#environment, this.#store, this.contextWindow);
+    this.#contextTokens = undefined;
+    this.#emit([{ sessionUpdate: "session_changed", descriptor: { ...this.#store.descriptor }, reason: "rewind" }]);
+    return {
+      descriptor: this.#store.descriptor,
+      entryId: target,
+      removedMessages: Math.max(0, before - this.#messagesInLineage()),
+    };
+  }
+
+  /** The entry the newest checkpoint that anchors one points at. */
+  async #newestAnchor(): Promise<string | undefined> {
+    const records = await this.app.checkpoints.list({ limit: 100 }).catch(() => []);
+    // The head's own anchor is not a rewind — it is where we already are.
+    const head = this.#store.head.id;
+    return records.map((record) => record.entryId).find((id) => id !== undefined && id !== head);
+  }
+
+  #messagesInLineage(): number {
+    return this.#store.lineage().filter((entry) => entry.type === "message").length;
   }
 
   /**
@@ -457,10 +543,17 @@ export class MainSession {
   }
   entries(): readonly TranscriptEntry[] { return this.#store.entries(); }
 
+  /**
+   * `/settings` reads; nothing here writes any more.
+   *
+   * The one runtime-settable value used to be the Git mode, and there are no modes left —
+   * integration is the model's job through the `git` tool. Everything else in the effective
+   * configuration is declarative and belongs in `.lyra/config.toml`, where it survives a
+   * restart, which is what anyone changing it actually wanted.
+   */
   async settings(args: readonly string[]): Promise<unknown> {
-    if (args.length === 0) return { config: this.app.config, provider: this.#environment.providerName, model: this.#environment.model, gitMode: this.app.git.mode };
-    if (args[0] === "git.mode" && args[1]) { await this.app.git.setMode(parseGitMode(args[1])); return { gitMode: this.app.git.mode }; }
-    throw new Error("Runtime settings supports: /settings git.mode observe|stage|auto. Persistent settings belong in .lyra/config.toml.");
+    if (args.length === 0) return { config: this.app.config, provider: this.#environment.providerName, model: this.#environment.model, cwd: this.app.cwd, checkpoints: this.app.checkpoints.available ? "on" : (this.app.checkpoints.unavailable ?? "off") };
+    throw new Error("/settings takes no arguments: it reports the effective configuration. Change a setting in .lyra/config.toml, or use /model and /provider for the ones that switch mid-session.");
   }
   command(command: string): Promise<unknown> { return this.app.slash(command); }
 
@@ -476,7 +569,7 @@ export class MainSession {
     if (request.kind !== "file") throw new Error(`Unsupported completion kind ${JSON.stringify(request.kind)}. This daemon completes: file.`);
     // Scoped to the session's workspace, which for a spawned agent is its own clone and
     // never the origin checkout: completion cannot offer a path the session cannot read.
-    this.#files ??= new WorkspaceFileIndex(this.app.workspace.path);
+    this.#files ??= new WorkspaceFileIndex(this.app.cwd);
     return this.#files.complete(request.query, request.limit);
   }
   #files: WorkspaceFileIndex | undefined;
@@ -872,7 +965,9 @@ export class MainSession {
         return { done: this.#lastTurnHardStop || text.includes("<loop-complete>"), progress: this.#lastTurnProgress, latencyMs: Date.now() - started };
       },
       processCount: () => this.app.processes.list().filter((job) => job.status === "queued" || job.status === "running").length,
-      workspaceLeakCount: async () => (await this.app.workspaces.list()).filter((workspace) => workspace.state === "active" && workspace.name !== this.app.workspace.name).length,
+      // Every workspace belongs to a child now; the main session has none, so an active one
+      // outliving its child is unambiguously a leak.
+      workspaceLeakCount: async () => (await this.app.workspaces.list().catch(() => [])).filter((workspace) => workspace.state === "active").length,
       metrics: this.app.metrics,
     });
     return runner.run(goal, spec);
@@ -891,7 +986,15 @@ export class MainSession {
     this.#lastPromptTrimmed = false;
     const steering = new SteerQueue();
     this.#steering = steering;
+    // The main session is a peer like any other: a child that answers a question lands in
+    // this turn at its next tool boundary instead of waiting for someone to read an inbox.
     this.#emit(this.#encoder.beginTurn(source));
+    // After the opening frame, so a client callback that throws cannot leave the sink
+    // attached to a queue no turn will ever drain.
+    const detachAsides = this.app.bus.attach(this.app.sessionName, {
+      deliver: (message) => { steering.aside({ from: message.from, ...(message.text === undefined ? {} : { text: message.text }), ...(message.data === undefined ? {} : { data: message.data }), messageId: message.id }); },
+      consume: (ids) => { steering.consume(ids); },
+    });
     try {
       const iterator = this.#loop.runTurn(text, signal, { steering });
       while (true) {
@@ -936,6 +1039,8 @@ export class MainSession {
       await this.app.metrics.record({ type: "turn", latencyMs: Date.now() - started, success: false });
       this.#emit(this.#encoder.endTurn({ status: "error", partialRetained: false, error: wireError(error) }));
       throw error;
+    } finally {
+      detachAsides();
     }
   }
 
@@ -1003,7 +1108,8 @@ export class MainSession {
   }
   async #waitForIdle(): Promise<void> { if (this.#activeTurn) await this.#activeTurn; }
   #compactor(): Compactor { return new Compactor({ transcript: this.#store, summaryGenerator: new ProviderSummaryGenerator({ provider: this.#environment.provider, model: this.#environment.model }), contextWindow: this.contextWindow, threshold: this.app.config.reliability.compact_at }); }
-  async #waitForChildren(): Promise<void> { const active = this.app.spawn.list().filter((handle) => handle.status === "queued" || handle.status === "running"); await Promise.all(active.map((handle) => this.app.spawn.wait(handle.id).catch(() => undefined))); }
+  /** Every child that has not reached a terminal state, including the ones inside a tool call. */
+  async #waitForChildren(): Promise<void> { const active = this.app.spawn.list().filter((handle) => !SPAWN_TERMINAL_STATES.includes(handle.status)); await Promise.all(active.map((handle) => this.app.spawn.wait(handle.id).catch(() => undefined))); }
   #recordUsage(usage: ProviderUsage, turn: TurnUsageTotals): void {
     this.#inputTokens += usage.inputTokens;
     this.#outputTokens += usage.outputTokens;
@@ -1169,8 +1275,132 @@ function promptPreview(entry: Record<string, unknown> | MessageEntry): string | 
   return `${cut}…`;
 }
 
+/**
+ * Put every spawned child on the bus, and keep it there.
+ *
+ * This is the wiring the observed failure was missing end to end. A child used to register
+ * itself when its executor started and *unregister* when it finished, which meant: a child
+ * that had not been scheduled yet could not be addressed, and a child that had finished
+ * stopped existing — so `hub list` showed one peer, `hub wait` returned `[]`, and there was
+ * nothing to send a follow-up to. Three changes fix it:
+ *
+ *  - **Registered at spawn**, before the job is even pumped, so the `peer` a spawn result
+ *    reports is addressable from the moment the model reads it.
+ *  - **Parked, never unregistered**, on every terminal state including failure. LYRA.md §9
+ *    makes a message the only resume primitive, and that is only true if there is still
+ *    somebody to send it to. `onRevive` turns that message into the child's next turn.
+ *  - **Published to the `agents` channel**, so `hub { op: "wait", channel: "agents" }` is a
+ *    real event stream and a parent never has to poll to learn a child finished.
+ *
+ * A client watching over ACP gets the same transitions as `agent` updates, which is what a
+ * presence strip renders from.
+ */
+export function attachAgentLifecycle(app: LyraApplication, emit: (update: SessionUpdate) => void): () => void {
+  const registered = new Set<string>();
+  return app.spawn.onLifecycle((event) => {
+    try {
+      if (event.type === "spawned" && !registered.has(event.peer)) {
+        // Added only once the bus has accepted the name, so a refused registration does not
+        // leave a peer this wiring believes in and nothing else does.
+        app.bus.register(event.peer, {
+          ...(event.label === undefined ? {} : { label: event.label }),
+          // A message to a parked child is its next instruction, with its transcript intact.
+          // `true` means the message became the child's next instruction, so the bus does
+          // not also queue it: a revived agent reading its own prompt out of its inbox
+          // cannot tell it from a second, unanswered request.
+          onRevive: (peer, message) => app.spawn.revive(peer.name, renderHubAside({ from: message.from, ...(message.text === undefined ? {} : { text: message.text }), ...(message.data === undefined ? {} : { data: message.data }) })) !== undefined,
+        });
+        registered.add(event.peer);
+      }
+      if (SPAWN_TERMINAL_STATES.includes(event.status) && registered.has(event.peer)) {
+        // Parked rather than completed: a completed peer swallows messages, and swallowing
+        // the one message that could have revived it is precisely the wrong behaviour.
+        app.bus.setState(event.peer, "parked");
+      } else if (event.type === "started" || event.type === "revived") {
+        if (registered.has(event.peer)) app.bus.setState(event.peer, "running");
+      }
+    } catch { /* a bus that refuses a name must not stop the child it names */ }
+    try {
+      app.bus.publish({ channel: SPAWN_LIFECYCLE_CHANNEL, text: describeLifecycle(event), data: event });
+      // And addressed straight to whoever asked for the child, when it ends.
+      //
+      // The channel alone is not enough: `hub wait` with no channel waits on the caller's
+      // own mailbox, which is the natural thing for a parent mid-conversation with a child
+      // to do — and a child that *failed* mid-conversation would never send again, leaving
+      // that wait to expire with nothing and no reason. A terminal transition is news the
+      // parent asked for, so it is delivered like any other message: folded into its running
+      // turn, or waking its wait.
+      if (SPAWN_TERMINAL_STATES.includes(event.status)) notifyParent(app, event);
+    } catch { /* publishing is observation; it never fails the job */ }
+    // Guarded like everything else here: a client callback that throws must not stop the
+    // sweep below, or peers for children that no longer exist accumulate on the bus.
+    try { emit(agentUpdate(event)); } catch { /* observation never fails the job */ }
+    // A child that has aged out of the manager's retention has no state left to report, so
+    // its mailbox is retired too rather than lingering as a name nothing answers to.
+    for (const peer of [...registered]) {
+      if (app.spawn.status(peer) !== undefined) continue;
+      registered.delete(peer);
+      try { app.bus.unregister(peer); } catch { /* already gone */ }
+    }
+  });
+}
+
+/**
+ * Tell the agent that spawned this one that it has ended.
+ *
+ * Only when the parent is live. A parked parent is one that finished before its own child,
+ * and reviving it to hear that a child it is no longer working on has ended would restart a
+ * turn nobody asked for — the parent can still read the news from the `agents` channel or
+ * from `spawn status` whenever something else revives it.
+ */
+function notifyParent(app: LyraApplication, event: SpawnLifecycleEvent): void {
+  const parent = event.parentId === undefined ? app.sessionName : app.spawn.status(event.parentId)?.peer;
+  if (parent === undefined || parent === event.peer) return;
+  const state = app.bus.getPeer(parent)?.state;
+  if (state === undefined || state === "parked" || state === "completed" || state === "failed") return;
+  try { app.bus.send({ from: event.peer, to: parent, text: describeLifecycle(event), data: event }); } catch { /* the channel still carries it */ }
+}
+
+/** One sentence a human or a model can read off the `agents` channel without parsing JSON. */
+function describeLifecycle(event: SpawnLifecycleEvent): string {
+  const name = event.label === undefined || event.label === event.peer ? event.peer : `${event.peer} (${event.label})`;
+  switch (event.type) {
+    case "spawned": return `${name} was spawned.`;
+    case "started": return `${name} started.`;
+    case "revived": return `${name} was revived by a message.`;
+    case "completed": return `${name} completed after ${event.toolCalls} tool call(s), ${event.filesModified} file(s) changed. Collect it with spawn { id: "${event.id}" }.`;
+    case "failed": return `${name} failed: ${event.error ?? "no reason was reported"}.`;
+    case "timed_out": return `${name} ran out of time: ${event.error ?? "its deadline expired"}.`;
+    case "cancelled": return `${name} was cancelled.`;
+  }
+}
+
+/** The protocol shape of one transition, for a client's presence strip. */
+function agentUpdate(event: SpawnLifecycleEvent): SessionUpdate {
+  return {
+    sessionUpdate: "agent",
+    id: event.id,
+    peer: event.peer,
+    ...(event.label === undefined ? {} : { label: event.label }),
+    // The transition, not only the state it left behind: `started` and `revived` are both
+    // `running`, and a client that can only diff states cannot tell a child that resumed
+    // from one that never stopped.
+    event: event.type,
+    status: event.status,
+    ...(event.model === undefined ? {} : { model: event.model }),
+    depth: event.depth,
+    workspace: event.workspace,
+    toolCalls: event.toolCalls,
+    filesModified: event.filesModified,
+    ...(event.error === undefined ? {} : { error: event.error }),
+  };
+}
+
 function createLoop(app: LyraApplication, environment: EnvironmentProvider, store: TranscriptStore, contextWindow: number): AgentLoop {
-  return new AgentLoop({ provider: environment.provider, store, tools: app.tools, model: environment.model, system: systemPrompt(app, app.workspace.path, store.descriptor.name), contextWindow, workspace: app.workspace.path, turnTimeoutMs: durationMs(app.config.reliability.turn_timeout), compactor: new Compactor({ transcript: store, summaryGenerator: new ProviderSummaryGenerator({ provider: environment.provider, model: environment.model }), contextWindow, threshold: app.config.reliability.compact_at }), loopDetector: new LoopDetector() });
+  // The checkpointer reads the transcript head at the moment it snapshots, so a pre-tool
+  // checkpoint is anchored to the assistant message that asked for the tool call — which is
+  // what makes "rewind the conversation and the code together" one operation.
+  return new AgentLoop({ provider: environment.provider, store, tools: app.tools, model: environment.model, system: systemPrompt(app, app.cwd, store.descriptor.name), contextWindow, workspace: app.cwd, checkpointer: app.checkpointer(() => store.head.id), turnTimeoutMs: durationMs(app.config.reliability.turn_timeout), compactor: new Compactor({ transcript: store, summaryGenerator: new ProviderSummaryGenerator({ provider: environment.provider, model: environment.model }), contextWindow, threshold: app.config.reliability.compact_at }), loopDetector: new LoopDetector() });
 }
 
 function systemPrompt(app: LyraApplication, workspace: string, session: string, definitions: readonly { name: string; description: string }[] = app.tools.definitions()): string {
@@ -1197,6 +1427,7 @@ function deferredServices(current: () => MainSession | undefined): SessionServic
       "session/steer": (params) => get().steer(stringParam(params, "prompt")),
       "session/cancel": (params) => get().cancel({ rewoundToComposer: booleanParam(params, "rewoundToComposer") }),
       "session/fork": (params) => get().fork(optionalParam(params, "entryId")),
+      "session/rewind": (params) => get().rewind(optionalParam(params, "entryId")),
       "session/models": (params) => get().models(booleanParam(params, "refresh")),
       // One switching surface: the reference may name another provider, and switching to it
       // is the same validated step selecting a model on the current one is.
@@ -1334,33 +1565,8 @@ function wireError(error: unknown): WireError {
   };
 }
 
-/**
- * The daemon's only human gate. With no local confirmer, auto-mode consent is asked of the
- * connected ACP client; with no client attached the request fails and consent is withheld.
- */
-async function requestGitPermission(app: LyraApplication | undefined, sessionId: string): Promise<boolean> {
-  if (!app) return false;
-  try {
-    const answer = await app.acp.requestClient("session/request_permission", {
-      sessionId,
-      kind: "git_auto_mode",
-      title: "Enable automatic Git commits?",
-      detail: "Auto mode lets Lyra stage and commit its own work in this repository. Every commit stays local and can be rolled back with /rollback.",
-      options: [
-        { optionId: "allow_always", label: "Enable auto mode", kind: "allow_always" },
-        { optionId: "reject", label: "Keep manual control", kind: "reject" },
-      ],
-    });
-    return answer !== null && typeof answer === "object" && (answer as { optionId?: unknown }).optionId === "allow_always";
-  } catch {
-    return false;
-  }
-}
 async function copyToClipboard(text: string): Promise<void> { const command = process.platform === "darwin" ? "/usr/bin/pbcopy" : Bun.which("wl-copy") ?? Bun.which("xclip") ?? Bun.which("xsel"); if (!command) throw new Error("No clipboard command is available. Install wl-clipboard, xclip, or xsel."); const args = command.endsWith("xclip") ? [command, "-selection", "clipboard"] : command.endsWith("xsel") ? [command, "--clipboard", "--input"] : [command]; const child = Bun.spawn(args, { stdin: "pipe", stdout: "ignore", stderr: "pipe" }); child.stdin.write(text); child.stdin.end(); const stderr = new Response(child.stderr).text(); if (await child.exited !== 0) throw new Error(`Clipboard command failed: ${(await stderr).trim()}`); }
 
 function assistantText(result: AgentTurnResult): string { return result.assistant.content.flatMap((block) => block.type === "text" ? [block.text] : []).join(""); }
 function validName(value: string): string { if (!/^[a-z][a-z0-9-]{0,63}$/.test(value)) throw new TypeError("Session name must start with a lowercase letter and contain only lowercase letters, numbers, and hyphens (max 64 characters)."); return value; }
 function oneLine(value: string): string { return value.replace(/\s+/g, " ").trim().slice(0, 180); }
-function parseGitMode(value: string): "observe" | "stage" | "auto" { if (value !== "observe" && value !== "stage" && value !== "auto") throw new Error("git.mode must be observe, stage, or auto."); return value; }
-
-async function confirmAutoGit(origin: string, confirm?: () => boolean | Promise<boolean>): Promise<boolean> { const path = join(origin, ".lyra", "auto-git-consent.json"); try { const value = JSON.parse(await readFile(path, "utf8")) as { approved?: unknown }; if (value.approved === true) return true; } catch (error) { if (!(error instanceof Error && "code" in error && (error as { code?: unknown }).code === "ENOENT")) throw error; } if (!confirm || !await confirm()) return false; await mkdir(join(origin, ".lyra"), { recursive: true, mode: 0o700 }); await writeFile(path, `${JSON.stringify({ approved: true, recordedAt: new Date().toISOString() })}\n`, { mode: 0o600 }); return true; }

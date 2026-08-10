@@ -15,7 +15,7 @@ test("external ACP agents negotiate and stream output over the IRC bus", async (
     bus.register("parent");
     bus.register("external-child-peer");
     const signal = new AbortController().signal;
-    const result = await runExternalAcpAgent(`${process.execPath} ${script}`, { task: "answer externally", workspace: root }, { id: "external-child-peer", signal, depth: 1, workspace: root, tools: ["read"], report() {} }, bus, "parent") as { acp: string; sessionId: string; stopReason: string; content: string };
+    const result = await runExternalAcpAgent(`${process.execPath} ${script}`, { task: "answer externally", workspace: root }, { id: "spawn-1", peer: "external-child-peer", signal, depth: 1, workspace: root, tools: ["read"], report() {}, activity() {} }, bus, "parent") as { acp: string; sessionId: string; stopReason: string; content: string };
     expect(result).toMatchObject({ acp: "fixture", sessionId: "external-child", stopReason: "end_turn" });
     expect(result.content).toBe("external answer");
     expect((await bus.inbox("parent")).length).toBe(1);

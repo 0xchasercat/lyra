@@ -1,6 +1,7 @@
 export * from "./config.ts";
 export * from "./metrics.ts";
 export * from "./commands.ts";
+export * from "./checkpoints.ts";
 export * from "./integrated-tools.ts";
 export * from "./app.ts";
 export * from "./soak.ts";

@@ -11,7 +11,10 @@ export interface SlashServices {
   compact(clear: boolean): Promise<unknown>;
   agents(operation: "list" | "kill", name?: string): Promise<unknown>;
   workspaces(operation: "list" | "cleanup"): Promise<unknown>;
-  git(operation: "mode" | "review" | "apply" | "rollback", value?: string): Promise<unknown>;
+  checkpoints(): Promise<unknown>;
+  review(from?: string): Promise<unknown>;
+  rollback(checkpoint: string | undefined, force: boolean): Promise<unknown>;
+  apply(preview?: string): Promise<unknown>;
   skills(): Promise<unknown>;
   mcp(): Promise<unknown>;
   install(tool: string): Promise<unknown>;
@@ -37,7 +40,7 @@ export interface SlashCommandSpec {
 export const SLASH_COMMAND_CATALOG: readonly SlashCommandSpec[] = Object.freeze([
   { name: "copy", description: "Copy the last assistant reply, or one addressed by entry id, to the clipboard.", usage: "/copy [entryId]", resultKind: "report" },
   { name: "dump", description: "Copy the whole transcript to the clipboard as JSON.", resultKind: "report" },
-  { name: "settings", description: "Show the effective runtime settings, or change the Git mode for this session.", usage: "/settings [git.mode observe|stage|auto]", resultKind: "report" },
+  { name: "settings", description: "Show the effective runtime settings for this session.", resultKind: "report" },
   // `edit` and `delete` are advertised here and intercepted by the client: one opens the
   // setup form filled in from `provider/get` and saves it with `provider/add` (persist
   // "keep" when the key is not being rotated), the other confirms and calls `provider/remove`.
@@ -50,14 +53,20 @@ export const SLASH_COMMAND_CATALOG: readonly SlashCommandSpec[] = Object.freeze(
   { name: "context", description: "Break down what the next request would send, section by section, with repairs and losses.", resultKind: "context" },
   { name: "compact", description: "Summarise the transcript now instead of waiting for the automatic threshold.", resultKind: "report" },
   { name: "clear", description: "Clear the context behind a boundary; nothing leaves the transcript on disk.", resultKind: "report" },
-  { name: "agents", description: "List spawned agents with their workspace and status.", resultKind: "agents" },
-  { name: "kill", description: "Cancel a running agent by id.", usage: "/kill <agentId>", resultKind: "report" },
+  { name: "agents", description: "List spawned agents: peer name, state, tool calls, files changed, and write scope.", resultKind: "agents" },
+  { name: "kill", description: "Cancel a running agent by its spawn id or peer name.", usage: "/kill <agentId>", resultKind: "report" },
   { name: "workspaces", description: "List every agent workspace and its lifecycle state.", resultKind: "workspaces" },
-  { name: "cleanup", description: "Drop archived workspaces older than the configured retention.", resultKind: "workspaces" },
-  { name: "gitmode", description: "Set how the Git pipeline behaves: observe, stage, or auto-commit.", usage: "/gitmode observe|stage|auto", resultKind: "report" },
-  { name: "review", description: "Assemble a merge preview of every completed agent workspace.", resultKind: "report" },
-  { name: "apply", description: "Apply a reviewed merge preview to the origin repository.", usage: "/apply [--preview <id>]", resultKind: "report" },
-  { name: "rollback", description: "Roll the repository back to a snapshot taken before an apply.", usage: "/rollback [--to <snapshot>]", resultKind: "report" },
+  { name: "cleanup", description: "Reclaim what this session no longer needs: archived workspaces, stale previews, and old checkpoints.", resultKind: "workspaces" },
+  // The rewind surface. These two have declared structure — a checkpoint listing and a
+  // per-file diff — so they name it rather than hiding it under a report's `detail`: a
+  // client that wants to draw the diff should dispatch on the kind, not sniff the payload,
+  // which is the entire reason `resultKind` exists. The prose line they used to carry is
+  // gone with the wrapper; the numbers it was made of are all still on the wire, and
+  // composing the sentence is the client's job (DESIGN §2, raw measurements).
+  { name: "checkpoints", description: "List the checkpoints taken before each state-changing tool call, newest first.", resultKind: "checkpoints" },
+  { name: "review", description: "Show what changed since a checkpoint, plus every agent workspace holding work to integrate.", usage: "/review [checkpointId]", resultKind: "review" },
+  { name: "rollback", description: "Restore the working tree to a checkpoint. Files changed outside Lyra are never reverted unless --force.", usage: "/rollback [checkpointId] [--force]", resultKind: "report" },
+  { name: "apply", description: "Apply an assembled merge preview to the repository.", usage: "/apply [--preview <id>]", resultKind: "report" },
   { name: "skills", description: "List discovered skills and where each was found.", resultKind: "skills" },
   { name: "mcp", description: "Re-index the configured MCP servers and list the tools they advertise.", resultKind: "mcp" },
   { name: "install", description: "Install a bundled MCP integration.", usage: "/install draco", resultKind: "report" },
@@ -100,10 +109,12 @@ export class SlashCommandRouter {
         case "kill": if (!tokens[0]) throw new Error("/kill requires an agent name."); output = await this.services.agents("kill", tokens[0]); break;
         case "workspaces": output = await this.services.workspaces("list"); break;
         case "cleanup": output = await this.services.workspaces("cleanup"); break;
-        case "gitmode": if (tokens[0] !== "observe" && tokens[0] !== "stage" && tokens[0] !== "auto") throw new Error("/gitmode requires observe, stage, or auto."); output = await this.services.git("mode", tokens[0]); break;
-        case "review": output = await this.services.git("review"); break;
-        case "apply": output = await this.services.git("apply", optionValue(tokens, "--preview")); break;
-        case "rollback": output = await this.services.git("rollback", optionValue(tokens, "--to")); break;
+        case "checkpoints": output = await this.services.checkpoints(); break;
+        case "review": output = await this.services.review(tokens[0]); break;
+        // `--force` is the one destructive flag in the whole surface, so it is spelled out
+        // rather than inferred: a bare /rollback never reverts a file Lyra did not write.
+        case "rollback": output = await this.services.rollback(tokens.find((token) => !token.startsWith("--")), tokens.includes("--force")); break;
+        case "apply": output = await this.services.apply(optionValue(tokens, "--preview")); break;
         case "skills": output = await this.services.skills(); break;
         case "mcp": output = await this.services.mcp(); break;
         case "install": if (!tokens[0]) throw new Error("/install requires a tool name."); output = await this.services.install(tokens[0]); break;
