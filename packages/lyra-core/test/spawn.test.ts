@@ -100,10 +100,10 @@ test("creates isolated workspaces and passes resolved context", async () => {
       return { name: "copy", path: "/repo-copy" };
     },
     releaseWorkspace: async (name) => { released.push(name); },
-    executor: async (_request, context) => { peer = context.id; return context.workspace; },
+    executor: async (_request, context) => { peer = context.workspaceName ?? context.peer; return context.workspace; },
   }));
 
-  const handle = manager.spawn({ task: "build" });
+  const handle = manager.spawn({ task: "build", isolated: true });
   const result = await manager.wait(handle);
   expect(calls).toEqual([undefined]);
   expect(handle.workspace).toBe("/repo-copy");
@@ -112,6 +112,60 @@ test("creates isolated workspaces and passes resolved context", async () => {
   expect(result.output).toBe("/repo-copy");
   expect(released).toEqual(["copy"]);
   expect(peer).toBe("copy");
+});
+
+// The redesigned default: a child helps with the work in front of the parent. It used to
+// be inferred the other way round — any spawn that could get a clone got one — which put
+// every child's edits somewhere the parent could not see.
+test("a child without isolated runs in the parent's own directory and creates no workspace", async () => {
+  let created = 0;
+  const released: string[] = [];
+  const manager = track(new SpawnManager({
+    defaultWorkspace: "/repo",
+    createWorkspace: async () => { created += 1; return { name: "copy", path: "/repo-copy" }; },
+    releaseWorkspace: async (name) => { released.push(name); },
+    executor: async (_request, context) => context.workspace,
+  }));
+
+  const result = await manager.spawn({ task: "help here", blocking: true });
+  expect(result).toMatchObject({ workspace: "/repo", output: "/repo" });
+  expect(created).toBe(0);
+  expect(released).toEqual([]);
+  // Nothing to integrate, because nothing was separated: the summary is for isolated work.
+  expect(result.integration).toBeUndefined();
+
+  // A grandchild inherits the same directory rather than falling back to the default.
+  const nested = await manager.spawn({ task: "deeper", blocking: true }, { depth: 1, workspace: "/repo/sub" });
+  expect(nested.workspace).toBe("/repo/sub");
+});
+
+test("an isolated child reports where its work is and how to merge it", async () => {
+  const manager = track(new SpawnManager({
+    defaultWorkspace: "/repo",
+    createWorkspace: async () => ({ name: "amber-forge", path: "/repo/.lyra/workspaces/amber-forge" }),
+    describeWorkspace: async (input) => ({
+      workspace: input.name, path: input.path, commits: 2, head: "abc1234",
+      uncommitted: ["notes.md"], truncated: false,
+      hint: [`git fetch ${input.path} HEAD:refs/lyra/agents/${input.name}`],
+    }),
+    executor: async () => "done",
+  }));
+
+  const result = await manager.spawn({ task: "swarm member", isolated: true, blocking: true });
+  expect(result.integration).toMatchObject({ workspace: "amber-forge", commits: 2, uncommitted: ["notes.md"] });
+  expect(result.integration!.hint[0]).toContain("git fetch");
+});
+
+test("a summary that cannot be taken never fails work that succeeded", async () => {
+  const manager = track(new SpawnManager({
+    defaultWorkspace: "/repo",
+    createWorkspace: async () => ({ name: "copy", path: "/repo-copy" }),
+    describeWorkspace: async () => { throw new Error("the workspace vanished"); },
+    executor: async () => "done",
+  }));
+  const result = await manager.spawn({ task: "build", isolated: true, blocking: true });
+  expect(result.output).toBe("done");
+  expect(result.integration).toMatchObject({ unavailable: "the workspace vanished", commits: 0 });
 });
 
 test("resolves an explicit existing workspace without releasing it", async () => {
@@ -233,7 +287,7 @@ test("a workspace release failure warns instead of failing successful work", asy
     executor: async () => ({ ok: true }),
   }));
 
-  const result = await manager.spawn({ task: "build", blocking: true });
+  const result = await manager.spawn({ task: "build", isolated: true, blocking: true });
   expect(result).toMatchObject({ output: { ok: true }, workspace: "/repo-copy" });
   expect(result.warnings).toEqual(["Workspace copy could not be released: archive is locked"]);
 });
@@ -248,7 +302,7 @@ test("a workspace release failure never shadows the executor's own error", async
   }));
   manager.onReport(({ message }) => reports.push(message));
 
-  const failure = await rejection(manager.spawn({ task: "build", blocking: true }));
+  const failure = await rejection(manager.spawn({ task: "build", isolated: true, blocking: true }));
   expect((failure as Error).message).toContain("the build itself failed");
   expect((failure as Error).message).not.toContain("archive is locked");
   // The cleanup trouble is still visible, just not as the verdict.

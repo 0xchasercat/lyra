@@ -92,7 +92,16 @@ export type AgentEvent =
     firstKeptEntry: EntryId | null;
   }
   | { type: "context_measured"; tokenEstimate: number; sourceEntryCount: number }
-  | { type: "steered"; entryId: EntryId; text: string; at: SteerBoundary }
+  | {
+    type: "steered";
+    entryId: EntryId;
+    text: string;
+    at: SteerBoundary;
+    /** Who spoke. `hub` is another agent's aside; absent is read as `user`. */
+    source?: "user" | "hub";
+    /** The peer that sent a `hub` aside. */
+    from?: string;
+  }
   | { type: "loop_warning"; warning: LoopWarning; hardStopRequested?: boolean };
 
 export interface AgentTurnResult {

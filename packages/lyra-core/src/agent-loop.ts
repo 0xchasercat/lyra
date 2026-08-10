@@ -11,8 +11,8 @@ import { TranscriptStore } from "@lyra/session";
 import type { Compactor } from "./compaction.ts";
 import { deriveContext } from "./context.ts";
 import type { LoopDetector } from "./loop-detection.ts";
-import type { SteerQueue } from "./steering.ts";
-import { ToolDispatcher } from "./tool-dispatch.ts";
+import { renderHubAside, type SteerQueue } from "./steering.ts";
+import { ToolDispatcher, type ToolCheckpointer } from "./tool-dispatch.ts";
 import type {
   AgentEvent,
   AgentTurnResult,
@@ -36,11 +36,18 @@ export interface AgentLoopOptions {
   workspace: string;
   imageByteLimit?: number;
   toolTimeoutMs?: number;
+  /** Per-tool deadlines; see [`DEFAULT_TOOL_TIMEOUTS`]. */
+  toolTimeouts?: Readonly<Record<string, number>>;
   turnTimeoutMs?: number;
   compactor?: Compactor;
   loopDetector?: LoopDetector;
   /** Tools a steering message may interrupt mid-execution; defaults to the wait-class set. */
   waitTools?: readonly string[];
+  /**
+   * Snapshots the working tree before every state-changing tool call and at both turn
+   * boundaries, so a conversation and the code it produced rewind together.
+   */
+  checkpointer?: ToolCheckpointer;
 }
 
 export type UserTurnContent = string | ContentBlock[];
@@ -67,6 +74,7 @@ export class AgentLoop {
   private readonly workspace: string;
   private readonly compactor: Compactor | undefined;
   private readonly loopDetector: LoopDetector | undefined;
+  private readonly checkpointer: ToolCheckpointer | undefined;
 
   constructor(options: AgentLoopOptions) {
     this.provider = options.provider;
@@ -86,9 +94,12 @@ export class AgentLoop {
       this.definitions.map((definition) => definition.name),
       {
         ...(options.toolTimeoutMs === undefined ? {} : { timeoutMs: options.toolTimeoutMs }),
+        ...(options.toolTimeouts === undefined ? {} : { toolTimeouts: options.toolTimeouts }),
         ...(options.waitTools === undefined ? {} : { waitTools: options.waitTools }),
+        ...(options.checkpointer === undefined ? {} : { checkpointer: options.checkpointer }),
       },
     );
+    this.checkpointer = options.checkpointer;
     this.compactor = options.compactor;
     this.loopDetector = options.loopDetector;
     this.turnTimeoutMs = options.turnTimeoutMs ?? DEFAULT_AGENT_TURN_TIMEOUT_MS;
@@ -109,11 +120,19 @@ export class AgentLoop {
     options: RunTurnOptions = {},
   ): AsyncGenerator<AgentEvent, AgentTurnResult, void> {
     const turnEntries: TranscriptEntry[] = [];
-    appendMessage(this.store, turnEntries, {
+    const prompt = appendMessage(this.store, turnEntries, {
       role: "user",
       content: normalizeUserContent(userContent),
       status: "complete",
     });
+    // Anchored to the prompt entry, so "rewind to before I asked this" is one lookup on
+    // the conversation DAG rather than a guess about which snapshot came first.
+    //
+    // Started, not awaited: the store serialises its own writes, so this still lands before
+    // any pre-tool checkpoint of this turn, and nothing between here and the first tool call
+    // can change the tree. Awaiting it would put an index refresh in front of every first
+    // token, which is the one place in a turn where latency is felt.
+    void this.checkpoint("turn_start", prompt.id);
     const steering = options.steering;
     /**
      * Drains steering into standalone user messages. Returning the events rather than
@@ -122,13 +141,19 @@ export class AgentLoop {
      */
     const drainSteering = (at: SteerBoundary): AgentEvent[] => {
       if (steering === undefined) return [];
-      return steering.drain().map((text) => {
-        const entry = appendMessage(this.store, turnEntries, {
+      return steering.drain().map((entry) => {
+        // A hub aside is a real user-role message like a steer is — that is what makes
+        // `/context`, compaction and replay attribute it — but it names its sender, so the
+        // model can tell "the user changed their mind" from "another agent answered me".
+        const text = entry.kind === "hub" ? renderHubAside(entry) : entry.text;
+        const appended = appendMessage(this.store, turnEntries, {
           role: "user",
           content: [{ type: "text", text }],
           status: "complete",
         });
-        return { type: "steered" as const, entryId: entry.id, text, at };
+        return entry.kind === "hub"
+          ? { type: "steered" as const, entryId: appended.id, text, at, source: "hub" as const, from: entry.from }
+          : { type: "steered" as const, entryId: appended.id, text, at, source: "user" as const };
       });
     };
 
@@ -384,7 +409,19 @@ export class AgentLoop {
     } finally {
       clearTimeout(timer);
       signal?.removeEventListener("abort", onUserAbort);
+      // Closes the bracket even for a cancelled or failed turn: whatever the model managed
+      // to write before it stopped is exactly what a user most wants to be able to undo.
+      // Started rather than awaited, for the same reason `turn_start` is: a turn is over
+      // when the model has finished, not when bookkeeping about it has. Reads of the
+      // history drain the write queue first, so nothing observes a half-recorded turn.
+      void this.checkpoint("turn_end", turnEntries.at(-1)?.id ?? prompt.id);
     }
+  }
+
+  /** A turn-boundary checkpoint. Never fatal: the store reports its own trouble. */
+  private async checkpoint(kind: "turn_start" | "turn_end", entryId: string): Promise<void> {
+    if (this.checkpointer === undefined) return;
+    try { await this.checkpointer.before({ kind, entryId }); } catch { /* the store warns */ }
   }
 }
 

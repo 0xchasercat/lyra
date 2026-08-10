@@ -20,4 +20,16 @@ export interface IrcDelivery {
   delivered: boolean;
   revived?: boolean;
 }
+
+/**
+ * A live agent's turn, as the bus sees it.
+ *
+ * Attached while an agent is actually running (see [`IrcBus.attach`]). `deliver` folds a
+ * message into that turn as an aside; `consume` says which messages the agent has since
+ * read for itself, so the same sentence never arrives twice.
+ */
+export interface IrcPeerSink {
+  deliver?(message: IrcMessage): void;
+  consume?(messageIds: readonly string[]): void;
+}
 export interface IrcBusOptions { maxWaitMs?: number; now?: () => number; id?: () => string; }

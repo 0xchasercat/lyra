@@ -3,6 +3,7 @@ import type {
   IrcDelivery,
   IrcMessage,
   IrcPeer,
+  IrcPeerSink,
   IrcPeerState,
 } from "./irc-types.ts";
 
@@ -13,19 +14,29 @@ const MAX_TEXT_LENGTH = 100_000;
 export interface IrcRegisterOptions {
   state?: IrcPeerState;
   label?: string;
+  /** Called when a message wakes this peer from `parked`. The only resume primitive (§9). */
   onRevive?: IrcReviveHandler;
-  revive?: IrcReviveHandler;
 }
 
-export type IrcReviveHandler = (peer: IrcPeer, message: IrcMessage) => void | Promise<void>;
+/**
+ * What a parked peer does when a message wakes it.
+ *
+ * Returning `true` — synchronously — means the handler took the message *as* the agent's
+ * next instruction, so the bus does not also leave a copy in its inbox. That is the revival
+ * case: an agent restarted with "fix the failing test" should not then read "fix the failing
+ * test" out of its own mailbox and wonder whether it is a second request. Anything else
+ * (including a promise) leaves the message queued, because a handler that might not have
+ * acted on it must not be able to lose it.
+ */
+export type IrcReviveHandler = (peer: IrcPeer, message: IrcMessage) => boolean | void | Promise<boolean | void>;
 
 export interface IrcSendRequest<T = unknown> {
   from: string;
   to: string;
   text?: string;
   data?: T;
+  /** Wait for a revived recipient to acknowledge before the send resolves. */
   await?: boolean;
-  awaitAck?: boolean;
 }
 
 export interface IrcPublishRequest<T = unknown> {
@@ -34,7 +45,6 @@ export interface IrcPublishRequest<T = unknown> {
   text?: string;
   data?: T;
   await?: boolean;
-  awaitAck?: boolean;
 }
 
 export interface IrcWaitRequest {
@@ -44,9 +54,13 @@ export interface IrcWaitRequest {
   signal?: AbortSignal;
 }
 
+export interface IrcSubscription {
+  peer: string;
+  channel: string;
+}
+
 export interface IrcBusConstructorOptions extends IrcBusOptions {
   onRevive?: IrcReviveHandler;
-  revive?: IrcReviveHandler;
 }
 
 export class IrcValidationError extends TypeError {
@@ -66,13 +80,26 @@ type PendingWait = {
   signal?: AbortSignal;
   onAbort?: () => void;
 };
+
+/**
+ * The process-global mailbox bus (LYRA.md §9).
+ *
+ * Every method here is called by something. There used to be roughly forty percent more
+ * surface than that — `setPeerState`/`updateState`/`transition` for one setter, `list`/
+ * `peersList`/`getPeers` for one reader, positional overloads beside every request object,
+ * and a `parseSubscription` that *guessed* whether it had been handed `(peer, channel)` or
+ * `(channel, peer)` by checking which one happened to be registered. Guessing produced a
+ * silently wrong subscription whenever neither name was known yet, which is exactly when a
+ * child is being wired up. The class now says what it does: one spelling per operation, and
+ * arguments in a declared order.
+ */
 export class IrcBus {
   private readonly peers = new Map<string, IrcPeer>();
   private readonly inboxes = new Map<string, IrcMessage[]>();
   private readonly channels = new Map<string, Set<string>>();
   private readonly channelInboxes = new Map<string, IrcMessage[]>();
   private readonly reviveHandlers = new Map<string, IrcReviveHandler>();
-  private readonly reviveAcks = new Map<string, Promise<void>[]>();
+  private readonly sinks = new Map<string, IrcPeerSink>();
   private readonly deliveries: IrcDelivery[] = [];
   private readonly waits = new Set<PendingWait>();
   private readonly now: () => number;
@@ -85,23 +112,20 @@ export class IrcBus {
   constructor(options: IrcBusConstructorOptions = {}) {
     this.now = options.now ?? (() => Date.now());
     this.configuredMaxWaitMs = this.normalizeMaxWait(options.maxWaitMs);
-    this.defaultRevive = options.onRevive ?? options.revive;
+    this.defaultRevive = options.onRevive;
     this.makeId = options.id ?? (() => {
       this.sequence += 1;
       return `irc-${this.sequence.toString(36).padStart(8, "0")}`;
     });
   }
-  register(name: string, options?: IrcRegisterOptions): IrcPeer;
-  register(peer: IrcPeer, options?: IrcRegisterOptions): IrcPeer;
-  register(nameOrPeer: string | IrcPeer, options: IrcRegisterOptions = {}): IrcPeer {
-    const name = typeof nameOrPeer === "string" ? nameOrPeer : nameOrPeer.name;
-    const source = typeof nameOrPeer === "string" ? undefined : nameOrPeer;
+
+  register(name: string, options: IrcRegisterOptions = {}): IrcPeer {
     this.assertName(name, "peer name");
     if (this.peers.has(name)) throw new IrcValidationError(`Peer already registered: ${name}`);
-    const state = options.state ?? source?.state ?? "running";
+    const state = options.state ?? "running";
     this.assertState(state);
-    const peer: IrcPeer = { name, state, createdAt: source?.createdAt ?? this.now() };
-    const label = options.label ?? source?.label;
+    const peer: IrcPeer = { name, state, createdAt: this.now() };
+    const label = options.label;
     if (label !== undefined) {
       if (typeof label !== "string" || label.trim() !== label) {
         throw new IrcValidationError("Peer label must be a trimmed string");
@@ -110,13 +134,9 @@ export class IrcBus {
     }
     this.peers.set(name, peer);
     this.inboxes.set(name, []);
-    const handler = options.onRevive ?? options.revive ?? this.defaultRevive;
+    const handler = options.onRevive ?? this.defaultRevive;
     if (handler) this.reviveHandlers.set(name, handler);
     return this.clonePeer(peer);
-  }
-
-  setPeerState(name: string, state: IrcPeerState): IrcPeer {
-    return this.setState(name, state);
   }
 
   unregister(name: string): boolean {
@@ -124,6 +144,7 @@ export class IrcBus {
     if (!this.peers.delete(name)) return false;
     this.inboxes.delete(name);
     this.reviveHandlers.delete(name);
+    this.sinks.delete(name);
     for (const [channel, members] of this.channels) {
       members.delete(name);
       if (members.size === 0) this.channels.delete(channel);
@@ -138,17 +159,9 @@ export class IrcBus {
     this.assertName(name, "peer name");
     this.assertState(state);
     const peer = this.peers.get(name);
-    if (!peer) throw new IrcValidationError(`Unknown peer: ${name}`);
+    if (!peer) throw new IrcValidationError(this.unknownPeer(name));
     peer.state = state;
     return this.clonePeer(peer);
-  }
-
-  updateState(name: string, state: IrcPeerState): IrcPeer {
-    return this.setState(name, state);
-  }
-
-  transition(name: string, state: IrcPeerState): IrcPeer {
-    return this.setState(name, state);
   }
 
   getPeer(name: string): IrcPeer | undefined {
@@ -161,37 +174,40 @@ export class IrcBus {
     return [...this.peers.values()].map((peer) => this.clonePeer(peer));
   }
 
-  peersList(): IrcPeer[] {
-    return this.list();
+  /**
+   * Attach a live agent's turn to its mailbox.
+   *
+   * `deliver` is what makes a message to a *running* agent an aside folded into its next
+   * turn rather than an item in a queue it has to remember to read; `consume` is what stops
+   * a message the agent already read through `hub` from arriving a second time as one. The
+   * returned function detaches, and a peer with nothing attached simply queues as before.
+   */
+  attach(peer: string, sink: IrcPeerSink): () => void {
+    this.assertName(peer, "peer name");
+    if (!sink || typeof sink !== "object") throw new IrcValidationError("A peer sink must be an object with deliver and/or consume");
+    this.sinks.set(peer, sink);
+    return () => { if (this.sinks.get(peer) === sink) this.sinks.delete(peer); };
   }
 
-  subscribe(peer: string, channel: string): boolean;
-  subscribe(request: { peer: string; channel: string }): boolean;
-  subscribe(first: string | { peer: string; channel: string }, second?: string): boolean {
-    const parsed = typeof first === "string" ? this.parseSubscription(first, second) : first;
-    this.assertName(parsed.peer, "peer name");
-    this.assertChannel(parsed.channel);
-    if (!this.peers.has(parsed.peer)) throw new IrcValidationError(`Unknown peer: ${parsed.peer}`);
-    let members = this.channels.get(parsed.channel);
+  subscribe(subscription: IrcSubscription): boolean {
+    const { peer, channel } = this.assertSubscription(subscription);
+    if (!this.peers.has(peer)) throw new IrcValidationError(this.unknownPeer(peer));
+    let members = this.channels.get(channel);
     if (!members) {
       members = new Set();
-      this.channels.set(parsed.channel, members);
+      this.channels.set(channel, members);
     }
     const before = members.size;
-    members.add(parsed.peer);
+    members.add(peer);
     return members.size !== before;
   }
 
-  unsubscribe(peer: string, channel: string): boolean;
-  unsubscribe(request: { peer: string; channel: string }): boolean;
-  unsubscribe(first: string | { peer: string; channel: string }, second?: string): boolean {
-    const parsed = typeof first === "string" ? this.parseSubscription(first, second) : first;
-    this.assertName(parsed.peer, "peer name");
-    this.assertChannel(parsed.channel);
-    const members = this.channels.get(parsed.channel);
+  unsubscribe(subscription: IrcSubscription): boolean {
+    const { peer, channel } = this.assertSubscription(subscription);
+    const members = this.channels.get(channel);
     if (!members) return false;
-    const removed = members.delete(parsed.peer);
-    if (members.size === 0) this.channels.delete(parsed.channel);
+    const removed = members.delete(peer);
+    if (members.size === 0) this.channels.delete(channel);
     return removed;
   }
 
@@ -202,45 +218,21 @@ export class IrcBus {
 
   send<T = unknown>(request: IrcSendRequest<T> & { await: true }): Promise<IrcDelivery>;
   send<T = unknown>(request: IrcSendRequest<T>): IrcDelivery;
-  send<T = unknown>(from: string, to: string, text?: string, data?: T, options?: { await: true; awaitAck?: boolean }): Promise<IrcDelivery>;
-  send<T = unknown>(from: string, to: string, text?: string, data?: T, options?: { await?: boolean; awaitAck?: boolean }): IrcDelivery;
-  send<T = unknown>(
-    requestOrFrom: IrcSendRequest<T> | string,
-    to?: string,
-    text?: string,
-    data?: T,
-    options: { await?: boolean; awaitAck?: boolean } = {},
-  ): IrcDelivery | Promise<IrcDelivery> {
-    const request: IrcSendRequest<T> = typeof requestOrFrom === "string"
-      ? { from: requestOrFrom, to: to as string, ...(text === undefined ? {} : { text }), ...(data === undefined ? {} : { data }), ...(options.await === undefined ? {} : { await: options.await }), ...(options.awaitAck === undefined ? {} : { awaitAck: options.awaitAck }) }
-      : requestOrFrom;
-    this.assertName(request.from, "sender name");
+  send<T = unknown>(request: IrcSendRequest<T>): IrcDelivery | Promise<IrcDelivery> {
+    this.assertName(request?.from, "sender name");
     this.assertName(request.to, "recipient name");
     this.assertContent(request.text, request.data);
     this.assertRegisteredSender(request.from);
     const message = this.makeMessage({ from: request.from, to: request.to, text: request.text, data: request.data });
-    const delivery = this.deliver(message, request.to);
-    return request.await || request.awaitAck ? this.awaitDelivery(message.id, delivery) : delivery;
-  }
-
-  async sendAsync<T = unknown>(request: IrcSendRequest<T>): Promise<IrcDelivery> {
-    return await this.send(request as IrcSendRequest<T> & { await: true });
+    const acks: Promise<void>[] = [];
+    const delivery = this.deliver(message, request.to, acks);
+    return request.await === true ? Promise.all(acks).then(() => this.cloneDelivery(delivery)) : delivery;
   }
 
   publish<T = unknown>(request: IrcPublishRequest<T> & { await: true }): Promise<IrcDelivery[]>;
   publish<T = unknown>(request: IrcPublishRequest<T>): IrcDelivery[];
-  publish<T = unknown>(channel: string, data?: T, from?: string, options?: { text?: string; await: true; awaitAck?: boolean }): Promise<IrcDelivery[]>;
-  publish<T = unknown>(channel: string, data?: T, from?: string, options?: { text?: string; await?: boolean; awaitAck?: boolean }): IrcDelivery[];
-  publish<T = unknown>(
-    requestOrChannel: IrcPublishRequest<T> | string,
-    data?: T,
-    from?: string,
-    options: { text?: string; await?: boolean; awaitAck?: boolean } = {},
-  ): IrcDelivery[] | Promise<IrcDelivery[]> {
-    const request: IrcPublishRequest<T> = typeof requestOrChannel === "string"
-      ? { channel: requestOrChannel, ...(data === undefined ? {} : { data }), ...(from === undefined ? {} : { from }), ...(options.text === undefined ? {} : { text: options.text }), ...(options.await === undefined ? {} : { await: options.await }), ...(options.awaitAck === undefined ? {} : { awaitAck: options.awaitAck }) }
-      : requestOrChannel;
-    this.assertChannel(request.channel);
+  publish<T = unknown>(request: IrcPublishRequest<T>): IrcDelivery[] | Promise<IrcDelivery[]> {
+    this.assertChannel(request?.channel);
     if (request.from !== undefined) {
       this.assertName(request.from, "sender name");
       this.assertRegisteredSender(request.from);
@@ -248,42 +240,34 @@ export class IrcBus {
     this.assertContent(request.text, request.data);
     const message = this.makeMessage({ from: request.from ?? "system", channel: request.channel, text: request.text, data: request.data });
     const recipients = [...(this.channels.get(request.channel) ?? [])];
-    const output = recipients.map((peer) => this.deliver(message, peer));
+    const acks: Promise<void>[] = [];
+    const output = recipients.map((peer) => this.deliver(message, peer, acks));
     this.enqueueChannel(message);
     this.notify("channel", request.channel);
     const result = output.map((delivery) => this.cloneDelivery(delivery));
-    return request.await || request.awaitAck ? this.awaitDeliveries(message.id, result) : result;
+    return request.await === true ? Promise.all(acks).then(() => result.map((delivery) => this.cloneDelivery(delivery))) : result;
   }
 
   /** Drain a peer's non-interrupting inbox. */
-  inbox(peer: string): IrcMessage[];
-  inbox(): Record<string, IrcMessage[]>;
-  inbox(peer?: string): IrcMessage[] | Record<string, IrcMessage[]> {
-    if (peer !== undefined) {
-      this.assertName(peer, "peer name");
-      const queue = this.inboxes.get(peer);
-      if (!queue) return [];
-      this.inboxes.set(peer, []);
-      return queue.map((message) => this.cloneMessage(message));
-    }
-    const result: Record<string, IrcMessage[]> = {};
-    for (const name of this.peers.keys()) result[name] = this.inbox(name) as IrcMessage[];
-    return result;
+  inbox(peer: string): IrcMessage[] {
+    this.assertName(peer, "peer name");
+    const queue = this.inboxes.get(peer);
+    if (!queue) return [];
+    this.inboxes.set(peer, []);
+    const drained = queue.map((message) => this.cloneMessage(message));
+    this.reportConsumed(peer, drained);
+    return drained;
   }
 
+  /** Look without draining, for a client rendering "N waiting". */
   peekInbox(peer: string): IrcMessage[] {
     this.assertName(peer, "peer name");
     return (this.inboxes.get(peer) ?? []).map((message) => this.cloneMessage(message));
   }
 
-  wait(request: IrcWaitRequest): Promise<IrcMessage[]>;
-  wait(peer: string, timeoutMs?: number): Promise<IrcMessage[]>;
-  wait(peerOrRequest: string | IrcWaitRequest, timeoutMs?: number): Promise<IrcMessage[]> {
-    const request: IrcWaitRequest = typeof peerOrRequest === "string"
-      ? { peer: peerOrRequest, ...(timeoutMs === undefined ? {} : { timeoutMs }) }
-      : peerOrRequest;
-    const selected = request.peer !== undefined ? { kind: "peer" as const, target: request.peer } :
-      request.channel !== undefined ? { kind: "channel" as const, target: request.channel } : undefined;
+  wait(request: IrcWaitRequest): Promise<IrcMessage[]> {
+    const selected = request?.peer !== undefined ? { kind: "peer" as const, target: request.peer } :
+      request?.channel !== undefined ? { kind: "channel" as const, target: request.channel } : undefined;
     if (!selected) throw new IrcValidationError("Wait requires a peer or channel");
     if (selected.kind === "peer") this.assertName(selected.target, "peer name");
     else this.assertChannel(selected.target);
@@ -300,24 +284,9 @@ export class IrcBus {
     return promise;
   }
 
-  waitPeer(peer: string, timeoutMs?: number): Promise<IrcMessage[]> {
-    return timeoutMs === undefined ? this.wait({ peer }) : this.wait({ peer, timeoutMs });
-  }
-
-  waitChannel(channel: string, timeoutMs?: number): Promise<IrcMessage[]> {
-    return timeoutMs === undefined ? this.wait({ channel }) : this.wait({ channel, timeoutMs });
-  }
-
+  /** The delivery log, for tests and audit surfaces. */
   getDeliveries(): IrcDelivery[] {
     return this.deliveries.map((delivery) => this.cloneDelivery(delivery));
-  }
-
-  get deliveryLog(): IrcDelivery[] {
-    return this.getDeliveries();
-  }
-
-  clearDeliveries(): void {
-    this.deliveries.length = 0;
   }
 
   close(): void {
@@ -328,60 +297,62 @@ export class IrcBus {
     this.channels.clear();
     this.channelInboxes.clear();
     this.reviveHandlers.clear();
+    this.sinks.clear();
   }
 
-  private deliver(message: IrcMessage, recipient: string): IrcDelivery {
+  /**
+   * Hand one message to one peer. `acks` collects the revive acknowledgements a caller that
+   * asked to `await` will wait on — held by the caller rather than in a map keyed by message
+   * id, because only the caller knows when it is done with them and a map nobody drains is
+   * a leak that grows with every revival.
+   */
+  private deliver(message: IrcMessage, recipient: string, acks: Promise<void>[]): IrcDelivery {
     const peer = this.peers.get(recipient);
     const delivery: IrcDelivery = { message: this.cloneMessage(message), delivered: false };
     if (!peer || peer.state === "completed" || peer.state === "failed" || this.closed) {
       this.deliveries.push(this.cloneDelivery(delivery));
       return delivery;
     }
+    let consumedByRevival = false;
     if (peer.state === "parked") {
-      peer.state = "running";
-      peer.revivedAt = this.now();
-      delivery.revived = true;
+      // The handler decides, and only then is the peer's state changed. Marking it running
+      // first meant a *declined* revival — a child that has aged out of retention — left a
+      // dead agent reported as running forever, holding a message nobody would ever drain,
+      // while the sender was told `revived: true`.
       const revive = this.reviveHandlers.get(recipient);
-      if (revive) {
+      let outcome: boolean | void | Promise<boolean | void> = undefined;
+      let revived = revive === undefined;
+      if (revive !== undefined) {
         try {
-          const ack = Promise.resolve(revive(this.clonePeer(peer), this.cloneMessage(message))).catch(() => undefined);
-          const pending = this.reviveAcks.get(message.id) ?? [];
-          pending.push(ack);
-          this.reviveAcks.set(message.id, pending);
-        } catch { /* delivery remains actionable */ }
+          outcome = revive(this.clonePeer({ ...peer, state: "running", revivedAt: this.now() }), this.cloneMessage(message));
+          // A promise cannot be judged here, so it is trusted: an asynchronous handler that
+          // was asked to revive is treated as having accepted, and the message is still
+          // queued because only a synchronous `true` proves it became the next prompt.
+          revived = outcome !== false;
+          consumedByRevival = outcome === true;
+        } catch { revived = false; }
+      }
+      if (revived) {
+        peer.state = "running";
+        peer.revivedAt = this.now();
+        delivery.revived = true;
+        if (outcome !== undefined && typeof outcome === "object") acks.push(Promise.resolve(outcome).then(() => undefined, () => undefined));
+      }
+    } else {
+      // A live peer is told now, so the message lands as an aside in its running turn rather
+      // than sitting in a queue nobody drains. It stays in the inbox too: `hub inbox` is
+      // still the explicit read, and `consume` is what stops it arriving twice.
+      const sink = this.sinks.get(recipient);
+      if (sink?.deliver) {
+        try { sink.deliver(this.cloneMessage(message)); } catch { /* an aside that cannot be folded is still in the inbox */ }
       }
     }
     const queue = this.inboxes.get(recipient);
-    if (queue) queue.push(this.cloneMessage(message));
+    if (queue && !consumedByRevival) queue.push(this.cloneMessage(message));
     delivery.delivered = Boolean(queue);
     this.deliveries.push(this.cloneDelivery(delivery));
-    this.notify("peer", recipient);
+    if (!consumedByRevival) this.notify("peer", recipient);
     return delivery;
-  }
-  get logs(): IrcDelivery[] {
-    return this.getDeliveries();
-  }
-
-  getPeers(): IrcPeer[] {
-    return this.list();
-  }
-
-  getInbox(peer: string): IrcMessage[] {
-    return this.inbox(peer) as IrcMessage[];
-  }
-
-  private awaitDelivery(id: string, delivery: IrcDelivery): Promise<IrcDelivery> {
-    return Promise.all(this.reviveAcks.get(id) ?? []).then(() => {
-      this.reviveAcks.delete(id);
-      return this.cloneDelivery(delivery);
-    });
-  }
-
-  private awaitDeliveries(id: string, deliveries: IrcDelivery[]): Promise<IrcDelivery[]> {
-    return Promise.all(this.reviveAcks.get(id) ?? []).then(() => {
-      this.reviveAcks.delete(id);
-      return deliveries.map((delivery) => this.cloneDelivery(delivery));
-    });
   }
 
   private makeMessage<T>(parts: { from: string; to?: string | undefined; channel?: string | undefined; text?: string | undefined; data?: T | undefined }): IrcMessage<T> {
@@ -405,13 +376,23 @@ export class IrcBus {
     const queue = this.inboxes.get(peer);
     if (!queue) return [];
     this.inboxes.set(peer, []);
-    return queue.map((message) => this.cloneMessage(message));
+    const drained = queue.map((message) => this.cloneMessage(message));
+    this.reportConsumed(peer, drained);
+    return drained;
   }
 
   private drainChannel(channel: string): IrcMessage[] {
     const queue = this.channelInboxes.get(channel) ?? [];
     this.channelInboxes.set(channel, []);
     return queue.map((message) => this.cloneMessage(message));
+  }
+
+  /** Tell an attached turn which messages it has now read for itself. */
+  private reportConsumed(peer: string, messages: readonly IrcMessage[]): void {
+    if (messages.length === 0) return;
+    const sink = this.sinks.get(peer);
+    if (!sink?.consume) return;
+    try { sink.consume(messages.map((message) => message.id)); } catch { /* bookkeeping never fails a read */ }
   }
 
   private notify(kind: "peer" | "channel", target: string): void {
@@ -429,34 +410,54 @@ export class IrcBus {
     wait.resolve(messages.map((message) => this.cloneMessage(message)));
   }
 
-  private parseSubscription(first: string, second?: string): { peer: string; channel: string } {
-    if (second === undefined) throw new IrcValidationError("Subscription requires a peer and channel");
-    // Support both subscribe(peer, channel) and subscribe(channel, peer); the
-    // existing registered name disambiguates the ergonomic channel-first form.
-    if (this.peers.has(first)) return { peer: first, channel: second };
-    if (this.peers.has(second)) return { peer: second, channel: first };
-    return { peer: first, channel: second };
+  private assertSubscription(subscription: unknown): IrcSubscription {
+    if (!subscription || typeof subscription !== "object") throw new IrcValidationError("A subscription is { peer, channel }");
+    const { peer, channel } = subscription as Partial<IrcSubscription>;
+    this.assertName(peer, "peer name");
+    this.assertChannel(channel);
+    return { peer, channel };
   }
 
   private assertRegisteredSender(name: string): void {
-    if (!this.peers.has(name)) throw new IrcValidationError(`Unknown sender peer: ${name}`);
+    if (!this.peers.has(name)) throw new IrcValidationError(this.unknownPeer(name, "sender"));
+  }
+
+  /**
+   * Why a name is not on the bus, and what puts it there.
+   *
+   * The old message was `Unknown sender peer: root`, which named neither how peers come to
+   * exist nor which ones do. Registration is never something a model does by hand: the main
+   * session registers itself at boot and every child registers at `spawn`, so an unknown
+   * name is nearly always a typo or a child that has already been pruned.
+   */
+  private unknownPeer(name: string, role = "peer"): string {
+    const known = [...this.peers.keys()];
+    return `No ${role} named ${JSON.stringify(name)} is on the bus. ` +
+      (known.length === 0 ? "No peer is registered." : `Registered peers: ${known.join(", ")}.`) +
+      ` Peers are not created by hand: the main session registers itself, and each child registers under the "peer" name its spawn result reports. Use that name, or spawn the agent you meant to talk to.`;
   }
 
   private assertName(value: unknown, label: string): asserts value is string {
     if (typeof value !== "string" || value.length === 0 || value.trim() !== value || value.length > MAX_NAME_LENGTH || /[\u0000-\u001f\u007f\s]/u.test(value)) {
-      throw new IrcValidationError(`Invalid ${label}`);
+      throw new IrcValidationError(`Invalid ${label}: a peer name is a single word without spaces, such as the "peer" a spawn result reports.`);
     }
   }
 
   private assertChannel(value: unknown): asserts value is string {
     if (typeof value !== "string" || value.length === 0 || value.trim() !== value || value.length > MAX_NAME_LENGTH || /[\u0000-\u001f\u007f\s]/u.test(value)) {
-      throw new IrcValidationError("Invalid channel");
+      throw new IrcValidationError("Invalid channel: a channel is a single word without spaces, such as \"agents\".");
     }
   }
 
   private assertContent(text: unknown, data: unknown): void {
     if (text !== undefined && (typeof text !== "string" || text.length === 0 || text.length > MAX_TEXT_LENGTH)) {
       throw new IrcValidationError("Invalid message text");
+    }
+    // Refused rather than delivered empty: an empty message is reported as delivered, folds
+    // into nothing at the recipient, and tells whoever sent it exactly as much as not
+    // sending would have.
+    if (text === undefined && data === undefined) {
+      throw new IrcValidationError("A message needs text or data; an empty one carries nothing to act on.");
     }
     if (data !== undefined) this.cloneData(data);
   }

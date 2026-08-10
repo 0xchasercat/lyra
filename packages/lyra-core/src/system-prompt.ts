@@ -17,9 +17,15 @@ export function buildSystemPrompt(environment: SystemPromptEnvironment): string 
   const lines = [
     "# Lyra",
     `OS: ${environment.os} ${environment.arch}`,
-    `Workspace: ${environment.workspace}`,
-    `Origin: ${environment.origin}`,
+    `Directory: ${environment.workspace}`,
+    // Only when it differs — which is exactly the isolated-child case. A main session runs
+    // in the project directory itself, and printing the same path twice under two names
+    // taught the model there was a second place to look for the files it was editing.
+    ...(environment.origin === environment.workspace ? [] : [`Project: ${environment.origin}`]),
     `Session: ${environment.session}`,
+    // One line, because the state directory is now inside the tree the model can see and
+    // the undo history is a capability it can use rather than a background service.
+    "State: .lyra/ holds Lyra's own state — do not read or edit it. Every state-changing tool call is checkpointed there; git op:\"list\"/\"diff\"/\"restore\" inspects and rewinds.",
     "",
     "## Tools",
     ...capabilityLines(environment.tools),

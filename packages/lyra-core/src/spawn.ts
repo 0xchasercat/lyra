@@ -1,12 +1,16 @@
 import type {
+  SpawnActivity,
   SpawnExecutor,
   SpawnExecutorContext,
   SpawnHandle,
+  SpawnLifecycleEvent,
   SpawnOutputSchema,
   SpawnRequest,
   SpawnResult,
+  SpawnState,
+  SpawnStatus,
+  SpawnIntegration,
   SpawnManagerOptions,
-  SpawnSchemaMode,
 } from "./spawn-types.ts";
 
 export const DEFAULT_SPAWN_MAX_DEPTH = 2;
@@ -16,10 +20,15 @@ export const DEFAULT_SPAWN_WAIT_MS = 60 * 60 * 1000;
 export const MAX_SPAWN_WAIT_MS = DEFAULT_SPAWN_WAIT_MS;
 /** Terminal jobs stay listable, but only the most recent ones: a session runs for hours. */
 export const DEFAULT_SPAWN_RETAINED_JOBS = 64;
+/** How much of a child's output the manager keeps for a status answer. Enough to diagnose, not enough to matter. */
+export const SPAWN_PARTIAL_OUTPUT_BUDGET = 2_000;
+/** The bus channel every child's lifecycle is published on. `hub wait channel:"agents"` is the parent's event stream. */
+export const SPAWN_LIFECYCLE_CHANNEL = "agents";
 
 /** A parent execution context used when a running child creates another child. */
 export interface SpawnParentContext {
   id?: string;
+  peer?: string;
   parentId?: string;
   depth?: number;
   workspace?: string;
@@ -97,6 +106,19 @@ export class SpawnTimeoutError extends SpawnError {
   }
 }
 
+/**
+ * The job itself ran out of time — not an observer's wait.
+ *
+ * Distinct from [`SpawnCancelledError`] because the two ask for different next moves: a
+ * deadline says "give it less to do or more time", a cancel says "you stopped it".
+ */
+export class SpawnDeadlineError extends SpawnError {
+  constructor(id: string, message = `Spawn ${id} exceeded its deadline`) {
+    super("timed_out", message, { id });
+    this.name = "SpawnDeadlineError";
+  }
+}
+
 export class SpawnClosedError extends SpawnError {
   constructor() {
     super("closed", "Spawn manager is closed");
@@ -106,23 +128,56 @@ export class SpawnClosedError extends SpawnError {
 
 interface SpawnJob {
   readonly id: string;
-  readonly request: SpawnRequest;
+  peer: string;
+  request: SpawnRequest;
   readonly parent?: SpawnParentContext;
   readonly depth: number;
   readonly model?: string;
   readonly tools: readonly string[];
+  readonly isolated: boolean;
+  readonly writeScope?: readonly string[];
   workspace: string;
   workspaceReady: boolean;
   workspaceName?: string;
   workspaceReleased: boolean;
+  /** Set by a revival whose isolated workspace was archived when the child last finished. */
+  resumeWorkspace?: boolean;
   readonly handle: SpawnHandle;
-  readonly controller: AbortController;
-  readonly completion: Promise<SpawnResult>;
+  controller: AbortController;
+  completion: Promise<SpawnResult>;
   resolve: (result: SpawnResult) => void;
   reject: (error: unknown) => void;
   terminal: boolean;
   queued: boolean;
-  running: boolean;
+  /**
+   * The epochs of this job's executions that are still on the wire.
+   *
+   * A set rather than a boolean because a revival can start a second run while the first is
+   * still unwinding: two executors really are running, the concurrency accounting has to say
+   * so, and each has to give back its own slot exactly once.
+   */
+  runs: Set<number>;
+  /**
+   * Which run of this job is current.
+   *
+   * A revival re-uses the job — same id, same peer, same transcript — so the executor of a
+   * *previous* run can still be unwinding when the next one starts. Without this, that stale
+   * run reads the replacement's abort signal (not aborted), sails past its own guard, and
+   * settles the revived run with the old run's output.
+   */
+  epoch: number;
+  // Observability. Every one of these is measured from what the executor reported.
+  queuedAt: number;
+  lastActivity: number;
+  toolCalls: number;
+  currentTool?: string;
+  filesModified: Set<string>;
+  scopeViolations: string[];
+  partialOutput: string;
+  revivals: number;
+  error?: string;
+  result?: SpawnResult;
+  integration?: SpawnIntegration;
 }
 
 interface SchemaValidationResult {
@@ -130,10 +185,16 @@ interface SchemaValidationResult {
 }
 
 const VALID_SCHEMA_TYPES = new Set(["object", "array", "string", "number", "integer", "boolean", "null"]);
+/** Bus names have no whitespace and no control characters; a label becomes one or is refused one. */
+const PEER_SAFE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$/;
 
 /**
  * Owns child execution and its lifecycle. The executor is intentionally injected: this
- * class only schedules and validates work, and never invents a fallback implementation.
+ * class only schedules, observes, and validates work, and never invents a fallback
+ * implementation.
+ *
+ * It knows nothing about the bus. It names peers and announces transitions through
+ * [`onLifecycle`]; whoever owns the bus does the registering, parking and publishing.
  */
 export class SpawnManager {
   readonly maxDepth: number;
@@ -146,12 +207,16 @@ export class SpawnManager {
 
   private readonly executor: SpawnExecutor;
   private readonly createWorkspace: SpawnManagerOptions["createWorkspace"];
+  private readonly describeWorkspace: SpawnManagerOptions["describeWorkspace"];
   private readonly resolveNamedWorkspace: SpawnManagerOptions["resolveWorkspace"];
   private readonly releaseWorkspace: SpawnManagerOptions["releaseWorkspace"];
+  private readonly reservedPeers: SpawnManagerOptions["reservedPeers"];
   private readonly now: () => number;
   private readonly jobs = new Map<string, SpawnJob>();
+  private readonly peers = new Map<string, string>();
   private readonly queue: SpawnJob[] = [];
   private readonly reportListeners = new Set<(report: SpawnReport) => void>();
+  private readonly lifecycleListeners = new Set<(event: SpawnLifecycleEvent) => void>();
   private readonly executions = new Set<Promise<void>>();
   private nextId = 1;
   private active = 0;
@@ -171,17 +236,10 @@ export class SpawnManager {
     assertNonNegativeInteger(maxDepth, "maxDepth");
     assertPositiveInteger(maxConcurrent, "maxConcurrent");
     if (options.availableTools !== undefined) assertTools(options.availableTools, "availableTools");
-    if (options.createWorkspace !== undefined && typeof options.createWorkspace !== "function") {
-      throw new SpawnRequestError("createWorkspace must be a function when provided");
-    }
-    if (options.resolveWorkspace !== undefined && typeof options.resolveWorkspace !== "function") {
-      throw new SpawnRequestError("resolveWorkspace must be a function when provided");
-    }
-    if (options.releaseWorkspace !== undefined && typeof options.releaseWorkspace !== "function") {
-      throw new SpawnRequestError("releaseWorkspace must be a function when provided");
-    }
-    if (options.now !== undefined && typeof options.now !== "function") {
-      throw new SpawnRequestError("now must be a function when provided");
+    for (const name of ["createWorkspace", "describeWorkspace", "resolveWorkspace", "releaseWorkspace", "now", "reservedPeers"] as const) {
+      if (options[name] !== undefined && typeof options[name] !== "function") {
+        throw new SpawnRequestError(`${name} must be a function when provided`);
+      }
     }
 
     this.maxDepth = maxDepth;
@@ -191,8 +249,10 @@ export class SpawnManager {
     this.availableTools = options.availableTools;
     this.executor = options.executor;
     this.createWorkspace = options.createWorkspace;
+    this.describeWorkspace = options.describeWorkspace;
     this.resolveNamedWorkspace = options.resolveWorkspace;
     this.releaseWorkspace = options.releaseWorkspace;
+    this.reservedPeers = options.reservedPeers;
     this.now = options.now ?? Date.now;
   }
 
@@ -213,6 +273,16 @@ export class SpawnManager {
     if (typeof listener !== "function") throw new SpawnRequestError("report listener must be a function");
     this.reportListeners.add(listener);
     return () => this.reportListeners.delete(listener);
+  }
+
+  /**
+   * Listen to lifecycle transitions. This is the whole of the manager's outward-facing
+   * story about children: who exists, what state each is in, and when that changed.
+   */
+  onLifecycle(listener: (event: SpawnLifecycleEvent) => void): () => void {
+    if (typeof listener !== "function") throw new SpawnRequestError("lifecycle listener must be a function");
+    this.lifecycleListeners.add(listener);
+    return () => this.lifecycleListeners.delete(listener);
   }
 
   spawn(request: SpawnRequest & { blocking: true }, parent?: SpawnParentContext): Promise<SpawnDiagnosticResult>;
@@ -246,13 +316,14 @@ export class SpawnManager {
     if (typeof id !== "string" || id.length === 0) {
       return Promise.reject(new SpawnRequestError("A spawn id or handle is required to wait"));
     }
-    const job = this.jobs.get(id);
-    if (!job) return Promise.reject(new SpawnRequestError(`Unknown spawn id: ${id}`, { id }));
+    const job = this.resolveJob(id);
+    if (!job) return Promise.reject(this.unknownJob(id));
     if (!Number.isFinite(timeoutMs) || timeoutMs < 0) {
       return Promise.reject(new SpawnRequestError("wait timeout must be a non-negative finite number"));
     }
     const boundedTimeout = Math.min(timeoutMs, MAX_SPAWN_WAIT_MS);
     if (job.terminal) return job.completion;
+    const completion = job.completion;
 
     return new Promise<SpawnResult>((resolve, reject) => {
       let timer: ReturnType<typeof setTimeout> | undefined;
@@ -269,7 +340,7 @@ export class SpawnManager {
         }));
       }, boundedTimeout);
       unrefTimer(timer);
-      void job.completion.then(
+      void completion.then(
         (result) => {
           cleanup();
           resolve(result);
@@ -285,16 +356,21 @@ export class SpawnManager {
   cancel(handleOrId: SpawnHandle | string, reason?: SpawnError): boolean {
     const id = typeof handleOrId === "string" ? handleOrId : handleOrId?.id;
     if (typeof id !== "string") return false;
-    const job = this.jobs.get(id);
+    const job = this.resolveJob(id);
     if (!job || job.terminal) return false;
-    const error = reason ?? new SpawnCancelledError(id);
+    const error = reason ?? new SpawnCancelledError(job.id);
+    const state: SpawnState = error instanceof SpawnDeadlineError || error instanceof SpawnTimeoutError ? "timed_out" : "cancelled";
     job.terminal = true;
     job.queued = false;
-    job.handle.status = "cancelled";
+    job.error = error.message;
+    job.handle.status = state;
+    job.lastActivity = this.now();
     job.controller.abort(error);
     job.reject(error);
     this.pump();
     this.pruneTerminalJobs();
+    // Last, for the same reason `finish` announces last: a listener may revive this job.
+    this.emitLifecycle(job, state === "timed_out" ? "timed_out" : "cancelled");
     return true;
   }
 
@@ -310,11 +386,141 @@ export class SpawnManager {
   }
 
   getHandle(id: string): SpawnHandle | undefined {
-    return this.jobs.get(id)?.handle;
+    return this.resolveJob(id)?.handle;
   }
 
   list(): SpawnHandle[] {
-    return [...this.jobs.values()].map((job) => job.handle);
+    return [...this.jobs.values()].map((job) => ({ ...job.handle }));
+  }
+
+  /** Every child, in the detail a parent needs to decide what to do next. */
+  statusList(): SpawnStatus[] {
+    return [...this.jobs.values()].map((job) => this.describe(job));
+  }
+
+  /**
+   * One child's live state, by spawn id or by peer name.
+   *
+   * Accepting the peer name is not an alias so much as the point: the parent knows children
+   * by the name it talks to them with, and being told "unknown spawn id: reviewer" for a
+   * child called `reviewer` is exactly the dead end this pass exists to remove.
+   */
+  status(idOrPeer: string): SpawnStatus | undefined {
+    const job = this.resolveJob(idOrPeer);
+    return job === undefined ? undefined : this.describe(job);
+  }
+
+  /** The spawn id a peer name belongs to, or undefined when nothing answers to it. */
+  idForPeer(peer: string): string | undefined {
+    return typeof peer === "string" ? this.peers.get(peer) : undefined;
+  }
+
+  /**
+   * Re-run a terminal child with `message` as its next prompt (LYRA.md §9: "a message
+   * revives a parked agent. The only resume primitive").
+   *
+   * The id, the peer name, the workspace and the transcript all survive — a revived child is
+   * the same child, one turn later, not a new one wearing its name. A child that is still
+   * running needs no revival and is left alone; the message reaches it as an aside instead.
+   */
+  revive(idOrPeer: string, message: string): SpawnHandle | undefined {
+    if (this.closed) throw new SpawnClosedError();
+    assertNonEmptyString(message, "message");
+    const job = this.resolveJob(idOrPeer);
+    if (!job) return undefined;
+    if (!job.terminal) return undefined;
+    const { promise, resolve, reject } = withResolvers<SpawnResult>();
+    void promise.catch(() => undefined);
+    job.completion = promise;
+    job.resolve = resolve;
+    job.reject = reject;
+    job.controller = new AbortController();
+    job.terminal = false;
+    job.queued = true;
+    job.epoch += 1;
+    job.revivals += 1;
+    // A job cancelled while still queued is left in the queue by `cancel` (it is skipped as
+    // terminal when pumped). Pushing it again would put the same job in twice.
+    for (let index = this.queue.indexOf(job); index >= 0; index = this.queue.indexOf(job)) this.queue.splice(index, 1);
+    job.request = { ...job.request, task: message, resume: true };
+    delete job.error;
+    delete job.result;
+    delete job.currentTool;
+    job.partialOutput = "";
+    job.lastActivity = this.now();
+    // A revived isolated child re-enters the workspace it already has; it is never
+    // re-created, because a new clone would revive the agent without its work. If that
+    // workspace was archived when the child finished — the normal case — it is resumed by
+    // name first, which is why this is a resolve rather than a flag flip.
+    if (job.workspaceName !== undefined) {
+      if (job.workspaceReleased) { job.workspaceReleased = false; job.workspaceReady = false; job.resumeWorkspace = true; }
+      else job.workspaceReady = true;
+    }
+    this.transition(job, "queued", "revived");
+    this.queue.push(job);
+    this.pump();
+    return { ...job.handle };
+  }
+
+  private describe(job: SpawnJob): SpawnStatus {
+    const partial = job.partialOutput.trim();
+    return {
+      id: job.id,
+      peer: job.peer,
+      status: job.handle.status,
+      ...(job.request.label === undefined ? {} : { label: job.request.label }),
+      workspace: job.workspace,
+      ...(job.workspaceName === undefined ? {} : { workspaceName: job.workspaceName }),
+      isolated: job.isolated,
+      ...(job.model === undefined ? {} : { model: job.model }),
+      depth: job.depth,
+      ...(job.parent?.id === undefined ? {} : { parentId: job.parent.id }),
+      queuedAt: job.queuedAt,
+      startedAt: job.handle.startedAt,
+      lastActivity: job.lastActivity,
+      elapsedMs: Math.max(0, this.now() - job.handle.startedAt),
+      toolCalls: job.toolCalls,
+      ...(job.currentTool === undefined ? {} : { currentTool: job.currentTool }),
+      filesModified: [...job.filesModified],
+      ...(job.writeScope === undefined ? {} : { writeScope: [...job.writeScope] }),
+      ...(job.scopeViolations.length === 0 ? {} : { scopeViolations: [...job.scopeViolations] }),
+      ...(partial.length === 0 ? {} : { partialOutput: partial }),
+      ...(job.revivals === 0 ? {} : { revivals: job.revivals }),
+      ...(job.error === undefined ? {} : { error: job.error }),
+      resultAvailable: job.result !== undefined,
+      ...(job.integration === undefined ? {} : { integration: job.integration }),
+    };
+  }
+
+  /** A job by spawn id, or by the bus name it answers to. */
+  private resolveJob(reference: string): SpawnJob | undefined {
+    if (typeof reference !== "string" || reference.length === 0) return undefined;
+    const direct = this.jobs.get(reference);
+    if (direct !== undefined) return direct;
+    const id = this.peers.get(reference);
+    return id === undefined ? undefined : this.jobs.get(id);
+  }
+
+  /**
+   * The error a bad reference gets: what exists, not just what does not.
+   *
+   * A retained job ages out (see [`pruneTerminalJobs`]), so "unknown" genuinely can mean
+   * "finished a long time ago" — and a parent told only "unknown spawn id" would reasonably
+   * conclude the child never existed.
+   */
+  private unknownJob(reference: string): SpawnRequestError {
+    const live = [...this.jobs.values()].filter((job) => !job.terminal).map((job) => `${job.id} (${job.peer}, ${job.handle.status})`);
+    const known = [...this.jobs.values()].map((job) => job.id);
+    return new SpawnRequestError(
+      `No spawn answers to ${JSON.stringify(reference)}. ` +
+      (live.length > 0
+        ? `Running now: ${live.join(", ")}.`
+        : known.length > 0
+          ? `Nothing is running; the most recent finished children are ${known.slice(-5).join(", ")}.`
+          : `No child has been spawned in this session yet.`) +
+      ` Only the ${this.retainedJobs} most recent finished children stay collectable.`,
+      { reference, known },
+    );
   }
 
   private enqueue(request: SpawnRequest, parent?: SpawnParentContext): SpawnJob {
@@ -322,28 +528,28 @@ export class SpawnManager {
     const normalized = this.validateRequest(request, parent);
     const id = `spawn-${this.nextId++}`;
     const createdAt = this.now();
+    const peer = this.namePeer(id, request.label);
     const handle: SpawnHandle = {
       id,
+      peer,
       workspace: normalized.workspace,
       ...(request.label === undefined ? {} : { label: request.label }),
       status: "queued",
       startedAt: createdAt,
     };
-    let resolve!: (result: SpawnResult) => void;
-    let reject!: (error: unknown) => void;
-    const completion = new Promise<SpawnResult>((resolvePromise, rejectPromise) => {
-      resolve = resolvePromise;
-      reject = rejectPromise;
-    });
+    const { promise: completion, resolve, reject } = withResolvers<SpawnResult>();
     // Non-blocking jobs are allowed to fail without creating an unhandled rejection.
     void completion.catch(() => undefined);
     const job: SpawnJob = {
       id,
+      peer,
       request: normalized.request,
       ...(parent === undefined ? {} : { parent }),
       depth: normalized.depth,
       ...(normalized.model === undefined ? {} : { model: normalized.model }),
       tools: normalized.tools,
+      isolated: normalized.isolated,
+      ...(normalized.writeScope === undefined ? {} : { writeScope: normalized.writeScope }),
       workspace: normalized.workspace,
       workspaceReady: normalized.workspaceReady,
       workspaceReleased: false,
@@ -354,12 +560,48 @@ export class SpawnManager {
       reject,
       terminal: false,
       queued: true,
-      running: false,
+      runs: new Set<number>(),
+      epoch: 0,
+      queuedAt: createdAt,
+      lastActivity: createdAt,
+      toolCalls: 0,
+      filesModified: new Set<string>(),
+      scopeViolations: [],
+      partialOutput: "",
+      revivals: 0,
     };
     this.jobs.set(id, job);
+    this.peers.set(peer, id);
     this.queue.push(job);
+    // Announced before it is pumped, so a listener that registers the peer has done so
+    // before the child's own first tool call can address anybody.
+    this.emitLifecycle(job, "spawned");
     this.pump();
     return job;
+  }
+
+  /**
+   * The name this child answers to on the bus.
+   *
+   * A label if it is usable and free, the spawn id otherwise. Legibility is the point
+   * (LYRA.md §9: names are never UUIDs), but a *stable* name matters more: it is minted here,
+   * before anything can be addressed to it, and never changes — not when an isolated
+   * workspace is created later, and not across a revival. A label that collides with a live
+   * peer falls back rather than shadowing it, because two children answering to one name is
+   * a lost message, not a naming inconvenience.
+   */
+  private namePeer(id: string, label?: string): string {
+    if (typeof label !== "string") return id;
+    const candidate = label.trim().replace(/\s+/g, "-");
+    if (!PEER_SAFE.test(candidate)) return id;
+    // `spawn-7` as a *label* would collide with the id spawn-7 is eventually minted for,
+    // and `resolveJob` checks ids before peer names — one name, two children.
+    if (/^spawn-\d+$/.test(candidate)) return id;
+    if (this.peers.has(candidate) || this.jobs.has(candidate)) return id;
+    if (this.reservedPeers !== undefined) {
+      try { for (const taken of this.reservedPeers()) if (taken === candidate) return id; } catch { return id; }
+    }
+    return candidate;
   }
 
   private pump(): void {
@@ -368,9 +610,14 @@ export class SpawnManager {
       if (!job) return;
       job.queued = false;
       if (job.terminal) continue;
-      job.running = true;
-      job.handle.status = "running";
+      job.runs.add(job.epoch);
       job.handle.startedAt = this.now();
+      job.lastActivity = job.handle.startedAt;
+      // Status only, deliberately unannounced. `starting` is the sliver between being
+      // dequeued and the executor being called — usually microseconds, and never long
+      // enough to be worth a row on the `agents` channel. A parent that catches a child
+      // there (an isolated clone being made) reads it from `spawn status`.
+      job.handle.status = "starting";
       this.active += 1;
       const execution = this.execute(job);
       this.executions.add(execution);
@@ -379,28 +626,52 @@ export class SpawnManager {
   }
 
   private async execute(job: SpawnJob): Promise<void> {
+    // Captured, not read live: everything below belongs to *this* run of the job, and a
+    // revival that starts another one must not be able to steal its result or its slot.
+    const epoch = job.epoch;
+    const controller = job.controller;
     try {
       if (!job.workspaceReady) await this.resolveWorkspace(job);
-      if (job.controller.signal.aborted) throw job.controller.signal.reason ?? new SpawnCancelledError(job.id);
+      if (controller.signal.aborted) throw controller.signal.reason ?? new SpawnCancelledError(job.id);
       const executionRequest = withResolvedRequest(job.request, job.model, job.tools, job.workspace);
-      const context = makeExecutorContext(job, this.emitReport.bind(this));
+      const context = this.makeExecutorContext(job, epoch, controller);
+      this.transition(job, "running", "started");
       const output = await this.executor(executionRequest, context);
-      if (job.controller.signal.aborted) throw job.controller.signal.reason ?? new SpawnCancelledError(job.id);
-      const result = this.makeResult(job, output);
+      if (controller.signal.aborted) throw controller.signal.reason ?? new SpawnCancelledError(job.id);
+      // Measured before the workspace is released, and never allowed to fail the job: the
+      // work is done either way, and a summary that could not be taken is reported as such.
+      const integration = await this.describeIsolatedWorkspace(job, controller);
+      if (integration !== undefined) job.integration = integration;
+      const result = this.makeResult(job, output, integration);
       const contractResult = this.applyOutputContract(job.request, result);
       // Work that succeeded stays successful: a failed release is a warning, not a verdict.
       const releaseError = await this.releaseIsolatedWorkspace(job);
-      this.finish(job, releaseError === undefined ? contractResult : withWarning(contractResult, releaseWarning(job, releaseError)));
+      this.finish(job, epoch, releaseError === undefined ? contractResult : withWarning(contractResult, releaseWarning(job, releaseError)));
     } catch (error: unknown) {
       // The original failure is the reportable one; cleanup trouble must never shadow it.
       const releaseError = await this.releaseIsolatedWorkspace(job);
       if (releaseError !== undefined) this.emitReport(job.id, releaseWarning(job, releaseError));
-      this.fail(job, error);
+      this.fail(job, epoch, error);
     }
   }
 
   private async resolveWorkspace(job: SpawnJob): Promise<void> {
     if (job.workspaceReady) return;
+    if (job.resumeWorkspace === true) {
+      const name = job.workspaceName!;
+      if (this.resolveNamedWorkspace === undefined) {
+        throw new SpawnRequestError(`Spawn ${job.id} cannot be revived: its workspace ${name} was archived and this manager cannot resume one. Spawn a new child against that workspace instead.`, { id: job.id, workspace: name });
+      }
+      const resumed = await this.resolveNamedWorkspace(name);
+      if (!resumed || typeof resumed.path !== "string" || resumed.path.trim().length === 0) {
+        throw new SpawnRequestError(`Spawn ${job.id} cannot be revived: its workspace ${name} could not be resumed.`, { id: job.id, workspace: name });
+      }
+      job.workspace = resumed.path;
+      job.handle.workspace = resumed.path;
+      job.workspaceReady = true;
+      job.resumeWorkspace = false;
+      return;
+    }
     const requested = job.request.workspace;
     const created = job.request.isolated
       ? await this.createWorkspace?.(requested, job.request.task, job.controller.signal)
@@ -426,14 +697,39 @@ export class SpawnManager {
     return undefined;
   }
 
-  private makeResult(job: SpawnJob, output: unknown): SpawnResult {
+  private makeResult(job: SpawnJob, output: unknown, integration?: SpawnIntegration): SpawnResult {
     return {
       id: job.id,
+      peer: job.peer,
       output,
       workspace: job.workspace,
       ...(job.model === undefined ? {} : { model: job.model }),
       ...(job.request.label === undefined ? {} : { label: job.request.label }),
+      ...(integration === undefined ? {} : { integration }),
+      // A shared-tree child wrote into the parent's own directory, so what it touched is the
+      // parent's next question. An isolated child answers that with `integration` instead.
+      ...(job.filesModified.size === 0 ? {} : { filesModified: [...job.filesModified] }),
+      ...(job.writeScope === undefined ? {} : { scope: { paths: [...job.writeScope], violations: [...job.scopeViolations] } }),
     };
+  }
+
+  /**
+   * The completion payload for an isolated child: where its work is and how to merge it.
+   *
+   * Only isolated children get one. A child sharing the parent's directory has already
+   * written into the tree the parent is looking at — there is nothing to fetch, and saying
+   * otherwise would invite a merge of a workspace into itself.
+   */
+  private async describeIsolatedWorkspace(job: SpawnJob, controller: AbortController): Promise<SpawnIntegration | undefined> {
+    if (job.workspaceName === undefined || this.describeWorkspace === undefined) return undefined;
+    try { return await this.describeWorkspace({ name: job.workspaceName, path: job.workspace }, controller.signal); }
+    catch (error) {
+      return {
+        workspace: job.workspaceName, path: job.workspace, commits: 0, uncommitted: [], truncated: false,
+        unavailable: error instanceof Error ? error.message : String(error),
+        hint: [`git fetch ${job.workspace} HEAD:refs/lyra/agents/${job.workspaceName}`],
+      };
+    }
   }
 
   private applyOutputContract(request: SpawnRequest, result: SpawnResult): SpawnResult {
@@ -461,34 +757,47 @@ export class SpawnManager {
     } as SpawnDiagnosticResult;
   }
 
-  private finish(job: SpawnJob, result: SpawnResult): void {
-    if (job.terminal) {
-      this.release(job);
+  private finish(job: SpawnJob, epoch: number, result: SpawnResult): void {
+    if (job.epoch !== epoch || job.terminal) {
+      this.release(job, epoch);
       return;
     }
     job.terminal = true;
+    job.result = result;
+    delete job.currentTool;
     job.handle.status = "completed";
+    // Settled *before* the transition is announced, because announcing it can come straight
+    // back in: a listener parks the peer on the bus, and a message delivered to a parked
+    // peer revives this very job — synchronously, from inside this call. Resolving first
+    // means the waiter that asked for this run gets this run's result either way.
     job.resolve(result);
-    this.release(job);
+    this.release(job, epoch);
+    this.emitLifecycle(job, "completed");
   }
 
-  private fail(job: SpawnJob, error: unknown): void {
-    if (job.terminal) {
-      this.release(job);
+  private fail(job: SpawnJob, epoch: number, error: unknown): void {
+    if (job.epoch !== epoch || job.terminal) {
+      this.release(job, epoch);
       return;
     }
     job.terminal = true;
-    job.handle.status = "failed";
-    job.reject(normalizeExecutionError(job.id, error));
-    this.release(job);
+    const normalized = normalizeExecutionError(job.id, error);
+    job.error = normalized instanceof Error ? normalized.message : String(normalized);
+    delete job.currentTool;
+    const state: SpawnState = isDeadline(normalized) ? "timed_out" : "failed";
+    job.handle.status = state;
+    job.reject(normalized);
+    this.release(job, epoch);
+    this.emitLifecycle(job, state === "timed_out" ? "timed_out" : "failed");
   }
 
-  private release(job: SpawnJob): void {
-    if (!job.running && !this.jobs.has(job.id)) return;
-    if (job.running) {
-      job.running = false;
-      this.active = Math.max(0, this.active - 1);
-    }
+  /**
+   * Give back the concurrency slot this run held — exactly once, and only if it still holds
+   * one. A stale run that lost its job to a revival releases nothing: the slot it would
+   * have returned is the one the revived run is standing in.
+   */
+  private release(job: SpawnJob, epoch: number): void {
+    if (job.runs.delete(epoch)) this.active = Math.max(0, this.active - 1);
     this.pump();
     this.pruneTerminalJobs();
   }
@@ -505,8 +814,9 @@ export class SpawnManager {
     if (excess <= 0) return;
     for (const [id, job] of this.jobs) {
       if (excess <= 0) break;
-      if (!job.terminal || job.running) continue;
+      if (!job.terminal || job.runs.size > 0) continue;
       this.jobs.delete(id);
+      if (this.peers.get(job.peer) === id) this.peers.delete(job.peer);
       excess -= 1;
     }
   }
@@ -519,6 +829,7 @@ export class SpawnManager {
     workspace: string;
     isolated: boolean;
     workspaceReady: boolean;
+    writeScope?: readonly string[];
   } {
     if (!request || typeof request !== "object") throw new SpawnRequestError("spawn request is required");
     assertNonEmptyString(request.task, "task");
@@ -542,6 +853,13 @@ export class SpawnManager {
     if (request.depth !== undefined) assertNonNegativeInteger(request.depth, "depth");
     if (parent !== undefined) this.validateParent(parent);
     if (request.output_schema !== undefined) validateSchemaDefinition(request.output_schema);
+    let writeScope: readonly string[] | undefined;
+    if (request.writeScope !== undefined) {
+      assertTools(request.writeScope, "writeScope");
+      const cleaned = request.writeScope.map((entry) => entry.trim()).filter((entry) => entry.length > 0);
+      if (cleaned.length === 0) throw new SpawnRequestError("writeScope must name at least one path when provided", { field: "writeScope" });
+      writeScope = Object.freeze(cleaned);
+    }
 
     const parentDepth = parent?.depth ?? 0;
     const depth = request.depth ?? (parent === undefined ? 0 : parentDepth + 1);
@@ -567,7 +885,15 @@ export class SpawnManager {
         if (!allowed.has(tool)) throw new SpawnRequestError(`tool is not available: ${tool}`, { tool });
       }
     }
-    const isolated = request.isolated ?? (request.workspace === undefined && this.createWorkspace !== undefined);
+    // Isolation is the model's decision, and the default is to share.
+    //
+    // It used to be inferred: any spawn without an explicit workspace got its own clone
+    // whenever one could be made. That inverted the common case — most children are helping
+    // with the work in front of the parent, and giving each one a private copy meant their
+    // edits landed somewhere the parent could not see and had to be merged back. Sharing is
+    // now the default and the #TAG guard is the collision protection; `isolated: true` is
+    // for the swarm case, where children must not step on each other.
+    const isolated = request.isolated === true;
     if (isolated && this.createWorkspace === undefined) throw new SpawnRequestError("isolated spawn requires createWorkspace");
     if (!isolated && request.workspace !== undefined && this.resolveNamedWorkspace === undefined) throw new SpawnRequestError("named workspace spawn requires resolveWorkspace");
     const workspace = request.workspace ?? parent?.workspace ?? this.defaultWorkspace;
@@ -580,6 +906,7 @@ export class SpawnManager {
       workspace,
       isolated,
       workspaceReady: !isolated && request.workspace === undefined,
+      ...(writeScope === undefined ? {} : { writeScope }),
     };
 
   }
@@ -587,11 +914,93 @@ export class SpawnManager {
   private validateParent(parent: SpawnParentContext): void {
     if (!parent || typeof parent !== "object") throw new SpawnRequestError("parent context must be an object");
     if (parent.id !== undefined) assertNonEmptyString(parent.id, "parent.id");
+    if (parent.peer !== undefined) assertNonEmptyString(parent.peer, "parent.peer");
     if (parent.parentId !== undefined) assertNonEmptyString(parent.parentId, "parent.parentId");
     if (parent.workspace !== undefined) assertNonEmptyString(parent.workspace, "parent.workspace");
     if (parent.model !== undefined) assertNonEmptyString(parent.model, "parent.model");
     if (parent.depth !== undefined) assertNonNegativeInteger(parent.depth, "parent.depth");
     if (parent.tools !== undefined) assertTools(parent.tools, "parent.tools");
+  }
+
+  private makeExecutorContext(job: SpawnJob, epoch: number, controller: AbortController): SpawnExecutorContext {
+    const parentId = job.parent?.id ?? job.parent?.parentId;
+    return {
+      id: job.id,
+      peer: job.peer,
+      signal: controller.signal,
+      ...(parentId === undefined ? {} : { parentId }),
+      depth: job.depth,
+      workspace: job.workspace,
+      ...(job.workspaceName === undefined ? {} : { workspaceName: job.workspaceName }),
+      ...(job.model === undefined ? {} : { model: job.model }),
+      tools: job.tools,
+      ...(job.writeScope === undefined ? {} : { writeScope: job.writeScope }),
+      ...(job.request.resume === true ? { resume: true } : {}),
+      report: (message: string) => this.emitReport(job.id, message),
+      // A superseded run's reports would otherwise overwrite the live run's picture.
+      activity: (update: SpawnActivity) => { if (job.epoch === epoch) this.recordActivity(job, update); },
+    };
+  }
+
+  /**
+   * Fold one observed step into the job's live picture.
+   *
+   * Deliberately total: a malformed report from an executor is dropped rather than allowed
+   * to throw into the middle of a child's turn.
+   */
+  private recordActivity(job: SpawnJob, update: SpawnActivity): void {
+    if (job.terminal || update === null || typeof update !== "object") return;
+    job.lastActivity = this.now();
+    if (update.toolCall === true) job.toolCalls += 1;
+    if (update.state === "awaiting_tool") {
+      if (typeof update.tool === "string" && update.tool.length > 0) job.currentTool = update.tool;
+      if (job.handle.status === "running" || job.handle.status === "starting") job.handle.status = "awaiting_tool";
+    } else if (update.state === "running") {
+      delete job.currentTool;
+      if (job.handle.status === "awaiting_tool" || job.handle.status === "starting") job.handle.status = "running";
+    }
+    if (Array.isArray(update.filesModified)) {
+      for (const path of update.filesModified) if (typeof path === "string" && path.length > 0) job.filesModified.add(path);
+    }
+    if (typeof update.scopeViolation === "string" && update.scopeViolation.length > 0 && !job.scopeViolations.includes(update.scopeViolation)) {
+      job.scopeViolations.push(update.scopeViolation);
+    }
+    if (typeof update.text === "string" && update.text.length > 0) {
+      const combined = job.partialOutput + update.text;
+      job.partialOutput = combined.length > SPAWN_PARTIAL_OUTPUT_BUDGET ? combined.slice(combined.length - SPAWN_PARTIAL_OUTPUT_BUDGET) : combined;
+    }
+  }
+
+  private transition(job: SpawnJob, state: SpawnState, type?: SpawnLifecycleEvent["type"]): void {
+    job.handle.status = state;
+    job.lastActivity = this.now();
+    this.emitLifecycle(job, type ?? lifecycleTypeFor(state));
+  }
+
+  private emitLifecycle(job: SpawnJob, type: SpawnLifecycleEvent["type"]): void {
+    if (this.lifecycleListeners.size === 0) return;
+    const event: SpawnLifecycleEvent = {
+      type,
+      id: job.id,
+      peer: job.peer,
+      ...(job.request.label === undefined ? {} : { label: job.request.label }),
+      status: job.handle.status,
+      depth: job.depth,
+      ...(job.parent?.id === undefined ? {} : { parentId: job.parent.id }),
+      workspace: job.workspace,
+      ...(job.model === undefined ? {} : { model: job.model }),
+      toolCalls: job.toolCalls,
+      filesModified: job.filesModified.size,
+      at: this.now(),
+      ...(job.error === undefined ? {} : { error: job.error }),
+    };
+    for (const listener of this.lifecycleListeners) {
+      try {
+        listener(event);
+      } catch {
+        // Watching a child must never be able to fail the child.
+      }
+    }
   }
 
   private emitReport(id: string, message: string): void {
@@ -607,18 +1016,32 @@ export class SpawnManager {
   }
 }
 
-function makeExecutorContext(job: SpawnJob, emit: (id: string, message: string) => void): SpawnExecutorContext {
-  const parentId = job.parent?.id ?? job.parent?.parentId;
-  return {
-    id: job.workspaceName ?? job.id,
-    signal: job.controller.signal,
-    ...(parentId === undefined ? {} : { parentId }),
-    depth: job.depth,
-    workspace: job.workspace,
-    ...(job.model === undefined ? {} : { model: job.model }),
-    tools: job.tools,
-    report: (message: string) => emit(job.id, message),
-  };
+/** The transition an entered state announces. Only these seven are broadcast. */
+function lifecycleTypeFor(state: SpawnState): SpawnLifecycleEvent["type"] {
+  switch (state) {
+    case "completed": return "completed";
+    case "failed": return "failed";
+    case "cancelled": return "cancelled";
+    case "timed_out": return "timed_out";
+    case "running": return "started";
+    default: return "spawned";
+  }
+}
+
+function isDeadline(error: unknown): boolean {
+  if (error instanceof SpawnDeadlineError || error instanceof SpawnTimeoutError) return true;
+  if (error instanceof SpawnError && error.code === "timed_out") return true;
+  return error instanceof DOMException && error.name === "TimeoutError";
+}
+
+function withResolvers<T>(): { promise: Promise<T>; resolve: (value: T) => void; reject: (error: unknown) => void } {
+  let resolve!: (value: T) => void;
+  let reject!: (error: unknown) => void;
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
 }
 
 function withResolvedRequest(request: SpawnRequest, model: string | undefined, tools: readonly string[], workspace: string): SpawnRequest {
@@ -641,6 +1064,7 @@ function withWarning(result: SpawnResult, warning: string): SpawnDiagnosticResul
 
 function normalizeExecutionError(id: string, error: unknown): unknown {
   if (error instanceof SpawnError) return error;
+  if (error instanceof DOMException && error.name === "TimeoutError") return new SpawnDeadlineError(id, `Spawn ${id} exceeded its deadline: ${error.message}`);
   if (error instanceof Error) return new SpawnError("execution_failed", `Spawn ${id} failed: ${error.message}`, { id, cause: error.message });
   return new SpawnError("execution_failed", `Spawn ${id} failed: ${String(error)}`, { id, cause: String(error) });
 }
