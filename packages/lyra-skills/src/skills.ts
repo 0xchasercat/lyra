@@ -1,6 +1,7 @@
 import { lstat, readFile, readdir, realpath } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import type { ToolDefinition } from "@lyra/provider";
 import type { ToolExecutionContext, ToolExecutionResult } from "@lyra/core";
 
@@ -69,13 +70,33 @@ export class SkillRegistry {
   }
 }
 
-export const SKILL_DEFINITION: ToolDefinition = Object.freeze({ name: "skill", description: "Load one discovered skill's full instructions only when needed.", inputSchema: Object.freeze({ type: "object", additionalProperties: false, properties: { name: { type: "string", pattern: NAME.source } }, required: ["name"] }) });
+export const SKILL_DEFINITION: ToolDefinition = Object.freeze({ name: "skill", description: "Load one discovered skill's full instructions only when needed.", inputSchema: Object.freeze({ type: "object", additionalProperties: false, properties: { name: { type: "string", pattern: NAME.source, description: "Name of a skill from the discovered index." }, skill: { type: "string", pattern: NAME.source, description: "Alias for name." } }, required: ["name"] }) });
+
+/**
+ * Claude Code's skill tool spells the name `skill` and carries an `args` field; the first
+ * folds onto `name`, the second has no honest meaning here (§16 — a skill is instructions,
+ * not a command). Written out rather than imported so this module stays loadable on its own.
+ */
+export function normalizeSkillArgs(input: unknown): unknown | string {
+  if (input === null || typeof input !== "object" || Array.isArray(input)) return input;
+  const args = input as Record<string, unknown>;
+  if (args.args !== undefined) return "args is not supported: a skill is lazily-loaded instructions, not a command. Call skill with just the name and follow the instructions it returns.";
+  if (args.skill === undefined) return args;
+  if (args.name !== undefined && args.name !== args.skill) return "skill received both name and skill with different values; skill is only an alias for name, so send name alone.";
+  const output: Record<string, unknown> = { ...args, name: args.skill };
+  delete output.skill;
+  return output;
+}
+
 export class SkillTool {
   readonly definition = SKILL_DEFINITION;
   constructor(private readonly registry: SkillRegistry) {}
-  async execute(input: unknown, _context: ToolExecutionContext): Promise<ToolExecutionResult> {
+  normalize(args: unknown): unknown | string { return normalizeSkillArgs(args); }
+  async execute(raw: unknown, _context: ToolExecutionContext): Promise<ToolExecutionResult> {
     try {
-      if (!input || typeof input !== "object" || !("name" in input) || typeof input.name !== "string") return { content: "skill requires a discovered skill name.", isError: true };
+      const input = normalizeSkillArgs(raw);
+      if (typeof input === "string") return { content: input, isError: true };
+      if (!input || typeof input !== "object" || !("name" in input) || typeof input.name !== "string") return { content: "skill requires name: a skill name from the discovered index.", isError: true };
       const result = await this.registry.load(input.name);
       return { content: `# ${result.record.name}\n\n${result.body}` };
     } catch (error) {
@@ -97,4 +118,3 @@ function parseSkill(raw: string, path: string): { name: string; description: str
 function validateName(value: string): void { if (!NAME.test(value)) throw new SkillError("invalid_name", `Skill name ${JSON.stringify(value)} is invalid.`); }
 function within(root: string, child: string): boolean { const parent = resolve(root); const target = resolve(child); return target === parent || target.startsWith(`${parent}/`); }
 function message(error: unknown): string { return error instanceof Error ? error.message : String(error); }
-function fileURLToPath(url: URL): string { return new URL(url).pathname; }

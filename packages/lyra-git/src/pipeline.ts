@@ -9,10 +9,13 @@ import type {
   GitMode,
   GitPipelineOptions,
   PreviewRecord,
+  RollbackOptions,
   SnapshotRecord,
 } from "./types.ts";
 
 const NAME = /^[a-z0-9][a-z0-9-]{0,79}$/;
+/** Previews, snapshots, and apply staging all live under .lyra; git must never read them as origin changes. */
+const EXCLUDE_ENTRY = "/.lyra/";
 interface GitOutput { stdout: string; stderr: string; exitCode: number; }
 
 export class GitPipeline {
@@ -43,6 +46,7 @@ export class GitPipeline {
     const root = await this.git(this.origin, ["rev-parse", "--show-toplevel"], signal);
     const [reportedRoot, configuredRoot] = await Promise.all([realpath(root.stdout.trim()).catch(() => resolve(root.stdout.trim())), realpath(this.origin).catch(() => this.origin)]);
     if (root.exitCode !== 0 || reportedRoot !== configuredRoot) throw new Error(`Git pipeline origin ${this.origin} must be a repository root: ${root.stderr.trim() || root.stdout.trim()}.`);
+    await this.excludeLyra(signal);
   }
 
   async setMode(mode: GitMode): Promise<GitMode> {
@@ -146,17 +150,22 @@ export class GitPipeline {
     return record;
   }
 
-  async rollback(name?: string, signal?: AbortSignal): Promise<SnapshotRecord> {
+  async rollback(name?: string, signal?: AbortSignal, options: RollbackOptions = {}): Promise<SnapshotRecord> {
     await this.initialize(signal);
     const snapshots = await this.listSnapshots();
     const selected = name === undefined ? snapshots.at(-1) : snapshots.find((snapshot) => snapshot.name === name);
     if (!selected) throw new Error(name === undefined ? "No snapshots are available to roll back." : `Snapshot ${name} does not exist.`);
+    if (options.force !== true) await this.requireCleanOrigin("rollback", signal);
     const reference = `refs/lyra/rollback/${selected.name}-${randomBytes(2).toString("hex")}`;
     const fetched = await this.git(this.origin, ["fetch", selected.path, `HEAD:${reference}`], signal);
     if (fetched.exitCode !== 0) throw new Error(`Could not fetch snapshot ${selected.name}: ${fetched.stderr.trim()}.`);
+    const restore = selected.branch === "HEAD"
+      ? await this.git(this.origin, ["checkout", "--force", "--detach", reference], signal)
+      : await this.git(this.origin, ["checkout", "--force", "-B", selected.branch, reference], signal);
+    if (restore.exitCode !== 0) throw new Error(`Could not restore branch ${selected.branch} from snapshot ${selected.name}: ${restore.stderr.trim()}.`);
     const reset = await this.git(this.origin, ["reset", "--hard", reference], signal);
     if (reset.exitCode !== 0) throw new Error(`Could not restore snapshot ${selected.name}: ${reset.stderr.trim()}.`);
-    this.log("rollback", true, `restored ${selected.name} at ${selected.head}`);
+    this.log("rollback", true, `restored ${selected.name} at ${selected.head} on ${selected.branch}`);
     return selected;
   }
 
@@ -178,6 +187,17 @@ export class GitPipeline {
   }
   private previewMetadata(name: string): string { return join(this.previewRoot, `${name}.preview.json`); }
   private snapshotMetadata(name: string): string { return join(this.snapshotRoot, `${name}.snapshot.json`); }
+  /** Hide .lyra through .git/info/exclude so the origin stays clean without rewriting a user-visible .gitignore. */
+  private async excludeLyra(signal?: AbortSignal): Promise<void> {
+    const gitDir = await this.git(this.origin, ["rev-parse", "--absolute-git-dir"], signal);
+    const directory = gitDir.stdout.trim();
+    if (gitDir.exitCode !== 0 || directory.length === 0) throw new Error(`Cannot locate the git directory for ${this.origin}: ${gitDir.stderr.trim() || `git exited ${gitDir.exitCode}`}.`);
+    const file = join(directory, "info", "exclude");
+    const existing = await readFile(file, "utf8").catch(() => "");
+    if (existing.split(/\r?\n/).some((line) => line.trim() === EXCLUDE_ENTRY)) return;
+    await mkdir(join(directory, "info"), { recursive: true });
+    await writeFile(file, `${existing.length === 0 || existing.endsWith("\n") ? existing : `${existing}\n`}${EXCLUDE_ENTRY}\n`);
+  }
   private async requireCleanOrigin(operation: string, signal?: AbortSignal): Promise<void> {
     const status = await this.git(this.origin, ["status", "--porcelain"], signal);
     if (status.exitCode !== 0) throw new Error(`Cannot inspect origin before ${operation}: ${status.stderr.trim()}.`);

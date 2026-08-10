@@ -21,7 +21,6 @@ async function repoFixture() {
   const origin = join(root, "origin");
   await Bun.$`mkdir -p ${origin}`;
   await git(origin, ["init", "-q", "-b", "main"]);
-  await writeFile(join(origin, ".gitignore"), ".lyra/\n");
   await writeFile(join(origin, "base.txt"), "base\n");
   await git(origin, ["add", "."]);
   await git(origin, ["commit", "-q", "-m", "base"]);
@@ -58,6 +57,44 @@ describe("transactional git pipeline", () => {
       expect(await readFile(join(origin, "base.txt"), "utf8")).toBe("base\n");
       expect(activities.some((event) => event.operation === "apply" && event.destructive)).toBe(true);
       expect(activities.some((event) => event.operation === "rollback" && event.destructive)).toBe(true);
+    } finally { await rm(root, { recursive: true, force: true }); }
+  }, 30_000);
+
+  test("hides .lyra through .git/info/exclude instead of the repository .gitignore", async () => {
+    const { root, origin } = await repoFixture();
+    try {
+      const one = await workspace(root, origin, "quiet-otter", "one.txt", "one\n", "add one");
+      const pipeline = new GitPipeline({ origin, mode: "stage" });
+      await pipeline.preview([one], "exclude-preview");
+      expect(await readFile(join(origin, ".git", "info", "exclude"), "utf8")).toContain("/.lyra/");
+      await expect(readFile(join(origin, ".gitignore"), "utf8")).rejects.toThrow();
+      expect(await git(origin, ["status", "--porcelain"])).toBe("");
+      const applied = await pipeline.apply("exclude-preview");
+      expect(applied.ok).toBe(true);
+      expect(await readFile(join(origin, "one.txt"), "utf8")).toBe("one\n");
+      expect(await git(origin, ["status", "--porcelain"])).toBe("");
+    } finally { await rm(root, { recursive: true, force: true }); }
+  }, 30_000);
+
+  test("rollback refuses to destroy uncommitted origin work and restores the recorded branch", async () => {
+    const { root, origin } = await repoFixture();
+    try {
+      const one = await workspace(root, origin, "steady-heron", "one.txt", "one\n", "add one");
+      const pipeline = new GitPipeline({ origin, mode: "stage" });
+      await pipeline.preview([one], "rollback-preview");
+      const applied = await pipeline.apply("rollback-preview");
+      expect(applied.ok).toBe(true);
+      expect(applied.snapshot.branch).toBe("main");
+      await writeFile(join(origin, "base.txt"), "locally edited\n");
+      await expect(pipeline.rollback(applied.snapshot.name)).rejects.toThrow("tracked or untracked changes");
+      expect(await readFile(join(origin, "base.txt"), "utf8")).toBe("locally edited\n");
+      expect(await readFile(join(origin, "one.txt"), "utf8")).toBe("one\n");
+      await git(origin, ["checkout", "-q", "-b", "side"]);
+      await pipeline.rollback(applied.snapshot.name, undefined, { force: true });
+      expect(await git(origin, ["symbolic-ref", "--short", "HEAD"])).toBe("main");
+      expect(await git(origin, ["rev-parse", "HEAD"])).toBe(applied.snapshot.head);
+      expect(await readFile(join(origin, "base.txt"), "utf8")).toBe("base\n");
+      await expect(readFile(join(origin, "one.txt"), "utf8")).rejects.toThrow();
     } finally { await rm(root, { recursive: true, force: true }); }
   }, 30_000);
 

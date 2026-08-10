@@ -6,6 +6,8 @@ export interface GitConflict { files: string[]; workspace: AgentWorkspace; prior
 export interface ApplyResult { ok: boolean; preview: string; snapshot: SnapshotRecord; appliedHead?: string; conflicts?: GitConflict[]; message: string; }
 export interface GitActivity { operation: string; destructive: boolean; detail: string; createdAt: string; }
 export interface ConflictResolver { resolve(args: { repo: string; conflict: GitConflict; allWorkspaces: readonly AgentWorkspace[] }, signal?: AbortSignal): Promise<boolean>; }
+/** Rollback discards uncommitted origin work, so it refuses a dirty origin unless the caller says otherwise. */
+export interface RollbackOptions { force?: boolean; }
 export interface GitPipelineOptions {
   origin: string;
   mode?: GitMode;

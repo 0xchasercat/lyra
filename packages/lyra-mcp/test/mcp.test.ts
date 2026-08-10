@@ -5,8 +5,17 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { McpGateway, McpRegistry, McpStdioClient, DracoInstaller } from "../src/index.ts";
 const SERVER = `let buffer = ""; for await (const chunk of Bun.stdin.stream()) { buffer += new TextDecoder().decode(chunk); let index = buffer.indexOf("\\n"); while (index >= 0) { const line = buffer.slice(0, index); buffer = buffer.slice(index + 1); const message = JSON.parse(line); if (message.id === undefined) { index = buffer.indexOf("\\n"); continue; } let result; if (message.method === "initialize") result = { protocolVersion: "2025-11-25", capabilities: { tools: {} }, serverInfo: { name: "fake", version: "1" } }; else if (message.method === "tools/list") result = { tools: [{ name: "echo", description: "Echo values", inputSchema: { type: "object" } }] }; else if (message.method === "tools/call") result = { content: [{ type: "text", text: message.params.arguments.large ? "x".repeat(200000) : JSON.stringify(message.params.arguments) }] }; else if (message.method === "slow") { index = buffer.indexOf("\\n"); continue; } else result = {}; process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: message.id, result }) + "\\n"); index = buffer.indexOf("\\n"); } }`;
+// Opens with a server→client request that reuses id 1 — the id the client itself uses for initialize —
+// and echoes whatever the client answered back through tools/call.
+const SAMPLING_SERVER = `let buffer = ""; let answer = null; process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: 1, method: "sampling/createMessage", params: {} }) + "\\n"); for await (const chunk of Bun.stdin.stream()) { buffer += new TextDecoder().decode(chunk); let index = buffer.indexOf("\\n"); while (index >= 0) { const line = buffer.slice(0, index); buffer = buffer.slice(index + 1); index = buffer.indexOf("\\n"); const message = JSON.parse(line); if (message.method === undefined) { answer = message; continue; } if (message.id === undefined) continue; const result = message.method === "initialize" ? { protocolVersion: "2025-11-25", capabilities: {}, serverInfo: { name: "sampler", version: "1" } } : { content: [{ type: "text", text: JSON.stringify(answer) }] }; process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: message.id, result }) + "\\n"); } }`;
 
 function context() { return { signal: new AbortController().signal, sessionId: "mcp", workspace: ".", callId: "mcp-call" }; }
+async function fixture(source: string): Promise<{ root: string; script: string }> {
+  const root = await mkdtemp(join(tmpdir(), "lyra-mcp-"));
+  const script = join(root, "server.ts");
+  await writeFile(script, source);
+  return { root, script };
+}
 
 describe("MCP client and Draco installer", () => {
   test("speaks newline JSON-RPC, indexes tools, describes and calls", async () => {
@@ -40,8 +49,56 @@ describe("MCP client and Draco installer", () => {
       expect(artifact.length).toBeGreaterThan(128 * 1024);
       const client = await registry.client("fake");
       await expect(client.request("slow")).rejects.toMatchObject({ code: "timeout" });
+      // A fired deadline is one request's answer, not the end of the server for everyone else.
+      expect(client.closed).toBe(false);
+      expect((await gateway.execute({ op: "call", server: "fake", tool: "echo", args: { value: 4 } }, context())).content.toString()).toContain("value");
       await expect(gateway.execute({ op: "describe", server: "fake", tool: "missing" }, context())).resolves.toMatchObject({ isError: true });
     } finally { await registry.close(); await rm(root, { recursive: true, force: true }); }
+  });
+
+  test("cancelling one call leaves concurrent calls and the shared server alive", async () => {
+    const { root, script } = await fixture(SERVER);
+    const client = new McpStdioClient({ name: "fake", command: process.execPath, args: [script], cwd: root, timeoutMs: 200 });
+    try {
+      await client.initialize();
+      const controller = new AbortController();
+      const timing = client.request("slow");
+      const cancelled = client.request("slow", {}, controller.signal);
+      const concurrent = client.callTool("echo", { value: "alive" });
+      controller.abort(new Error("caller cancelled"));
+      await expect(cancelled).rejects.toThrow("caller cancelled");
+      expect(await concurrent).toMatchObject({ content: [{ type: "text" }] });
+      await expect(timing).rejects.toMatchObject({ code: "timeout" });
+      expect(client.closed).toBe(false);
+      expect(await client.callTool("echo", { value: "after" })).toMatchObject({ content: [{ type: "text" }] });
+    } finally { await client.close(); await rm(root, { recursive: true, force: true }); }
+  });
+
+  test("honors a configured timeout above the 60s default", async () => {
+    const { root, script } = await fixture(SERVER);
+    const client = new McpStdioClient({ name: "fake", command: process.execPath, args: [script], cwd: root, timeoutMs: 300_000 });
+    const delays: number[] = [];
+    const real = globalThis.setTimeout;
+    globalThis.setTimeout = ((handler: (...args: unknown[]) => void, delay?: number, ...rest: unknown[]) => { delays.push(delay ?? 0); return real(handler, delay, ...rest); }) as unknown as typeof globalThis.setTimeout;
+    let pending: Promise<unknown>;
+    try { pending = client.request("slow"); } finally { globalThis.setTimeout = real; }
+    void pending.catch(() => undefined);
+    try {
+      expect(delays).toContain(300_000);
+      expect(delays).not.toContain(60_000);
+    } finally { await client.close(); await rm(root, { recursive: true, force: true }); }
+    await expect(pending).rejects.toMatchObject({ code: "closed" });
+  });
+
+  test("answers unsupported server→client requests so the server fails fast", async () => {
+    const { root, script } = await fixture(SAMPLING_SERVER);
+    const client = new McpStdioClient({ name: "sampler", command: process.execPath, args: [script], cwd: root, timeoutMs: 2000 });
+    try {
+      expect(await client.initialize()).toMatchObject({ serverInfo: { name: "sampler" } });
+      const echoed = await client.callTool("echo", {});
+      const [first] = echoed.content as Array<{ text: string }>;
+      expect(JSON.parse(first!.text)).toMatchObject({ jsonrpc: "2.0", id: 1, error: { code: -32601 } });
+    } finally { await client.close(); await rm(root, { recursive: true, force: true }); }
   });
 
   test("Draco offers once, validates fetched installer, runs it, and registers draco mcp", async () => {

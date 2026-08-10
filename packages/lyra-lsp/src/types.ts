@@ -40,8 +40,13 @@ export interface LanguageServerClientOptions {
   command: string;
   args?: readonly string[];
   cwd: string;
+  /** Defaults to `cwd`; servers that index a project refuse to work without a root. */
   rootUri?: string;
   requestTimeoutMs?: number;
+  /** Ceiling for `requestTimeoutMs`. Defaults to the §3.4 LSP deadline of 20 seconds. */
+  maxRequestTimeoutMs?: number;
+  /** Size of the open-document working set held with the server. */
+  maxOpenDocuments?: number;
   spawn?: LspSpawn;
   onLog?: (line: string) => void;
 }

@@ -46,12 +46,19 @@ interface Pending {
 }
 
 export interface LspJsonRpcTransportOptions {
-  /** Default request deadline. Values are always capped at 20 seconds. */
+  /** Default request deadline. Values are always capped at `maxTimeoutMs`. */
   defaultTimeoutMs?: number;
+  /** Hard ceiling for every request on this transport. Defaults to the §3.4 LSP deadline of 20s. */
   maxTimeoutMs?: number;
+  /** Server-initiated notifications: $/progress, publishDiagnostics, logMessage, ... */
+  onNotification?: (method: string, params: unknown) => void;
 }
 
 const MAX_TIMEOUT_MS = 20_000;
+/** JSON-RPC's MethodNotFound. Server→client requests we do not implement get this. */
+export const LSP_METHOD_NOT_FOUND = -32601;
+/** Marks a server→client request this client deliberately does not implement. */
+const UNSUPPORTED = Symbol("lsp-unsupported-request");
 const textEncoder = new TextEncoder();
 
 function bytesFromChunk(chunk: Uint8Array | string): Uint8Array<ArrayBuffer> {
@@ -97,10 +104,47 @@ function parseContentLength(header: string): number {
   return length;
 }
 
+/**
+ * Minimal answers to the server→client requests real servers send unprompted.
+ *
+ * rust-analyzer and pyright open progress tokens, pull configuration and register
+ * capabilities during startup. Leaving any of them unanswered stalls indexing, and
+ * treating them as protocol violations tears down an otherwise healthy session.
+ */
+function serverRequestResult(method: string, params: unknown): unknown {
+  switch (method) {
+    case "window/workDoneProgress/create":
+    case "client/registerCapability":
+    case "client/unregisterCapability":
+    case "window/showMessageRequest":
+    case "workspace/workspaceFolders":
+    case "workspace/codeLens/refresh":
+    case "workspace/diagnostic/refresh":
+    case "workspace/inlayHint/refresh":
+    case "workspace/inlineValue/refresh":
+    case "workspace/semanticTokens/refresh":
+      return null;
+    case "workspace/configuration": {
+      // One entry per requested section; null means "this client configures nothing".
+      const items = params !== null && typeof params === "object" ? (params as { items?: unknown }).items : undefined;
+      return Array.isArray(items) ? items.map(() => null) : [];
+    }
+    // This client never applies server-driven edits or navigation on its own.
+    case "workspace/applyEdit":
+      return { applied: false };
+    case "window/showDocument":
+      return { success: false };
+    default:
+      return UNSUPPORTED;
+  }
+}
+
 /** JSON-RPC 2.0 transport using LSP's byte-counted stdio framing. */
 export class LspJsonRpcTransport implements LspTransport {
   private readonly pending = new Map<JsonRpcId, Pending>();
   private readonly defaultTimeoutMs: number;
+  private readonly maxTimeoutMs: number;
+  private readonly onNotification: ((method: string, params: unknown) => void) | undefined;
   private input = new Uint8Array(0);
   private nextId = 1;
   private writeQueue: Promise<void> = Promise.resolve();
@@ -110,8 +154,9 @@ export class LspJsonRpcTransport implements LspTransport {
   private closePromise: Promise<void> | undefined;
 
   constructor(private readonly process: LspProcess, options: LspJsonRpcTransportOptions = {}) {
-    const requested = options.defaultTimeoutMs ?? MAX_TIMEOUT_MS;
-    this.defaultTimeoutMs = clampTimeout(requested, MAX_TIMEOUT_MS);
+    this.maxTimeoutMs = clampTimeout(options.maxTimeoutMs ?? MAX_TIMEOUT_MS, Number.MAX_SAFE_INTEGER);
+    this.defaultTimeoutMs = clampTimeout(options.defaultTimeoutMs ?? this.maxTimeoutMs, this.maxTimeoutMs);
+    this.onNotification = options.onNotification;
     this.startReader();
     if (process.exited) {
       void process.exited.then((code) => {
@@ -127,7 +172,7 @@ export class LspJsonRpcTransport implements LspTransport {
     const id = this.nextId++;
     const request: JsonRpcRequest = { jsonrpc: "2.0", id, method };
     if (params !== undefined) request.params = params;
-    const timeout = clampTimeout(timeoutMs ?? this.defaultTimeoutMs, MAX_TIMEOUT_MS);
+    const timeout = clampTimeout(timeoutMs ?? this.defaultTimeoutMs, this.maxTimeoutMs);
     return new Promise<unknown>((resolve, reject) => {
       const timer = setTimeout(() => {
         const pending = this.pending.get(id);
@@ -224,10 +269,26 @@ export class LspJsonRpcTransport implements LspTransport {
       this.fail(new LspError("protocol", "LSP response must be a JSON object"));
       return;
     }
+    const envelope = message as { jsonrpc?: unknown; id?: unknown; method?: unknown; params?: unknown };
+    if (envelope.jsonrpc !== "2.0") {
+      this.fail(new LspError("protocol", "LSP response has invalid jsonrpc or id"));
+      return;
+    }
+    // Server-initiated traffic carries a method: with an id it is a request, without one a notification.
+    if (typeof envelope.method === "string") {
+      if (envelope.id === undefined || envelope.id === null) {
+        this.onNotification?.(envelope.method, envelope.params);
+        return;
+      }
+      if (typeof envelope.id !== "string" && typeof envelope.id !== "number") {
+        this.fail(new LspError("protocol", "LSP request id must be a string or number"));
+        return;
+      }
+      this.answerServerRequest(envelope.id, envelope.method, envelope.params);
+      return;
+    }
     const response = message as Partial<JsonRpcResponse>;
-    if (response.jsonrpc !== "2.0" || response.id === undefined) {
-      // Server notifications are valid and have no bearing on pending requests.
-      if (response.jsonrpc === "2.0" && response.id === undefined && typeof (message as { method?: unknown }).method === "string") return;
+    if (response.id === undefined) {
       this.fail(new LspError("protocol", "LSP response has invalid jsonrpc or id"));
       return;
     }
@@ -257,6 +318,15 @@ export class LspJsonRpcTransport implements LspTransport {
       return;
     }
     request.resolve(response.result);
+  }
+
+  private answerServerRequest(id: JsonRpcId, method: string, params: unknown): void {
+    const result = serverRequestResult(method, params);
+    const response: JsonRpcResponse = result === UNSUPPORTED
+      ? { jsonrpc: "2.0", id, error: { code: LSP_METHOD_NOT_FOUND, message: `Unsupported client method: ${method}` } }
+      : { jsonrpc: "2.0", id, result };
+    // A failed reply already fails the transport; it must not also reject unobserved here.
+    void this.enqueueWrite(encodeFrame(response)).catch(() => undefined);
   }
 
   private enqueueWrite(data: Uint8Array): Promise<void> {

@@ -6,10 +6,16 @@ import { discoverLanguageServers, type DiscoverLanguageServersOptions } from "./
 import type { LanguageServerClientOptions, LanguageServerSpec, LspMethod, LspSpawn, TextFallback } from "./types.ts";
 
 const DEFAULT_DEADLINE_MS = 20_000;
+/** A graceful exit is worth a short wait, never a slow one. */
+const DEFAULT_SHUTDOWN_DEADLINE_MS = 2_000;
+/** One restart per language per session: enough for a cold index, not a restart loop. */
+const DEFAULT_RESTART_LIMIT = 1;
 const TIMED_OUT = Symbol("lsp-manager-timeout");
 
 export interface ManagedLanguageServerClient {
   initialize(): Promise<unknown>;
+  /** The LSP exit handshake, attempted before close() tears the process down. */
+  shutdown?(timeoutMs?: number): Promise<unknown>;
   request?(method: string, params?: unknown, timeoutMs?: number): Promise<unknown>;
   definition?(params: unknown): Promise<unknown>;
   references?(params: unknown): Promise<unknown>;
@@ -26,6 +32,10 @@ export interface LspManagerOptions extends DiscoverLanguageServersOptions {
   workspace: string;
   fallback?: TextFallback;
   deadlineMs?: number;
+  /** Deadline for the graceful shutdown handshake during close(). */
+  shutdownDeadlineMs?: number;
+  /** Restarts allowed per language for the life of the manager. Defaults to one. */
+  restartLimit?: number;
   spawn?: LspSpawn;
   onLog?: (line: string) => void;
   onWarning?: (message: string) => void;
@@ -104,17 +114,24 @@ function languageFromParams(params: unknown): string | undefined {
 async function withDeadline<T>(promise: Promise<T>, deadlineMs: number): Promise<T | typeof TIMED_OUT> {
   let timer: ReturnType<typeof setTimeout> | undefined;
   const timeout = new Promise<typeof TIMED_OUT>((resolveTimeout) => { timer = setTimeout(() => resolveTimeout(TIMED_OUT), deadlineMs); });
+  // Losing the race means nobody observes this promise again; a late rejection must not go unhandled.
+  void promise.catch(() => undefined);
   try { return await Promise.race([promise, timeout]); } finally { if (timer !== undefined) clearTimeout(timer); }
 }
 
 export class LspManager {
   readonly workspace: string;
   readonly deadlineMs: number;
+  readonly shutdownDeadlineMs: number;
   readonly warnings: string[] = [];
   reason: string | undefined;
   private readonly fallback: TextFallback;
   private readonly options: LspManagerOptions;
   private readonly clients = new Map<string, ClientSlot>();
+  /** Specs of languages that started at least once, so a dropped client can be revived. */
+  private readonly specs = new Map<string, LanguageServerSpec>();
+  private readonly restartBudget = new Map<string, number>();
+  private readonly restartLimit: number;
   private readonly warnedLanguages = new Set<string>();
   private readonly readyPromise: Promise<void>;
   private closed = false;
@@ -122,7 +139,9 @@ export class LspManager {
   constructor(options: LspManagerOptions);
   constructor(workspace: string, fallback?: TextFallback, options?: Omit<LspManagerOptions, "workspace" | "fallback">);
   constructor(optionsOrWorkspace: LspManagerOptions | string, fallback?: TextFallback, extra?: Omit<LspManagerOptions, "workspace" | "fallback">) {
-    this.options = normalizeOptions(optionsOrWorkspace, fallback, extra); this.workspace = resolve(this.options.workspace || "."); this.deadlineMs = this.options.deadlineMs ?? DEFAULT_DEADLINE_MS; this.fallback = this.options.fallback ?? DEFAULT_FALLBACK; this.readyPromise = this.startDiscoveredServers();
+    this.options = normalizeOptions(optionsOrWorkspace, fallback, extra); this.workspace = resolve(this.options.workspace || "."); this.deadlineMs = this.options.deadlineMs ?? DEFAULT_DEADLINE_MS;
+    this.shutdownDeadlineMs = this.options.shutdownDeadlineMs ?? Math.min(this.deadlineMs, DEFAULT_SHUTDOWN_DEADLINE_MS); this.restartLimit = Math.max(0, this.options.restartLimit ?? DEFAULT_RESTART_LIMIT);
+    this.fallback = this.options.fallback ?? DEFAULT_FALLBACK; this.readyPromise = this.startDiscoveredServers();
   }
   static async create(options: LspManagerOptions): Promise<LspManager>;
   static async create(workspace: string, fallback?: TextFallback, options?: Omit<LspManagerOptions, "workspace" | "fallback">): Promise<LspManager>;
@@ -155,7 +174,15 @@ export class LspManager {
 
   async close(): Promise<void> {
     if (this.closed) return; this.closed = true; await this.readyPromise;
-    const clients = [...new Set([...this.clients.values()].map((slot) => slot.client))]; this.clients.clear(); await Promise.allSettled(clients.map((client) => client.close()));
+    const clients = [...new Set([...this.clients.values()].map((slot) => slot.client))]; this.clients.clear(); await Promise.allSettled(clients.map((client) => this.stop(client)));
+  }
+
+  /** Ask for the LSP exit handshake, then tear the process down regardless of the answer. */
+  private async stop(client: ManagedLanguageServerClient): Promise<void> {
+    if (typeof client.shutdown === "function") {
+      try { await withDeadline(Promise.resolve(client.shutdown(this.shutdownDeadlineMs)), this.shutdownDeadlineMs); } catch { /* close() below is authoritative */ }
+    }
+    await client.close();
   }
 
   private async startDiscoveredServers(): Promise<void> {
@@ -167,30 +194,52 @@ export class LspManager {
     };
     const specs = await discoverLanguageServers(this.workspace, discovery);
     if (specs.length === 0) { this.reason = "No supported language-server markers found"; return; }
-    const factory = this.options.clientFactory ?? defaultClientFactory; const startedCommands = new Set<string>();
+    const startedCommands = new Set<string>();
     for (const spec of specs) {
       if (this.closed || this.clients.has(spec.language)) continue;
       const commandKey = `${spec.command}\0${spec.args.join("\0")}`; if (startedCommands.has(commandKey)) continue; startedCommands.add(commandKey);
-      const clientOptions: LanguageServerClientOptions = {
-        command: spec.command, args: spec.args, cwd: this.workspace, rootUri: pathToFileURL(this.workspace).href, requestTimeoutMs: this.deadlineMs,
-        ...(this.options.spawn === undefined ? {} : { spawn: this.options.spawn }), ...(this.options.onLog === undefined ? {} : { onLog: this.options.onLog }),
-      };
-      let client: ManagedLanguageServerClient;
-      try { client = factory(clientOptions, spec); } catch (error) { this.markUnavailable(spec.language, errorText(error)); continue; }
-      try {
-        const initialized = await withDeadline(Promise.resolve(client.initialize()), this.deadlineMs);
-        if (initialized === TIMED_OUT || isErrorResult(initialized)) { this.markUnavailable(spec.language, initialized === TIMED_OUT ? `initialization exceeded ${this.deadlineMs}ms` : errorText(initialized)); void client.close().catch(() => {}); continue; }
-        if (this.closed) { await client.close(); continue; }
-        this.clients.set(spec.language, { spec, client });
-      } catch (error) { this.markUnavailable(spec.language, errorText(error)); void client.close().catch(() => {}); }
+      await this.startClient(spec);
     }
     if (this.clients.size === 0 && this.reason === undefined) this.reason = "Detected language servers were unavailable";
+  }
+
+  private clientOptions(spec: LanguageServerSpec): LanguageServerClientOptions {
+    return {
+      command: spec.command, args: spec.args, cwd: this.workspace, rootUri: pathToFileURL(this.workspace).href, requestTimeoutMs: this.deadlineMs,
+      ...(this.options.spawn === undefined ? {} : { spawn: this.options.spawn }), ...(this.options.onLog === undefined ? {} : { onLog: this.options.onLog }),
+    };
+  }
+
+  private async startClient(spec: LanguageServerSpec): Promise<ClientSlot | undefined> {
+    const factory = this.options.clientFactory ?? defaultClientFactory;
+    let client: ManagedLanguageServerClient;
+    try { client = factory(this.clientOptions(spec), spec); } catch (error) { this.markUnavailable(spec.language, errorText(error)); return undefined; }
+    try {
+      const initialized = await withDeadline(Promise.resolve(client.initialize()), this.deadlineMs);
+      if (initialized === TIMED_OUT || isErrorResult(initialized)) { this.markUnavailable(spec.language, initialized === TIMED_OUT ? `initialization exceeded ${this.deadlineMs}ms` : errorText(initialized)); void client.close().catch(() => {}); return undefined; }
+      if (this.closed) { await client.close(); return undefined; }
+      const slot: ClientSlot = { spec, client };
+      this.clients.set(spec.language, slot); this.specs.set(spec.language, spec);
+      // Seeded once, so a successful restart never refills its own budget.
+      if (!this.restartBudget.has(spec.language)) this.restartBudget.set(spec.language, this.restartLimit);
+      return slot;
+    } catch (error) { this.markUnavailable(spec.language, errorText(error)); void client.close().catch(() => {}); return undefined; }
+  }
+
+  /** One slow cold index must not disable a language for the session — but only once. */
+  private async restart(language: string): Promise<ClientSlot | undefined> {
+    const spec = this.specs.get(language); const budget = this.restartBudget.get(language) ?? 0;
+    if (spec === undefined || budget <= 0) return undefined;
+    this.restartBudget.set(language, budget - 1);
+    return this.startClient(spec);
   }
 
   private async route(operation: OperationName, a: unknown, b?: unknown): Promise<unknown> {
     await this.readyPromise;
     const explicitFirst = typeof a === "string" && typeof b !== "string"; const params = explicitFirst ? b : a; const explicitLanguage = explicitFirst ? a : typeof b === "string" ? b : undefined;
-    const language = this.selectLanguage(explicitLanguage, params); const method = METHOD_BY_OPERATION[operation]; const slot = language === undefined ? undefined : this.clients.get(language);
+    const language = this.selectLanguage(explicitLanguage, params); const method = METHOD_BY_OPERATION[operation];
+    let slot = language === undefined || this.closed ? undefined : this.clients.get(language);
+    if (slot === undefined && language !== undefined && !this.closed) slot = await this.restart(language);
     if (this.closed || language === undefined || slot === undefined) return this.runFallback(language ?? explicitLanguage ?? languageFromParams(params) ?? "unknown", method, params);
     const activeLanguage = language;
     try {

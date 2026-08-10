@@ -1,7 +1,8 @@
 import { describe, expect, test } from "bun:test";
-import { mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
+import { copyFile, mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { SkillRegistry, SkillTool } from "../src/index.ts";
 
 const skill = (name: string, description: string, body: string, extra = "") => `---\nname: ${name}\ndescription: ${description}\n${extra}---\n${body}\n`;
@@ -62,6 +63,22 @@ describe("lazy skills", () => {
       expect(registry.issues.map((issue) => issue.detail).join("\n")).toContain("outside skill root");
       const missing = await new SkillTool(registry).execute({ name: "missing" }, context);
       expect(missing.isError).toBe(true);
+    } finally { await rm(root, { recursive: true, force: true }); }
+  });
+
+  test("resolves the default bundled root from an install path containing spaces", async () => {
+    const root = await mkdtemp(join(tmpdir(), "lyra skills "));
+    const pack = join(root, "pack ünicode");
+    try {
+      await mkdir(join(pack, "src"), { recursive: true });
+      await mkdir(join(pack, "bundled", "spaced"), { recursive: true });
+      await copyFile(fileURLToPath(new URL("../src/skills.ts", import.meta.url)), join(pack, "src", "skills.ts"));
+      await writeFile(join(pack, "bundled", "spaced", "SKILL.md"), skill("spaced", "Skill under a spaced bundled root", "spaced body"));
+      const module = await import(pathToFileURL(join(pack, "src", "skills.ts")).href) as { SkillRegistry: new (options: { workspace: string; home: string }) => SkillRegistry };
+      const registry = new module.SkillRegistry({ workspace: root, home: root });
+      expect(registry.options.bundledRoot.endsWith(join("pack ünicode", "bundled"))).toBe(true);
+      expect((await registry.discover()).map((record) => record.name)).toEqual(["spaced"]);
+      expect((await registry.load("spaced")).body).toBe("spaced body");
     } finally { await rm(root, { recursive: true, force: true }); }
   });
 });

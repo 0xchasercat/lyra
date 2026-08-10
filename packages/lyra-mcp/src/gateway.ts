@@ -4,7 +4,7 @@ import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { McpStdioClient, McpError } from "./client.ts";
 import type { McpClientOptions, McpServerConfig, McpToolDescriptor, McpToolSummary, McpGatewayOptions, McpToolLike, DracoInstallerOptions } from "./types.ts";
-import type { ToolExecutionContext, ToolExecutionResult } from "@lyra/core";
+import { foldToolAliases, type ToolAlias, type ToolExecutionContext, type ToolExecutionResult } from "@lyra/core";
 import type { ToolDefinition } from "@lyra/provider";
 
 export class McpRegistry {
@@ -47,7 +47,11 @@ export class McpRegistry {
   private async save(): Promise<void> { await mkdir(join(this.path, ".."), { recursive: true, mode: 0o700 }); const temporary = `${this.path}.${process.pid}.tmp`; await writeFile(temporary, `${JSON.stringify(this.#configs, null, 2)}\n`, { flag: "w", mode: 0o600 }); await rename(temporary, this.path); }
 }
 
-export const MCP_DEFINITION: ToolDefinition = Object.freeze({ name: "mcp", description: "Describe one indexed MCP tool or call it with explicit server, tool, and arguments.", inputSchema: Object.freeze({ type: "object", additionalProperties: false, properties: { op: { type: "string", enum: ["describe", "call"] }, server: { type: "string" }, tool: { type: "string" }, args: {} }, required: ["op", "server", "tool"] }) });
+export const MCP_DEFINITION: ToolDefinition = Object.freeze({ name: "mcp", description: "Describe one indexed MCP tool or call it with explicit server, tool, and arguments.", inputSchema: Object.freeze({ type: "object", additionalProperties: false, properties: { op: { type: "string", enum: ["describe", "call"], description: "describe returns the tool's full schema; call invokes it." }, server: { type: "string", description: "Server name from the index in this description." }, tool: { type: "string", description: "Tool name on that server." }, args: { description: "Arguments object for the call, shaped by the schema describe returns." }, arguments: { description: "Alias for args." } }, required: ["op", "server", "tool"] }) });
+
+const MCP_ALIASES: readonly ToolAlias[] = Object.freeze([{ canonical: "args", aliases: ["arguments"] }]);
+/** `arguments` is the MCP wire spelling of tools/call params, so models reach for it here too. */
+export function normalizeMcpArgs(input: unknown): unknown | string { return foldToolAliases(input, MCP_ALIASES, "mcp"); }
 interface McpArtifactStore { put(content: string | Uint8Array, options?: { mimeType?: string; name?: string }): Promise<string>; }
 export class McpGateway implements McpToolLike {
   readonly definition: ToolDefinition;
@@ -56,8 +60,11 @@ export class McpGateway implements McpToolLike {
     const available = index.length === 0 ? "No MCP tools are currently registered." : `Available MCP tools:\n${index.map((tool) => `${tool.server}/${tool.name} — ${tool.description}`).join("\n")}`;
     this.definition = Object.freeze({ ...MCP_DEFINITION, description: `${MCP_DEFINITION.description} ${available}` });
   }
-  async execute(input: unknown, context: ToolExecutionContext): Promise<ToolExecutionResult> {
+  normalize(args: unknown): unknown | string { return normalizeMcpArgs(args); }
+  async execute(raw: unknown, context: ToolExecutionContext): Promise<ToolExecutionResult> {
     try {
+      const input = normalizeMcpArgs(raw);
+      if (typeof input === "string") throw new McpError("invalid_request", input);
       if (!input || typeof input !== "object" || Array.isArray(input)) throw new McpError("invalid_request", "mcp requires op, server, and tool.");
       if (!("op" in input) || (input.op !== "describe" && input.op !== "call")) throw new McpError("invalid_request", "mcp op must be describe or call.");
       if (!("server" in input) || typeof input.server !== "string" || !("tool" in input) || typeof input.tool !== "string") throw new McpError("invalid_request", "mcp server and tool must be strings.");
