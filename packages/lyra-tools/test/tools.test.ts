@@ -1,6 +1,6 @@
 import { ProcessHost } from "@lyra/host";
 import { describe, expect, test } from "bun:test";
-import { mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readdir, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -11,6 +11,7 @@ import {
   GitTool,
   GlobTool,
   GrepTool,
+  NodeFileSystem,
   ReadTool,
   WriteTool,
   createDefaultToolRegistry,
@@ -137,6 +138,85 @@ describe("core tool behavior", () => {
       const result = await new GitTool({ root, artifactStore: store }).execute({ args: ["status"], cwd: "external-repo" }, context);
       expect(result.isError).not.toBe(true);
     } finally { await Promise.all([dispose(root), dispose(outside)]); }
+  });
+
+  test("atomic writes preserve an existing file's mode and clean up after a failed rename", async () => {
+    const { root, store, context } = await fixture();
+    try {
+      const script = join(root, "run.sh");
+      await writeFile(script, "echo one\n");
+      await chmod(script, 0o755);
+      const read = await new ReadTool({ root, artifactStore: store }).execute({ path: "run.sh" }, context);
+      const tag = read.content.toString().match(/(#[a-f0-9]+)/i)?.[1];
+      const edit = await new EditTool({ root, artifactStore: store }).execute({ mode: "search_replace", path: "run.sh", tag, search: "one", replace: "two" }, context);
+      expect(edit.isError).not.toBe(true);
+      expect(await readFile(script, "utf8")).toBe("echo two\n");
+      expect((await stat(script)).mode & 0o777).toBe(0o755);
+      const created = await new WriteTool({ root, artifactStore: store }).execute({ path: "fresh.txt", content: "fresh\n" }, context);
+      expect(created.isError).not.toBe(true);
+      expect((await stat(join(root, "fresh.txt"))).mode & 0o777).toBe(0o600);
+      const blocked = join(root, "as-directory");
+      await mkdir(blocked);
+      await expect(new NodeFileSystem().writeAtomic(blocked, "content\n")).rejects.toThrow();
+      expect((await readdir(root)).filter((entry) => entry.startsWith("as-directory."))).toEqual([]);
+    } finally { await dispose(root); }
+  });
+
+  test("grep skips binary files instead of abandoning the search", async () => {
+    const { root, store, context } = await fixture();
+    try {
+      // Sorts before the text file, so the old abort-on-first-binary path would have hidden the match entirely.
+      await writeFile(join(root, "a-payload.bin"), new Uint8Array([0x00, 0xff, 0x41, 0x00]));
+      await writeFile(join(root, "z-notes.txt"), "needle here\n");
+      const result = await new GrepTool({ root, artifactStore: store }).execute({ path: ".", pattern: "needle" }, context);
+      expect(result.isError).not.toBe(true);
+      expect(result.content.toString()).toContain("z-notes.txt:1: needle here");
+      expect(result.content.toString()).toContain("skipped 1 binary file");
+      expect(result.content.toString()).toContain("a-payload.bin");
+    } finally { await dispose(root); }
+  });
+
+  test("gitignore rules stop at the repository root and the deepest file wins", async () => {
+    const root = await mkdtemp(join(tmpdir(), "lyra-tools-ignore-"));
+    try {
+      const repo = join(root, "repo");
+      const nested = join(repo, "nested");
+      await mkdir(join(repo, ".git"), { recursive: true });
+      await mkdir(nested, { recursive: true });
+      await writeFile(join(root, ".gitignore"), "above.txt\n");
+      await writeFile(join(repo, ".gitignore"), "shared.txt\n");
+      await writeFile(join(repo, "above.txt"), "above\n");
+      await writeFile(join(repo, "shared.txt"), "shared\n");
+      await writeFile(join(nested, ".gitignore"), "!shared.txt\n");
+      await writeFile(join(nested, "shared.txt"), "nested shared\n");
+      const base = { signal: new AbortController().signal, sessionId: "ignore-test", callId: "call-ignore" };
+      const repoStore = createArtifactStore(repo);
+      const fromRepo = await new GlobTool({ root: repo, artifactStore: repoStore })
+        .execute({ pattern: "*.txt" }, { ...base, workspace: repo, cwd: repo, origin: repo, artifactStore: repoStore } as any);
+      expect(fromRepo.isError).not.toBe(true);
+      // A .gitignore above the repository root is never consulted, so above.txt stays visible.
+      expect(fromRepo.content.toString().split("\n")).toContain("above.txt");
+      expect(fromRepo.content.toString().split("\n")).not.toContain("shared.txt");
+      const nestedStore = createArtifactStore(nested);
+      const fromNested = await new GlobTool({ root: nested, artifactStore: nestedStore })
+        .execute({ pattern: "*.txt" }, { ...base, workspace: nested, cwd: nested, origin: nested, artifactStore: nestedStore } as any);
+      expect(fromNested.isError).not.toBe(true);
+      // The nested negation is the deepest rule, so it overrides the repository root's ignore.
+      expect(fromNested.content.toString().split("\n")).toContain("shared.txt");
+    } finally { await dispose(root); }
+  });
+
+  test("bash accepts the description field models habitually send, and ignores it", async () => {
+    // Models trained on other harnesses attach a `description` to bash calls; rejecting
+    // it costs retries (LYRA.md §3.7 — a misused tool is the tool's defect). It is
+    // accepted as display metadata and has no effect on execution.
+    const { root, store, context } = await fixture();
+    try {
+      const registry = createDefaultToolRegistry({ filesystem: { root, artifactStore: store }, bash: { root, artifactStore: store }, git: { root, artifactStore: store } });
+      const result = await registry.execute("bash", { command: "printf 'described'", description: "List files in the project" }, context);
+      expect(result.isError).not.toBe(true);
+      expect(result.content).toContain("described");
+    } finally { await dispose(root); }
   });
 
   test("default registry never throws for malformed inputs", async () => {

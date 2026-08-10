@@ -1,5 +1,6 @@
 import { readdir, readFile, realpath, stat } from "node:fs/promises";
 import { basename, dirname, isAbsolute, relative, resolve, sep } from "node:path";
+import { aliasSchema, foldToolAliases, rejectedField, toolArgs, type ToolAlias } from "@lyra/core";
 import type { ToolDefinition } from "@lyra/provider";
 import type { ArtifactStore, LyraTool, ToolExecutionResult, ToolRuntimeContext } from "./types.ts";
 import { FileArtifactStore } from "./artifacts.ts";
@@ -55,11 +56,24 @@ export function globRegex(pattern: string): RegExp {
 }
 
 interface IgnoreRule { readonly regex: RegExp; readonly negate: boolean; readonly basenameOnly: boolean; }
-async function ignoreRules(origin: string): Promise<IgnoreRule[]> {
-  const rules: IgnoreRule[] = [];
+async function pathExists(path: string): Promise<boolean> { try { await stat(path); return true; } catch { return false; } }
+/** Directories whose .gitignore applies, outermost first: git stops at the repository root and never reads above it. */
+async function ignoreChain(origin: string): Promise<string[]> {
+  const chain: string[] = [];
   let current = origin;
   while (true) {
-    const file = resolve(current, ".gitignore");
+    chain.unshift(current);
+    if (await pathExists(resolve(current, ".git"))) return chain;
+    const parent = dirname(current);
+    if (parent === current) return [origin];
+    current = parent;
+  }
+}
+async function ignoreRules(origin: string): Promise<IgnoreRule[]> {
+  const rules: IgnoreRule[] = [];
+  // Outermost first, so last-match-wins in ignored() gives the deepest .gitignore the final word, as git does.
+  for (const directory of await ignoreChain(origin)) {
+    const file = resolve(directory, ".gitignore");
     try {
       const raw = await readFile(file, "utf8");
       for (const line of raw.split(/\r?\n/)) {
@@ -70,11 +84,6 @@ async function ignoreRules(origin: string): Promise<IgnoreRule[]> {
         if (pattern) rules.push({ regex: globRegex(pattern), negate, basenameOnly: !pattern.includes("/") });
       }
     } catch (error) { if (!/ENOENT/.test(errorMessage(error))) throw new Error(`Unable to read ${file}: ${errorMessage(error)}`); }
-    const parent = dirname(current);
-    if (parent === current) break;
-    current = parent;
-    const rel = relative(origin, current);
-    if (rel === "" || rel.startsWith(`..${sep}`)) break;
   }
   return rules;
 }
@@ -109,8 +118,96 @@ async function searchRoot(value: unknown, context: ToolRuntimeContext, root?: st
   return { path, origin, cwd };
 }
 
-export const GLOB_DEFINITION: ToolDefinition = Object.freeze({ name: "glob", description: "Find files with deterministic gitignore-aware glob patterns.", inputSchema: Object.freeze({ type: "object", properties: { pattern: { type: "string", description: "Glob such as src/**/*.ts." }, path: { type: "string", description: "Directory to search, defaulting to cwd." } }, required: ["pattern"], additionalProperties: false }) });
-export const GREP_DEFINITION: ToolDefinition = Object.freeze({ name: "grep", description: "Search UTF-8 files with a regular expression and deterministic results.", inputSchema: Object.freeze({ type: "object", properties: { pattern: { type: "string" }, path: { type: "string" }, flags: { type: "string" }, glob: { type: "string" }, maxResults: { type: "integer", minimum: 1 }, before: { type: "integer", minimum: 0 }, after: { type: "integer", minimum: 0 } }, required: ["pattern"], additionalProperties: false }) });
+export const GLOB_DEFINITION: ToolDefinition = Object.freeze({
+  name: "glob",
+  description: "List files matching a glob, gitignore-aware, sorted deterministically.",
+  inputSchema: Object.freeze({
+    type: "object",
+    properties: {
+      pattern: { type: "string", minLength: 1, description: "Glob such as src/**/*.ts. ** crosses directories, * and ? do not." },
+      path: { type: "string", minLength: 1, description: "Directory to search, defaulting to cwd." },
+    },
+    required: ["pattern"],
+    additionalProperties: false,
+  }),
+});
+export const GREP_DEFINITION: ToolDefinition = Object.freeze({
+  name: "grep",
+  description: "Search UTF-8 files line by line with a JavaScript regular expression, skipping gitignored and binary files.",
+  inputSchema: Object.freeze({
+    type: "object",
+    properties: {
+      pattern: { type: "string", description: "JavaScript regular expression, matched against one line at a time." },
+      path: { type: "string", minLength: 1, description: "File or directory to search, defaulting to cwd." },
+      flags: { type: "string", description: "JavaScript RegExp flags, such as \"i\" for case-insensitive." },
+      glob: { type: "string", description: "Restrict the search to files matching this glob, such as **/*.ts." },
+      maxResults: { type: "integer", minimum: 1, description: "Cap on matched lines, or on matched files in the other output modes. Defaults to 1000." },
+      before: { type: "integer", minimum: 0, description: "Context lines to include before each match." },
+      after: { type: "integer", minimum: 0, description: "Context lines to include after each match." },
+      output_mode: { type: "string", enum: ["content", "files_with_matches", "count"], description: "content (default) returns path:line: text; files_with_matches returns matching paths; count returns path:count." },
+      include: aliasSchema("glob", "string"),
+      head_limit: aliasSchema("maxResults", "integer", { minimum: 1 }),
+      headLimit: aliasSchema("maxResults", "integer", { minimum: 1 }),
+      "-A": aliasSchema("after", "integer", { minimum: 0 }),
+      "-B": aliasSchema("before", "integer", { minimum: 0 }),
+      "-C": { type: "integer", minimum: 0, description: "Context lines on both sides; sets before and after together." },
+      "-i": { type: "boolean", description: "Case-insensitive; the ripgrep spelling, folded into flags." },
+      "-n": { type: "boolean", description: "Line numbers. Matches are always reported as path:line: text, so only true is meaningful." },
+    },
+    required: ["pattern"],
+    additionalProperties: false,
+  }),
+});
+
+const GREP_ALIASES: readonly ToolAlias[] = Object.freeze([
+  { canonical: "glob", aliases: ["include"] },
+  { canonical: "maxResults", aliases: ["head_limit", "headLimit"] },
+  { canonical: "after", aliases: ["-A"] },
+  { canonical: "before", aliases: ["-B"] },
+]);
+
+/** ripgrep-flavoured switches fold onto grep's own fields; the ones with no honest mapping say so. */
+export function normalizeGrepArgs(input: unknown): unknown | string {
+  const unsupported: ReadonlyArray<readonly [string, string]> = [
+    ["multiline", "multiline is not supported: grep matches one line at a time, so a pattern cannot span lines. Match a single-line anchor, then read the surrounding lines."],
+    ["type", "type is not supported: filter by filename with glob instead, such as glob: \"**/*.ts\" rather than type: \"ts\"."],
+  ];
+  for (const [field, lesson] of unsupported) {
+    const hit = rejectedField(input, field, lesson);
+    if (hit !== undefined) return hit;
+  }
+  const folded = foldToolAliases(input, GREP_ALIASES, "grep");
+  if (typeof folded === "string") return folded;
+  const args = toolArgs(folded);
+  if (args === undefined) return folded;
+  let output: Record<string, unknown> | undefined;
+  const draft = (): Record<string, unknown> => (output ??= { ...args });
+  const both = args["-C"];
+  if (both !== undefined) {
+    if (typeof both !== "number" || !Number.isSafeInteger(both) || both < 0) return "-C must be a non-negative integer count of context lines.";
+    for (const side of ["before", "after"] as const) {
+      const supplied = (output ?? args)[side];
+      if (supplied !== undefined && supplied !== both) return `grep received both ${side} and -C with different values; -C sets before and after together, so send ${side} alone.`;
+      draft()[side] = both;
+    }
+    delete draft()["-C"];
+  }
+  const insensitive = args["-i"];
+  if (insensitive !== undefined) {
+    if (typeof insensitive !== "boolean") return "-i must be a boolean; it is the ripgrep spelling of the \"i\" regular-expression flag.";
+    const flags = typeof (output ?? args).flags === "string" ? (output ?? args).flags as string : "";
+    const merged = insensitive && !flags.includes("i") ? `${flags}i` : flags;
+    if (merged.length === 0) delete draft().flags; else draft().flags = merged;
+    delete draft()["-i"];
+  }
+  const numbered = args["-n"];
+  if (numbered !== undefined) {
+    if (typeof numbered !== "boolean") return "-n must be a boolean.";
+    if (numbered === false) return "-n cannot be false: matches are always reported as path:line: text, so line numbers are never omitted. Use output_mode: \"files_with_matches\" for paths only.";
+    delete draft()["-n"];
+  }
+  return output ?? args;
+}
 
 export async function globPaths(pattern: string, root: string, origin = root): Promise<string[]> {
   const regex = globRegex(slash(pattern));
@@ -135,18 +232,31 @@ export class GlobTool implements LyraTool {
         if (ignored(file, origin, rules)) return false;
         return regex.test(slash(relative(cwd, file))) || regex.test(slash(relative(origin, file)));
       }).sort((a, b) => slash(relative(cwd, a)).localeCompare(slash(relative(cwd, b))));
+      // An empty string cannot be read as "no matches" — it looks like a broken tool, and a
+      // model that cannot tell those apart retries the same call (§3.7).
+      if (matches.length === 0) return ok(`No files match ${JSON.stringify(args.pattern)} under ${slash(relative(cwd, path)) || "."}. Widen the pattern, or check the directory with bash.`);
       const output = matches.map((file) => slash(relative(cwd, file))).join("\n");
       return ok(await boundText(output, storeFor(context, this.options.artifactStore, this.options.root), { budget: budgetFor(this.options), mimeType: "text/plain", name: args.pattern }));
     } catch (error) { return fail(`Unable to glob files: ${errorMessage(error)} Check the directory, pattern syntax, and permissions, then retry.`); }
   }
 }
 interface MatchLine { path: string; line: number; text: string; }
+function binary(bytes: Uint8Array): boolean {
+  if (bytes.includes(0)) return true;
+  try { new TextDecoder("utf-8", { fatal: true }).decode(bytes); return false; } catch { return true; }
+}
 export class GrepTool implements LyraTool {
   readonly definition = GREP_DEFINITION;
   constructor(private readonly options: SearchToolOptions = {}) {}
-  async execute(args: unknown, context: ToolRuntimeContext): Promise<ToolExecutionResult> {
+  normalize(args: unknown): unknown | string { return normalizeGrepArgs(args); }
+  async execute(input: unknown, context: ToolRuntimeContext): Promise<ToolExecutionResult> {
     try {
+      const normalized = normalizeGrepArgs(input);
+      if (typeof normalized === "string") return fail(normalized);
+      const args = normalized as Record<string, unknown>;
       if (!validObject(args) || !str(args.pattern)) return fail("grep requires pattern as a regular-expression string.");
+      const outputMode = args.output_mode === undefined ? "content" : args.output_mode;
+      if (outputMode !== "content" && outputMode !== "files_with_matches" && outputMode !== "count") return fail("output_mode must be content, files_with_matches, or count.");
       let regex: RegExp;
       try { regex = new RegExp(args.pattern, str(args.flags) ? args.flags : ""); } catch (error) { return fail(`Invalid regular expression ${JSON.stringify(args.pattern)}: ${errorMessage(error)} Escape special characters or provide a valid pattern.`); }
       const before = args.before === undefined ? 0 : args.before;
@@ -162,15 +272,22 @@ export class GrepTool implements LyraTool {
       if (str(args.glob) && args.glob) { const glob = globRegex(slash(args.glob)); files = files.filter((file) => glob.test(slash(relative(path, file))) || glob.test(slash(relative(origin, file)))); }
       files = [...new Set(files)].sort((a, b) => slash(relative(origin, a)).localeCompare(slash(relative(origin, b))));
       const matches: MatchLine[] = [];
+      const perFile: Array<{ path: string; count: number }> = [];
+      const skipped: string[] = [];
       const store = storeFor(context, this.options.artifactStore, this.options.root);
       for (const file of files) {
         const bytes = new Uint8Array(await readFile(file));
-        let text: string;
-        try { text = new TextDecoder("utf-8", { fatal: true }).decode(bytes); } catch { const id = await store.put(bytes, { mimeType: "application/octet-stream", name: file }); return fail(`Cannot grep binary file ${file}; full content is preserved at ${id}. Search a text path or inspect the artifact.`); }
-        if (bytes.includes(0)) { const id = await store.put(bytes, { mimeType: "application/octet-stream", name: file }); return fail(`Cannot grep binary file ${file}; full content is preserved at ${id}. Search a text path or inspect the artifact.`); }
-        const lines = text.replace(/\r\n/g, "\n").split("\n");
+        // A binary file is not a search failure: skip it and keep going so one .png never hides the rest of the tree.
+        if (binary(bytes)) { skipped.push(slash(relative(origin, file))); continue; }
+        const lines = new TextDecoder("utf-8").decode(bytes).replace(/\r\n/g, "\n").split("\n");
         const found: number[] = [];
         for (let lineIndex = 0; lineIndex < lines.length; lineIndex++) { regex.lastIndex = 0; if (regex.test(lines[lineIndex]!)) found.push(lineIndex); }
+        if (outputMode !== "content") {
+          // maxResults caps files here, not lines, because a file is one output row in these modes.
+          if (found.length > 0) perFile.push({ path: slash(relative(origin, file)), count: found.length });
+          if (perFile.length >= maxResults) break;
+          continue;
+        }
         for (const lineIndex of found) {
           if (matches.length >= maxResults) break;
           const start = Math.max(0, lineIndex - (before as number));
@@ -180,8 +297,14 @@ export class GrepTool implements LyraTool {
         if (matches.length >= maxResults) break;
       }
       const seen = new Set<string>();
-      const output = matches.filter((match) => { const key = `${match.path}:${match.line}`; if (seen.has(key)) return false; seen.add(key); return true; }).map((match) => `${match.path}:${match.line}: ${match.text}`).join("\n");
-      return ok(await boundText(output, store, { budget: budgetFor(this.options), mimeType: "text/plain", name: "grep.txt" }));
+      const output = outputMode === "files_with_matches"
+        ? perFile.map((entry) => entry.path)
+        : outputMode === "count"
+          ? perFile.map((entry) => `${entry.path}:${entry.count}`)
+          : matches.filter((match) => { const key = `${match.path}:${match.line}`; if (seen.has(key)) return false; seen.add(key); return true; }).map((match) => `${match.path}:${match.line}: ${match.text}`);
+      if (output.length === 0) output.push(`No lines match ${JSON.stringify(args.pattern)} in ${files.length} searched file${files.length === 1 ? "" : "s"}.`);
+      if (skipped.length > 0) output.push(`[skipped ${skipped.length} binary file${skipped.length === 1 ? "" : "s"}: ${skipped.slice(0, 10).join(", ")}${skipped.length > 10 ? ", and more" : ""}]`);
+      return ok(await boundText(output.join("\n"), store, { budget: budgetFor(this.options), mimeType: "text/plain", name: "grep.txt" }));
     } catch (error) { return fail(`Unable to grep files: ${errorMessage(error)} Check the path, expression syntax, and permissions, then retry.`); }
   }
 }

@@ -1,7 +1,7 @@
 import { realpath } from "node:fs/promises";
 import { resolve } from "node:path";
 import type { ToolDefinition } from "@lyra/provider";
-import type { ToolExecutionContext, ToolExecutionResult } from "@lyra/core";
+import { aliasSchema, foldToolAliases, type ToolAlias, type ToolExecutionContext, type ToolExecutionResult } from "@lyra/core";
 import { boundText } from "./filesystem-tools.ts";
 import type { ArtifactStore, LyraTool, ToolRuntimeContext } from "./types.ts";
 import { createArtifactStore } from "./artifacts.ts";
@@ -15,18 +15,22 @@ export interface GitToolOptions {
 
 export const GIT_DEFINITION: ToolDefinition = Object.freeze({
   name: "git",
-  description: "Run a validated git subcommand from the model-selected working directory and report repository state, output, and exit status.",
+  description: "Run one git command in the workspace and report repository state, output, and exit status. Destructive subcommands are logged, never blocked.",
   inputSchema: Object.freeze({
     type: "object",
     additionalProperties: false,
     properties: {
-      args: { type: "array", minItems: 1, items: { type: "string" }, description: "Git arguments after the git executable." },
+      args: { type: "array", minItems: 1, items: { type: "string" }, description: "Arguments after the git executable, already split: [\"commit\", \"-m\", \"fix: thing\"]. Not a single command string." },
       cwd: { type: "string", minLength: 1, description: "Optional absolute or cwd-relative working directory." },
       timeoutMs: { type: "integer", minimum: 1, maximum: 3_600_000, description: "Optional deadline in milliseconds." },
+      timeout: aliasSchema("timeoutMs", "integer", { minimum: 1, maximum: 3_600_000 }),
     },
     required: ["args"],
   }),
 });
+
+const GIT_ALIASES: readonly ToolAlias[] = Object.freeze([{ canonical: "timeoutMs", aliases: ["timeout"] }]);
+export function normalizeGitArgs(input: unknown): unknown | string { return foldToolAliases(input, GIT_ALIASES, "git"); }
 
 function errorResult(message: string): ToolExecutionResult { return { content: message, isError: true }; }
 function runtime(context: ToolExecutionContext, root?: string): { cwd: string; origin: string; store: ArtifactStore } {
@@ -37,10 +41,13 @@ function runtime(context: ToolExecutionContext, root?: string): { cwd: string; o
   return { cwd, origin, store: value.artifactStore ?? createArtifactStore(origin) };
 }
 async function realCwd(path: string): Promise<string> { return await realpath(path); }
-function parse(args: unknown): { args: string[]; cwd?: string; timeoutMs?: number } | string {
+function parse(input: unknown): { args: string[]; cwd?: string; timeoutMs?: number } | string {
+  const folded = normalizeGitArgs(input);
+  if (typeof folded === "string") return folded;
+  const args = folded;
   if (args === null || typeof args !== "object" || Array.isArray(args)) return "arguments must be an object with args";
   const value = args as Record<string, unknown>;
-  if (!Array.isArray(value.args) || value.args.length === 0 || value.args.some((arg) => typeof arg !== "string")) return "args must be a non-empty array of strings";
+  if (!Array.isArray(value.args) || value.args.length === 0 || value.args.some((arg) => typeof arg !== "string")) return "args must be a non-empty array of already-split strings, such as [\"status\", \"--short\"]";
   if (value.cwd !== undefined && (typeof value.cwd !== "string" || value.cwd.trim().length === 0)) return "cwd must be a non-empty string when provided";
   const rawTimeout = value.timeoutMs;
   if (rawTimeout !== undefined && (typeof rawTimeout !== "number" || !Number.isSafeInteger(rawTimeout) || rawTimeout < 1 || rawTimeout > 3_600_000)) return "timeoutMs must be an integer between 1 and 3600000";
@@ -70,6 +77,7 @@ export class GitTool implements LyraTool {
   readonly definition = GIT_DEFINITION;
   readonly #options: Required<Pick<GitToolOptions, "displayBudget">> & GitToolOptions;
   constructor(options: GitToolOptions = {}) { this.#options = { displayBudget: 32 * 1024, ...options }; }
+  normalize(args: unknown): unknown | string { return normalizeGitArgs(args); }
 
   async execute(input: unknown, context: ToolExecutionContext): Promise<ToolExecutionResult> {
     const parsed = parse(input);

@@ -1,7 +1,7 @@
 import { resolve } from "node:path";
 import { ProcessHost, type HostProcess, type JobHandle, type ProcessResult } from "@lyra/host";
 import type { ToolDefinition } from "@lyra/provider";
-import type { ToolExecutionContext, ToolExecutionResult } from "@lyra/core";
+import { aliasSchema, foldToolAliases, toolArgs, type ToolAlias, type ToolExecutionContext, type ToolExecutionResult } from "@lyra/core";
 import { boundText } from "./filesystem-tools.ts";
 import type { ArtifactStore, LyraTool, ToolRuntimeContext } from "./types.ts";
 import { createArtifactStore } from "./artifacts.ts";
@@ -18,24 +18,95 @@ export interface BashRequest {
   command: string;
   cwd?: string;
   timeoutMs?: number;
+  background?: boolean;
 }
 
 export type BashCompleted = ProcessResult;
 
 export const BASH_DEFINITION: ToolDefinition = Object.freeze({
   name: "bash",
-  description: "Run a shell command from the model-selected working directory and report complete stdout, stderr, exit status, and cancellation details.",
+  description: "Run a shell command from the model-selected working directory and report complete stdout, stderr, exit status, and cancellation details. Put the command in `command`; every other field is optional and is best left out. Heavy commands (builds, test suites, servers) return a job id immediately — a later call with `job` set to that id, and no command, collects the output.",
   inputSchema: Object.freeze({
     type: "object",
     additionalProperties: false,
     properties: {
-      command: { type: "string", minLength: 1, description: "The exact command to run." },
+      command: { type: ["string", "array"], items: { type: "string" }, minLength: 1, minItems: 1, description: "The command to run, as one shell string. An argv array such as [\"bash\", \"-lc\", \"ls\"] is also accepted and joined. Required unless job is given." },
       cwd: { type: "string", minLength: 1, description: "Optional absolute or cwd-relative working directory." },
-      timeoutMs: { type: "integer", minimum: 1, maximum: 3_600_000, description: "Optional deadline in milliseconds." },
+      timeoutMs: { type: "integer", minimum: 1, maximum: 3_600_000, description: "Optional deadline in milliseconds. With job, how long to wait for the job to finish." },
+      description: { type: "string", maxLength: 200, description: "Optional one-line summary of what the command does, shown in the UI. Has no effect on execution." },
+      run_in_background: { type: "boolean", description: "Return a job id immediately instead of blocking. Heavy commands do this regardless of this flag." },
+      job: { type: ["string", "null"], description: "Collection only: a job id such as \"job-000001\" reported by an earlier background or heavy call, waited on and returned in full. Leave it out, empty, or null whenever you are running a command." },
+      timeout: aliasSchema("timeoutMs", "integer", { minimum: 1, maximum: 3_600_000 }),
+      timeout_ms: aliasSchema("timeoutMs", "integer", { minimum: 1, maximum: 3_600_000 }),
+      workdir: aliasSchema("cwd", "string", { minLength: 1 }),
+      runInBackground: aliasSchema("run_in_background", "boolean"),
     },
-    required: ["command"],
   }),
 });
+
+const BASH_ALIASES: readonly ToolAlias[] = Object.freeze([
+  { canonical: "timeoutMs", aliases: ["timeout", "timeout_ms"] },
+  { canonical: "cwd", aliases: ["workdir"] },
+  { canonical: "run_in_background", aliases: ["runInBackground"] },
+]);
+
+/** Quote one argv element so a joined array runs as the same command it described. */
+function shellQuote(part: string): string {
+  return /^[A-Za-z0-9_@%+=:,./-]+$/.test(part) ? part : `'${part.split("'").join(`'\\''`)}'`;
+}
+
+/**
+ * Codex-family models send `command` as an argv array. Lyra runs commands through
+ * `bash -lc`, so `["bash", "-lc", script]` *is* the script, and any other argv joins back
+ * losslessly once each element is quoted.
+ */
+export function commandFromArgv(parts: readonly string[]): string {
+  const shell = parts[0] ?? "";
+  if (parts.length === 3 && /(^|\/)(bash|sh|zsh)$/.test(shell) && (parts[1] === "-lc" || parts[1] === "-c")) return parts[2]!;
+  return parts.map(shellQuote).join(" ");
+}
+
+/** The shape of every job id this tool hands out, so a placeholder is recognisably not one. */
+const JOB_ID = /^job-[0-9a-z]+$/i;
+
+/** Optional fields a schema-complete emitter pads; blank means the model had nothing to say. */
+const PADDED_FIELDS = Object.freeze(["job", "cwd", "description", "timeoutMs", "run_in_background"] as const);
+
+function blank(value: unknown): boolean {
+  return value === null || (typeof value === "string" && value.trim().length === 0);
+}
+
+function runnable(command: unknown): boolean {
+  return (typeof command === "string" && command.trim().length > 0) || (Array.isArray(command) && command.length > 0);
+}
+
+/**
+ * Claude Code's `timeout` is milliseconds, so it folds onto `timeoutMs` with no conversion.
+ *
+ * The rest of this is defence against a provider that emits *every* declared property on
+ * every call — observed live from an openai_completions proxy, which sent the whole schema
+ * and padded `job` with `"?"`, `"x"`, `"."`, `".undefined"` because the field was declared as
+ * a non-empty string. That padding flipped the tool into collection mode and made the call
+ * unrecoverable: the model could not stop sending `job`, so it retried the same failure
+ * forever. A collect call carries no command, so a `job` that arrives beside a real command
+ * and is not one of our ids is padding, and the command is the request.
+ */
+export function normalizeBashArgs(input: unknown): unknown | string {
+  const folded = foldToolAliases(input, BASH_ALIASES, "bash");
+  if (typeof folded === "string") return folded;
+  const source = toolArgs(folded);
+  if (source === undefined) return folded;
+  const args = { ...source };
+  for (const field of PADDED_FIELDS) if (field in args && blank(args[field])) delete args[field];
+  if (typeof args.job === "string") {
+    const job = args.job.trim();
+    if (runnable(args.command) && !JOB_ID.test(job)) delete args.job;
+    else args.job = job;
+  }
+  if (!Array.isArray(args.command)) return args;
+  if (args.command.length === 0 || args.command.some((part) => typeof part !== "string")) return "command as an array must contain only strings, such as [\"bash\", \"-lc\", \"ls -la\"]; a single shell string is simpler.";
+  return { ...args, command: commandFromArgv(args.command as string[]) };
+}
 
 function runtime(context: ToolExecutionContext, root?: string): { cwd: string; origin: string; store: ArtifactStore } {
   const value = context as Partial<ToolRuntimeContext>;
@@ -48,14 +119,35 @@ function runtime(context: ToolExecutionContext, root?: string): { cwd: string; o
 
 
 
-function parseArgs(args: unknown): BashRequest | string {
-  if (args === null || typeof args !== "object" || Array.isArray(args)) return "arguments must be an object with a command";
-  const value = args as Record<string, unknown>;
-  if (typeof value.command !== "string" || value.command.trim().length === 0) return "command must be a non-empty string";
-  if (value.cwd !== undefined && (typeof value.cwd !== "string" || value.cwd.trim().length === 0)) return "cwd must be a non-empty string when provided";
+type BashCall = { kind: "run"; request: BashRequest } | { kind: "collect"; job: string; timeoutMs?: number };
+
+function parseArgs(input: unknown): BashCall | string {
+  const folded = normalizeBashArgs(input);
+  if (typeof folded === "string") return folded;
+  if (folded === null || typeof folded !== "object" || Array.isArray(folded)) return "arguments must be an object with a command";
+  const value = folded as Record<string, unknown>;
   const rawTimeout = value.timeoutMs;
   if (rawTimeout !== undefined && (typeof rawTimeout !== "number" || !Number.isSafeInteger(rawTimeout) || rawTimeout < 1 || rawTimeout > 3_600_000)) return "timeoutMs must be an integer between 1 and 3600000";
-  return { command: value.command, ...(value.cwd === undefined ? {} : { cwd: value.cwd as string }), ...(rawTimeout === undefined ? {} : { timeoutMs: rawTimeout }) };
+  if (value.job !== undefined) {
+    if (typeof value.job !== "string" || value.job.trim().length === 0) return "job must be the job id string returned by an earlier bash call";
+    if (value.command !== undefined) return `job ${JSON.stringify(value.job)} arrived alongside a command; send command by itself to start a command, or job by itself to collect one already started`;
+    return { kind: "collect", job: value.job, ...(rawTimeout === undefined ? {} : { timeoutMs: rawTimeout }) };
+  }
+  if (typeof value.command !== "string" || value.command.trim().length === 0) return "command must be a non-empty string, or pass job to collect the output of a command already started";
+  if (value.cwd !== undefined && (typeof value.cwd !== "string" || value.cwd.trim().length === 0)) return "cwd must be a non-empty string when provided";
+  if (value.description !== undefined && typeof value.description !== "string") return "description must be a string when provided";
+  const background = value.run_in_background;
+  if (background !== undefined && typeof background !== "boolean") return "run_in_background must be a boolean when provided";
+  // `description` is display metadata for the UI's collapsed tool row; execution ignores it.
+  return {
+    kind: "run",
+    request: {
+      command: value.command,
+      ...(value.cwd === undefined ? {} : { cwd: value.cwd as string }),
+      ...(rawTimeout === undefined ? {} : { timeoutMs: rawTimeout }),
+      ...(background === true ? { background: true } : {}),
+    },
+  };
 }
 
 function errorResult(message: string): ToolExecutionResult { return { content: message, isError: true }; }
@@ -87,23 +179,43 @@ export class BashTool implements LyraTool {
     this.#ownsHost = options.processHost === undefined;
   }
 
+  normalize(args: unknown): unknown | string { return normalizeBashArgs(args); }
+
   async execute(args: unknown, context: ToolExecutionContext): Promise<ToolExecutionResult> {
     const parsed = parseArgs(args);
     if (typeof parsed === "string") return errorResult(`Invalid bash arguments: ${parsed}.`);
     const base = runtime(context, this.#options.root);
-    const requested = parsed.cwd === undefined ? base.cwd : resolve(base.cwd, parsed.cwd);
+    if (parsed.kind === "collect") return this.#collect(parsed.job, parsed.timeoutMs ?? this.#options.maxInlineMs, base.store);
+    const request = parsed.request;
+    const requested = request.cwd === undefined ? base.cwd : resolve(base.cwd, request.cwd);
     const cwd = requested;
-    const timeoutMs = parsed.timeoutMs ?? this.#options.maxInlineMs;
-    this.#options.activity?.({ type: "bash_started", command: parsed.command, cwd });
+    const timeoutMs = request.timeoutMs ?? this.#options.maxInlineMs;
+    this.#options.activity?.({ type: "bash_started", command: request.command, cwd });
     try {
-      const launched = await this.#host.run({ command: parsed.command, cwd, timeoutMs, signal: context.signal });
+      const launched = await this.#host.run({ command: request.command, cwd, timeoutMs, signal: context.signal, ...(request.background === true ? { background: true } : {}) });
       if (isJobHandle(launched)) {
-        this.#options.activity?.({ type: "bash_started", command: parsed.command, cwd, jobId: launched.id });
-        return { content: `Started heavy bash command as job ${launched.id}. Use the host job wait/status API to retrieve complete output.`, metadata: { jobId: launched.id, command: parsed.command, cwd, heavy: true } };
+        this.#options.activity?.({ type: "bash_started", command: request.command, cwd, jobId: launched.id });
+        const why = launched.class === "heavy" ? "heavy commands never block the agent" : "run_in_background was set";
+        return { content: `Started bash job ${launched.id} (${why}). Call bash({ job: ${JSON.stringify(launched.id)} }) to wait for it and read the complete output.`, metadata: { jobId: launched.id, command: request.command, cwd, heavy: launched.class === "heavy" } };
       }
-      this.#options.activity?.({ type: "bash_finished", command: parsed.command, cwd, exitCode: launched.exitCode });
+      this.#options.activity?.({ type: "bash_finished", command: request.command, cwd, exitCode: launched.exitCode });
       return { content: await present(launched, base.store, this.#options.displayBudget), ...(launched.exitCode === 0 ? {} : { isError: true }) };
     } catch (error) { return errorResult(`Bash failed: ${error instanceof Error ? error.message : String(error)}`); }
+  }
+
+  /** The other half of the job handle: without it, a heavy command's output is unreachable. */
+  async #collect(id: string, timeoutMs: number, store: ArtifactStore): Promise<ToolExecutionResult> {
+    try {
+      const known = this.#host.status?.(id);
+      if (this.#host.status !== undefined && known === undefined) return errorResult(`No bash job ${JSON.stringify(id)} exists in this session. Job ids come from a bash call that reported "Started bash job ...".`);
+      const result = await this.#host.wait(id, timeoutMs);
+      if (result === undefined) {
+        const status = this.#host.status?.(id)?.status ?? "running";
+        return { content: `Bash job ${id} is still ${status} after ${timeoutMs}ms. Call bash({ job: ${JSON.stringify(id)} }) again to keep waiting.`, metadata: { jobId: id, pending: true } };
+      }
+      this.#options.activity?.({ type: "bash_finished", command: known?.command ?? id, cwd: known?.cwd ?? "", jobId: id, exitCode: result.exitCode });
+      return { content: await present(result, store, this.#options.displayBudget), ...(result.exitCode === 0 ? {} : { isError: true }), metadata: { jobId: id } };
+    } catch (error) { return errorResult(`Unable to collect bash job ${id}: ${error instanceof Error ? error.message : String(error)}`); }
   }
   async close(): Promise<void> { if (this.#ownsHost) await this.#host.close(); }
 }

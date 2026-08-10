@@ -15,6 +15,13 @@ export interface ArtifactStore {
 
 export interface LyraTool {
   readonly definition: ToolDefinition;
+  /**
+   * Fold schema-declared argument aliases onto their canonical names and refuse fields Lyra
+   * deliberately does not implement. Runs before schema validation, so a first call spelled
+   * the way another harness trained the model still lands (LYRA.md §3.7). Returns the
+   * rewritten arguments, or a sentence explaining the correct call.
+   */
+  normalize?(args: unknown): unknown | string;
   execute(args: unknown, context: ToolExecutionContext): Promise<ToolExecutionResult>;
   close?(): void | Promise<void>;
 }
@@ -76,18 +83,30 @@ export class ToolRegistry implements CoreToolRegistry {
       };
     }
     const schema = this.#schemas.get(name);
+    // Aliases are folded before validation: `additionalProperties: false` would otherwise
+    // refuse a first call spelled the way another harness trained the model (§3.7).
+    let normalized = input;
+    try {
+      if (typeof tool.normalize === "function") {
+        const result = tool.normalize(input);
+        if (typeof result === "string") return { content: `Invalid arguments for ${safeJson(name)}: ${result}`, isError: true };
+        normalized = result;
+      }
+    } catch (error) {
+      return { content: `Invalid arguments for ${safeJson(name)}: ${errorMessage(error)} Correct the arguments and retry.`, isError: true };
+    }
     let argumentError: string | undefined;
     try {
-      argumentError = validateInput(input, schema);
+      argumentError = validateInput(normalized, schema);
     } catch (error) {
       return {
-        content: `Invalid arguments for ${safeJson(name)}: ${errorMessage(error)} Use the schema fields shown for this tool and retry.`,
+        content: `Invalid arguments for ${safeJson(name)}: ${errorMessage(error)} Correct the arguments and retry.`,
         isError: true,
       };
     }
     if (argumentError !== undefined) {
       return {
-        content: `Invalid arguments for ${safeJson(name)}: ${argumentError} Use the schema fields shown for this tool and retry.`,
+        content: `Invalid arguments for ${safeJson(name)}: ${argumentError} Correct the arguments and retry.`,
         isError: true,
       };
     }
@@ -106,7 +125,7 @@ export class ToolRegistry implements CoreToolRegistry {
       };
     }
     try {
-      const result = await tool.execute(input, context);
+      const result = await tool.execute(normalized, context);
       if (!isToolExecutionResult(result)) {
         return {
           content: `Tool ${safeJson(name)} returned an invalid result. Retry with corrected arguments or report this defect.`,
@@ -192,8 +211,14 @@ function validateInput(input: unknown, schema: Readonly<Record<string, unknown>>
   return schemaIssue(input, schema, "$args");
 }
 
+/** The documented field list, inlined into errors so the model never has to re-read the schema. */
+function fieldList(properties: Record<string, unknown>): string {
+  const names = Object.keys(properties);
+  return names.length === 0 ? "this tool takes no arguments" : `this tool takes: ${names.join(", ")}`;
+}
+
 function schemaIssue(value: unknown, schema: Readonly<Record<string, unknown>>, path: string): string | undefined {
-  if (schema.enum !== undefined && Array.isArray(schema.enum) && !schema.enum.some((candidate) => sameJson(candidate, value))) return `${path} must be one of the declared values.`;
+  if (schema.enum !== undefined && Array.isArray(schema.enum) && !schema.enum.some((candidate) => sameJson(candidate, value))) return `${path} must be one of: ${schema.enum.map((candidate) => safeJson(candidate)).join(", ")}.`;
   const expected = schema.type;
   if (expected !== undefined) {
     const allowed = Array.isArray(expected) ? expected : [expected];
@@ -228,13 +253,21 @@ function schemaIssue(value: unknown, schema: Readonly<Record<string, unknown>>, 
   if (value !== null && typeof value === "object" && !Array.isArray(value) && (expected === undefined || expected === "object" || (Array.isArray(expected) && expected.includes("object")))) {
     const properties = schema.properties && typeof schema.properties === "object" && !Array.isArray(schema.properties) ? schema.properties as Record<string, unknown> : {};
     if (Array.isArray(schema.required)) {
-      for (const name of schema.required) if (!(name in value)) return `${path}.${name} is required.`;
+      // A missing required field is the highest-frequency first call to get wrong, so the
+      // error carries that field's own documentation rather than a bare name (§3.7).
+      for (const name of schema.required) if (!(name in value)) {
+        const described = properties[name];
+        const detail = described !== null && typeof described === "object" && !Array.isArray(described) && typeof (described as Record<string, unknown>).description === "string"
+          ? (described as Record<string, string>).description
+          : undefined;
+        return detail === undefined ? `${path}.${name} is required (${fieldList(properties)}).` : `${path}.${name} is required — ${detail}`;
+      }
     }
     for (const [name, propertySchema] of Object.entries(properties)) if (name in value && propertySchema && typeof propertySchema === "object" && !Array.isArray(propertySchema)) {
       const issue = schemaIssue((value as Record<string, unknown>)[name], propertySchema as Readonly<Record<string, unknown>>, `${path}.${name}`);
       if (issue !== undefined) return issue;
     }
-    if (schema.additionalProperties === false) for (const name of Object.keys(value)) if (!(name in properties)) return `${path}.${name} is not recognized; remove it or use the documented fields.`;
+    if (schema.additionalProperties === false) for (const name of Object.keys(value)) if (!(name in properties)) return `${path}.${name} is not recognized — ${fieldList(properties)}.`;
   }
   return undefined;
 }
