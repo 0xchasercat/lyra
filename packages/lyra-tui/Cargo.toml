@@ -13,6 +13,29 @@ name = "lyra-tui"
 path = "src/main.rs"
 
 [dependencies]
-flywheel = { package = "flywheel-compositor", git = "https://github.com/0xchasercat/flywheel", rev = "067a68fc4bc1e5c6790b746f9ec053553f1ed3a8" }
+# Flywheel is vendored, not depended upon (LYRA.md §4). Its compositor core lives
+# in src/vendor/flywheel; see that module for what was taken and what was rejected.
+bitflags = "2.6"
+crossbeam-channel = "0.5"
+crossterm = { version = "0.28", default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# SIGWINCH, for the input actor's resize source (build phase 4). Used through its
+# safe `iterator::Signals` API only; this crate forbids unsafe code.
+signal-hook = { version = "0.3", default-features = false, features = ["iterator"] }
+# Theme overrides are *data*, never code: a TOML table of semantic tokens
+# (DESIGN.md §3). Parse-only — this crate never writes a theme file.
+toml = { version = "0.8", default-features = false, features = ["parse"] }
+unicode-segmentation = "1.12"
+unicode-width = "0.2"
+
+[dev-dependencies]
+# The stable-prefix monotonicity property (DESIGN.md §1) is the one invariant an
+# example-based test cannot cover: it quantifies over *every* split point of
+# *every* document.
+proptest = "1"
+
+# The pty integration test needs a controlling terminal, which only exists
+# behind `openpty`/`setsid`/`TIOCSCTTY`. Dev-only, and confined to the
+# integration-test crate so `#![forbid(unsafe_code)]` in the library stands.
+libc = "0.2"
