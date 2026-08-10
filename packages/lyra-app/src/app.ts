@@ -1,3 +1,4 @@
+import { realpath } from "node:fs/promises";
 import { basename, isAbsolute, resolve } from "node:path";
 import { AcpDaemon, type AcpHandler, type AcpHandlers } from "@lyra/acp";
 import { IrcBus, SpawnManager, type SpawnExecutor, type SpawnRequest } from "@lyra/core";
@@ -9,11 +10,19 @@ import { RuntimeManager, type RuntimeAdapters } from "@lyra/runtime";
 import { SkillRegistry } from "@lyra/skills";
 import { createArtifactStore, type ToolRegistry } from "@lyra/tools";
 import { loadConfig, durationMs, type LyraConfig } from "./config.ts";
-import { SlashCommandRouter, type SlashServices } from "./commands.ts";
+import { SLASH_COMMAND_CATALOG, SlashCommandRouter, type SlashServices } from "./commands.ts";
 import { createIntegratedToolRegistry, INTEGRATED_TOOL_NAMES } from "./integrated-tools.ts";
 import { MetricsStore } from "./metrics.ts";
 
-type SessionAcpMethod = "session/new" | "session/load" | "session/prompt" | "session/update" | "session/cancel" | "session/fork" | "session/command" | "context/inspect";
+type SessionAcpMethod =
+  | "session/new" | "session/load" | "session/list" | "session/snapshot"
+  | "session/prompt" | "session/steer" | "session/cancel" | "session/fork" | "session/command"
+  | "session/complete"
+  | "session/models" | "session/select_model" | "session/providers" | "session/select_provider"
+  | "provider/setup_options" | "provider/detect" | "provider/verify" | "provider/add"
+  | "provider/get" | "provider/remove"
+  | "model/add"
+  | "context/inspect";
 export interface SessionServices {
   copy(target?: string): Promise<unknown>; dump(): Promise<unknown>; settings(args: readonly string[]): Promise<unknown>; provider(args: readonly string[]): Promise<unknown>; model(args: readonly string[]): Promise<unknown>; loop(spec: string): Promise<unknown>; context(): Promise<unknown>; compact(clear: boolean): Promise<unknown>; sessions(operation: "fork" | "resume" | "list", value?: string): Promise<unknown>;
   acp: Record<SessionAcpMethod, AcpHandler>;
@@ -29,11 +38,17 @@ export interface LyraApplicationOptions {
   home?: string;
 }
 interface ApplicationParts {
-  config: LyraConfig; workspace: WorkspaceRecord; workspaces: WorkspaceManager; processes: ProcessHost; bus: IrcBus; spawn: SpawnManager; lsp: LspManager; git: GitPipeline; mcp: McpRegistry; mcpTool: McpGateway; draco: DracoInstaller; skills: SkillRegistry; runtime: RuntimeManager; tools: ToolRegistry; metrics: MetricsStore; commands: SlashCommandRouter; acp: AcpDaemon;
+  config: LyraConfig; origin: string; workspace: WorkspaceRecord; workspaces: WorkspaceManager; processes: ProcessHost; bus: IrcBus; spawn: SpawnManager; lsp: LspManager; git: GitPipeline; mcp: McpRegistry; mcpTool: McpGateway; draco: DracoInstaller; skills: SkillRegistry; runtime: RuntimeManager; tools: ToolRegistry; metrics: MetricsStore; commands: SlashCommandRouter; acp: AcpDaemon;
 }
 
 export class LyraApplication {
   readonly config: LyraConfig;
+  /**
+   * The origin repository's canonical path. It is read from here rather than from
+   * `workspaces.origin` because the manager only learns its own canonical path when
+   * it opens, and with workspaces disabled it is never opened.
+   */
+  readonly origin: string;
   readonly workspace: WorkspaceRecord;
   readonly workspaces: WorkspaceManager;
   readonly processes: ProcessHost;
@@ -53,30 +68,50 @@ export class LyraApplication {
   readonly #sessions: SessionServices;
 
   private constructor(parts: ApplicationParts, sessions: SessionServices) {
-    this.config = parts.config; this.workspace = parts.workspace; this.workspaces = parts.workspaces; this.processes = parts.processes; this.bus = parts.bus; this.spawn = parts.spawn; this.lsp = parts.lsp; this.git = parts.git; this.mcp = parts.mcp; this.mcpTool = parts.mcpTool; this.draco = parts.draco; this.skills = parts.skills; this.runtime = parts.runtime; this.tools = parts.tools; this.metrics = parts.metrics; this.commands = parts.commands; this.acp = parts.acp; this.#sessions = sessions;
+    this.config = parts.config; this.origin = parts.origin; this.workspace = parts.workspace; this.workspaces = parts.workspaces; this.processes = parts.processes; this.bus = parts.bus; this.spawn = parts.spawn; this.lsp = parts.lsp; this.git = parts.git; this.mcp = parts.mcp; this.mcpTool = parts.mcpTool; this.draco = parts.draco; this.skills = parts.skills; this.runtime = parts.runtime; this.tools = parts.tools; this.metrics = parts.metrics; this.commands = parts.commands; this.acp = parts.acp; this.#sessions = sessions;
   }
 
   static async boot(options: LyraApplicationOptions): Promise<LyraApplication> {
     if (!options || typeof options.origin !== "string" || options.origin.length === 0) throw new TypeError("Lyra application origin is required.");
     if (typeof options.session !== "string" || !/^[a-z][a-z0-9-]{0,63}$/.test(options.session)) throw new TypeError("Lyra session must be a readable lowercase name.");
     if (typeof options.spawnExecutor !== "function") throw new TypeError("A real spawn executor is required; Lyra does not install a fake delegation fallback.");
-    const config = await loadConfig(options.origin, options.home);
-    const workspaces = await WorkspaceManager.open(options.origin);
-    const existing = (await workspaces.list()).find((record) => record.state !== "dropped" && record.name === options.session);
-    let workspace = existing ?? (config.workspace.enabled ? await workspaces.create(options.session) : { name: options.session, path: workspaces.origin, origin: workspaces.origin, state: "active" as const, mode: "clone" as const, createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() });
-    if (config.workspace.enabled) workspace = await workspaces.resume(workspace.name);
+    // Configuration and the origin's canonical path are both independent disk walks that
+    // only need the origin path, so the two overlap instead of queueing.
+    const [config, origin] = await Promise.all([loadConfig(options.origin, options.home), canonicalOrigin(options.origin)]);
+    // Opening the manager probes Git, and that probe is what rejects an origin which is
+    // not a repository root. With workspaces disabled nothing here needs a clone, so the
+    // manager is constructed but left closed and opens on its first real use — a spawn
+    // asking for isolation, or a workspace command. A plain directory therefore boots and
+    // runs, and an impossible isolated spawn fails at the spawn with an actionable error
+    // instead of taking the whole daemon down before the first prompt.
+    const workspaces = new WorkspaceManager(options.origin);
+    let workspace: WorkspaceRecord;
+    if (config.workspace.enabled) {
+      await workspaces.ready();
+      const existing = (await workspaces.list()).find((record) => record.state !== "dropped" && record.name === options.session);
+      workspace = await workspaces.resume((existing ?? await workspaces.create(options.session)).name);
+    } else {
+      const now = new Date().toISOString();
+      workspace = { name: options.session, path: origin, origin, state: "active", mode: "clone", createdAt: now, updatedAt: now };
+    }
     const processes = new ProcessHost({ heavyLimit: config.exec.heavy, ioLimit: config.exec.io, cgroup: config.exec.cgroup });
     const bus = new IrcBus(); bus.register(workspace.name);
     const spawn = new SpawnManager({ defaultWorkspace: workspace.path, ...(config.roles.default === undefined ? {} : { defaultModel: config.roles.default }), availableTools: INTEGRATED_TOOL_NAMES, maxDepth: 2, createWorkspace: async (name, task, signal) => { const created = await workspaces.create({ ...(name === undefined ? {} : { name }), ...(task === undefined ? {} : { task }) }, signal); return { name: created.name, path: created.path }; }, resolveWorkspace: (name) => resolveSpawnWorkspace(workspaces, name), releaseWorkspace: (name) => workspaces.archive(name), executor: options.spawnExecutor });
-    const lsp = await LspManager.create({ workspace: workspace.path, ...(options.lspFallback === undefined ? {} : { fallback: options.lspFallback }) });
-    const git = new GitPipeline({ origin: workspaces.origin, mode: config.git.mode, ...(options.confirmAuto === undefined ? {} : { confirmAuto: options.confirmAuto }), resolver: { resolve: async (args, signal) => { try { await runSpawnWithSignal(spawn, { task: mergeResolverTask(args), model: "@merge", isolated: false, workspace: args.repo, label: "merge-resolver" }, signal ?? new AbortController().signal); return true; } catch (error) { await options.onReport?.(`[git merge] Resolver stopped: ${errorMessage(error)}`); return false; } } }, activity: (activity) => { void options.onReport?.(`[git ${activity.operation}] ${activity.detail}`); } });
-    if (config.git.mode === "auto") await git.setMode("auto");
-    const mcp = new McpRegistry(workspaces.origin);
-    await mcp.index();
-    const mcpGateway = new McpGateway(mcp, createArtifactStore(workspaces.origin));
-    const draco = new DracoInstaller({ origin: workspaces.origin, ...(options.home === undefined ? {} : { home: options.home }) });
-    const skills = new SkillRegistry({ workspace: workspace.path, ...(options.home === undefined ? {} : { home: options.home }) }); await skills.discover();
-    const metrics = new MetricsStore(workspaces.origin);
+    const git = new GitPipeline({ origin, mode: config.git.mode, ...(options.confirmAuto === undefined ? {} : { confirmAuto: options.confirmAuto }), resolver: { resolve: async (args, signal) => { try { await runSpawnWithSignal(spawn, { task: mergeResolverTask(args), model: "@merge", isolated: false, workspace: args.repo, label: "merge-resolver" }, signal ?? new AbortController().signal); return true; } catch (error) { await options.onReport?.(`[git merge] Resolver stopped: ${errorMessage(error)}`); return false; } } }, activity: (activity) => { void options.onReport?.(`[git ${activity.operation}] ${activity.detail}`); } });
+    const mcp = new McpRegistry(origin);
+    const mcpGateway = new McpGateway(mcp, createArtifactStore(origin));
+    const draco = new DracoInstaller({ origin, ...(options.home === undefined ? {} : { home: options.home }) });
+    const skills = new SkillRegistry({ workspace: workspace.path, ...(options.home === undefined ? {} : { home: options.home }) });
+    // Language servers, MCP indexing, skill discovery, and the Git mode probe each depend
+    // only on the workspace that already exists, so they start together. Promise.all still
+    // propagates the first failure, so a boot that used to throw still throws.
+    const [lsp] = await Promise.all([
+      LspManager.create({ workspace: workspace.path, ...(options.lspFallback === undefined ? {} : { fallback: options.lspFallback }) }),
+      mcp.index(),
+      skills.discover(),
+      config.git.mode === "auto" ? git.setMode("auto") : undefined,
+    ]);
+    const metrics = new MetricsStore(origin);
     let tools: ToolRegistry | undefined;
     const runtimeAdapters: RuntimeAdapters = {
       spawn: async (request, signal) => runSpawnWithSignal(spawn, runtimeSpawn(request), signal),
@@ -87,13 +122,16 @@ export class LyraApplication {
       workspace: async (operation, args, signal) => { throwIfAborted(signal); const result = operation === "create" ? await workspaces.create(runtimeOptionalName(args, "name") ?? {}, signal) : operation === "list" ? await workspaces.list() : await workspaces.drop(runtimeName(args, "name"), signal); throwIfAborted(signal); return result; },
       report: async (message, signal) => { throwIfAborted(signal); await options.onReport?.(message); },
     };
-    const runtime = new RuntimeManager({ origin: workspaces.origin, session: options.session, adapters: runtimeAdapters, runTimeoutMs: durationMs(config.reliability.turn_timeout) });
+    const runtime = new RuntimeManager({ origin, session: options.session, adapters: runtimeAdapters, runTimeoutMs: durationMs(config.reliability.turn_timeout) });
     tools = createIntegratedToolRegistry({ lsp, spawn, bus, peer: workspace.name, skills, runtime, mcp: mcpGateway, filesystem: { root: workspace.path }, bash: { root: workspace.path, processHost: processes } });
     const services = makeSlashServices(options.sessions, { workspaces, processes, bus, spawn, git, skills, mcp, draco, metrics, config });
     const handlers = makeAcpHandlers(options.sessions, { workspaces, spawn, bus, git, metrics, config });
-    const acp = new AcpDaemon({ handlers });
+    // The turn-class deadline is the *configured* one, so `reliability.turn_timeout` bounds
+    // the ACP request that carries a turn exactly as it bounds the loop running inside it.
+    // Both stdio paths — `--acp` and the TUI's private pipe pair — are this one daemon.
+    const acp = new AcpDaemon({ handlers, turnTimeoutMs: durationMs(config.reliability.turn_timeout) });
     const commands = new SlashCommandRouter(services);
-    return new LyraApplication({ config, workspace, workspaces, processes, bus, spawn, lsp, git, mcp, mcpTool: mcpGateway, draco, skills, runtime, tools, metrics, commands, acp }, options.sessions);
+    return new LyraApplication({ config, origin, workspace, workspaces, processes, bus, spawn, lsp, git, mcp, mcpTool: mcpGateway, draco, skills, runtime, tools, metrics, commands, acp }, options.sessions);
   }
 
   slash(command: string): Promise<unknown> { return this.commands.execute(command); }
@@ -102,6 +140,9 @@ export class LyraApplication {
 function makeAcpHandlers(sessions: SessionServices, parts: { workspaces: WorkspaceManager; spawn: SpawnManager; bus: IrcBus; git: GitPipeline; metrics: MetricsStore; config: LyraConfig }): AcpHandlers {
   return {
     ...sessions.acp,
+    // Served straight from the router's own table: the popup and the router can never
+    // disagree about which commands exist.
+    "session/commands": () => ({ commands: SLASH_COMMAND_CATALOG }),
     "workspace/list": () => parts.workspaces.list(), "workspace/create": (params, context) => parts.workspaces.create(runtimeOptionalName(params, "name") ?? {}, context.signal), "workspace/drop": (params, context) => parts.workspaces.drop(runtimeName(params, "name"), context.signal),
     "agent/list": () => parts.spawn.list(),
     "agent/spawn": async (params, context) => { const handle = parts.spawn.spawn({ ...runtimeSpawn(params), blocking: false }); const cancel = (): void => { parts.spawn.cancel(handle.id); }; context.signal.addEventListener("abort", cancel, { once: true }); try { return await parts.spawn.wait(handle.id); } finally { context.signal.removeEventListener("abort", cancel); } },
@@ -112,13 +153,80 @@ function makeAcpHandlers(sessions: SessionServices, parts: { workspaces: Workspa
 }
 function makeSlashServices(sessions: SessionServices, parts: { workspaces: WorkspaceManager; processes: ProcessHost; bus: IrcBus; spawn: SpawnManager; git: GitPipeline; skills: SkillRegistry; mcp: McpRegistry; draco: DracoInstaller; metrics: MetricsStore; config: LyraConfig }): SlashServices {
   return {
-    copy: (target) => sessions.copy(target), dump: () => sessions.dump(), settings: (args) => sessions.settings(args), provider: (args) => sessions.provider(args), model: (args) => sessions.model(args), loop: (spec) => sessions.loop(spec), context: () => sessions.context(), compact: (clear) => sessions.compact(clear),
-    agents: async (operation, name) => operation === "list" ? parts.spawn.list() : name ? parts.spawn.cancel(name) : false,
-    workspaces: async (operation) => operation === "list" ? parts.workspaces.list() : cleanupWorkspaces(parts.workspaces, durationMs(parts.config.workspace.archive_after)),
-    git: async (operation, value) => operation === "mode" ? parts.git.setMode(gitMode(value)) : operation === "review" ? assembleReview(parts.git, parts.workspaces) : operation === "apply" ? parts.git.apply(value) : parts.git.rollback(value),
-    skills: async () => parts.skills.list(), mcp: async () => parts.mcp.index(), install: async (tool) => { if (tool !== "draco") throw new Error(`Unsupported installer: ${tool}.`); return parts.draco.install(parts.mcp); }, sessions: (operation, value) => sessions.sessions(operation, value), health: async () => parts.metrics.health({ processes: parts.processes.list().length, workspaces: (await parts.workspaces.list()).length }),
+    copy: async (target) => report(`Copied ${textLength(await sessions.copy(target))} characters of the assistant's reply to the clipboard.`),
+    dump: async () => report(`Copied the full transcript to the clipboard as ${textLength(await sessions.dump())} characters of JSON.`),
+    settings: async (args) => report(args.length === 0 ? "Effective runtime settings." : `Applied ${args[0]}.`, await sessions.settings(args)),
+    provider: async (args) => report(args.length === 0 ? "Configured providers." : `Switched provider to ${args.join("/")}.`, await sessions.provider(args)),
+    // Selecting a model answers with the whole model surface rather than an
+    // acknowledgement, so /model has one declared shape whether or not it was given a
+    // reference — the client renders one view and never branches on the arguments it sent.
+    model: async (args) => {
+      if (args.length > 0 && args[0] !== "refresh") await sessions.model(args);
+      return sessions.model(args[0] === "refresh" ? ["refresh"] : []);
+    },
+    loop: async (spec) => report(`Autonomous loop finished: ${spec}.`, await sessions.loop(spec)),
+    // The measured payload itself is megabytes and no client renders it; the breakdown is
+    // the answer. `context/inspect` still returns the whole inspection for callers that
+    // want the payload.
+    context: async () => contextBreakdown(await sessions.context()),
+    compact: async (clear) => report(clear ? "Cleared the context behind a boundary; the transcript on disk is untouched." : "Compacted the transcript into a summary boundary.", await sessions.compact(clear)),
+    agents: async (operation, name) => operation === "list" ? { agents: parts.spawn.list() } : report(name === undefined ? "No agent id was given." : await parts.spawn.cancel(name) ? `Cancelled agent ${name}.` : `Agent ${name} is not running.`),
+    workspaces: async (operation) => ({ workspaces: operation === "list" ? await parts.workspaces.list() : await cleanupWorkspaces(parts.workspaces, durationMs(parts.config.workspace.archive_after)) }),
+    git: async (operation, value) => operation === "mode" ? report(`Git mode is now ${await parts.git.setMode(gitMode(value))}.`)
+      : operation === "review" ? report("Assembled a merge preview of the completed agent workspaces.", await assembleReview(parts.git, parts.workspaces))
+      : operation === "apply" ? report("Applied the reviewed preview to the origin repository.", await parts.git.apply(value))
+      : report("Rolled the repository back to the snapshot.", await parts.git.rollback(value)),
+    skills: async () => ({ skills: parts.skills.list() }),
+    mcp: async () => ({ tools: await parts.mcp.index() }),
+    install: async (tool) => { if (tool !== "draco") throw new Error(`Unsupported installer: ${tool}.`); return report(`Installed ${tool} and re-indexed the MCP registry.`, await parts.draco.install(parts.mcp)); },
+    sessions: async (operation, value) => operation === "list" ? { sessions: await sessions.sessions("list") }
+      : operation === "resume" ? report(`Loaded session ${value ?? ""}.`, await sessions.sessions(operation, value))
+      : report(value === undefined ? "Forked the transcript at its head." : `Forked the transcript at ${value}.`, await sessions.sessions(operation, value)),
+    health: async () => parts.metrics.health({ processes: parts.processes.list().length, workspaces: await workspaceCount(parts.workspaces, parts.config.workspace.enabled) }),
   };
 }
+/**
+ * The shape every free-form command answers with: one printable line, plus the command's
+ * own payload beside it. The line is for the client to render as-is; the payload is not
+ * flattened into prose, so nothing a command computed is lost on the way to the wire.
+ */
+function report(message: string, detail?: unknown): { report: string; detail?: unknown } {
+  return { report: message, ...(detail === undefined ? {} : { detail }) };
+}
+function textLength(value: unknown): number { return typeof value === "string" ? value.length : 0; }
+
+/**
+ * A context inspection without its `payload`: the measurement, not the megabytes. Every
+ * field is copied by name, so a new field in the inspection is an explicit decision here
+ * rather than an accidental addition to the protocol.
+ */
+function contextBreakdown(value: unknown): Record<string, unknown> {
+  if (!isRecord(value)) throw new Error("Context inspection returned no breakdown.");
+  const fields = ["tokenEstimate", "contextWindow", "sections", "repairs", "lossMarkers", "cacheBreakpoints", "sourceEntryIds"] as const;
+  return Object.fromEntries(fields.flatMap((field) => field in value ? [[field, value[field]] as const] : []));
+}
+
+/**
+ * How many workspaces exist, for a health report that is about everything else. With
+ * workspaces enabled the manager is already open and any failure is real. With them
+ * disabled the manager may never have opened, and an origin that cannot host a
+ * workspace holds none — so it answers zero instead of failing an unrelated report.
+ */
+async function workspaceCount(manager: WorkspaceManager, enabled: boolean): Promise<number> {
+  try { return (await manager.list()).length; }
+  catch (error) { if (enabled) throw error; return 0; }
+}
+
+/**
+ * The origin's canonical path — the same value an opened `WorkspaceManager` reports.
+ * A path that cannot be resolved is left as written: the manager says why, in its own
+ * words, the moment anything actually needs it.
+ */
+async function canonicalOrigin(origin: string): Promise<string> {
+  const resolved = resolve(origin);
+  try { return await realpath(resolved); } catch { return resolved; }
+}
+
 async function resolveSpawnWorkspace(manager: WorkspaceManager, name: string): Promise<{ name: string; path: string }> {
   if (isAbsolute(name)) return { name: basename(name), path: resolve(name) };
   const existing = await manager.get(name);

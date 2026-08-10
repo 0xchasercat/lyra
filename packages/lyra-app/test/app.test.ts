@@ -7,7 +7,7 @@ import { LyraApplication, LyraRuntime, MetricsStore, SlashCommandRouter, duratio
 import type { SessionServices, SlashServices } from "../src/index.ts";
 
 async function git(cwd: string, args: string[]): Promise<void> { const child = Bun.spawn(["git", ...args], { cwd, env: { ...process.env, GIT_AUTHOR_NAME: "Lyra", GIT_AUTHOR_EMAIL: "lyra@test", GIT_COMMITTER_NAME: "Lyra", GIT_COMMITTER_EMAIL: "lyra@test" }, stdout: "ignore", stderr: "pipe" }); const error = new Response(child.stderr).text(); if (await child.exited !== 0) throw new Error(await error); }
-function sessionServices(): SessionServices { const value = async () => null; return { copy: value, dump: value, settings: value, provider: value, model: value, loop: value, context: value, compact: value, sessions: value, acp: { "session/new": value, "session/load": value, "session/prompt": value, "session/update": value, "session/cancel": value, "session/fork": value, "context/inspect": value } }; }
+function sessionServices(): SessionServices { const value = async () => null; return { copy: value, dump: value, settings: value, provider: value, model: value, loop: value, context: value, compact: value, sessions: value, acp: { "session/new": value, "session/load": value, "session/list": value, "session/snapshot": value, "session/prompt": value, "session/steer": value, "session/cancel": value, "session/fork": value, "session/command": value, "session/complete": value, "session/models": value, "session/select_model": value, "session/providers": value, "session/select_provider": value, "context/inspect": value } }; }
 
 describe("Lyra application composition", () => {
   test("loads data-only config with project precedence and validates durations", async () => {
@@ -81,11 +81,59 @@ describe("Lyra application composition", () => {
       expect(scoped.content.toString()).toContain("assembled");
       const childWorkspace = (await runtime.app.workspaces.list()).find((workspace) => workspace.name !== runtime.app.workspace.name && workspace.state === "archived");
       expect(childWorkspace?.task).toBe("child proof");
-      const review = await runtime.command("/review") as { error?: string; output?: { path?: string; workspaces?: unknown[] } };
+      // /review has no declared result shape, so it answers with the free-form report
+      // shape: one printable line, with the preview it computed intact beside it.
+      const review = await runtime.command("/review") as { error?: string; resultKind?: string; output?: { report?: string; detail?: { path?: string; workspaces?: unknown[] } } };
       expect(review.error).toBeUndefined();
-      expect(review.output?.path).toContain(join(".lyra", "previews"));
-      expect(review.output?.workspaces).toHaveLength(1);
+      expect(review.resultKind).toBe("report");
+      expect(review.output?.report).toContain("merge preview");
+      expect(review.output?.detail?.path).toContain(join(".lyra", "previews"));
+      expect(review.output?.detail?.workspaces).toHaveLength(1);
       expect((await runtime.session.context() as { payload: { messages: unknown[] } }).payload.messages.length).toBeGreaterThan(0);
+    } finally { await runtime.close(); await rm(root, { recursive: true, force: true }); }
+  }, 30_000);
+
+  // The session totals live in memory and on the ACP wire, so a finished run on disk
+  // could say what the agent did but not what it cost. The transcript now answers both.
+  test("persists each turn's reported token usage into the transcript", async () => {
+    const root = await mkdtemp(join(tmpdir(), "lyra-usage-"));
+    await mkdir(join(root, ".lyra"), { recursive: true });
+    await writeFile(join(root, ".lyra", "config.toml"), "[workspace]\nenabled = false\n");
+    const transport: ProviderTransport = { id: "fixture", apiType: "openai_completions", async *stream() { yield { type: "text_delta", text: "counted" }; yield { type: "usage", usage: { inputTokens: 1_200, outputTokens: 340, cacheReadTokens: 900 } }; yield { type: "complete", stopReason: "end_turn" }; } };
+    const environment = { provider: new ReliableProvider(transport), providerName: "fixture", model: "fixture-model", config: { providers: { fixture: { base_url: "http://fixture.invalid/v1", api_type: "openai_completions" as const, auth: { type: "none" as const }, models: ["fixture-model"] } }, roles: { default: "fixture/fixture-model" } } };
+    const runtime = await LyraRuntime.create({ origin: root, session: "usage-test", environment, home: join(root, "home") });
+    try {
+      await runtime.prompt("count this turn");
+      await runtime.prompt("and this one");
+      const usage = runtime.session.entries().filter((entry) => entry.type === "usage");
+      expect(usage).toHaveLength(2);
+      // Raw counts only: the fixture model has no known pricing, so cost is absent rather
+      // than a zero that would read as "free".
+      expect(usage[0]).toMatchObject({ inputTokens: 1_200, outputTokens: 340, cacheReadTokens: 900 });
+      expect(usage[0]).not.toHaveProperty("costMicroUsd");
+      expect(usage[0]).not.toHaveProperty("cacheWriteTokens");
+      // The recorded turn is still a plain conversation as far as the model is concerned.
+      expect((await runtime.session.context() as { payload: { messages: unknown[] } }).payload.messages).toHaveLength(4);
+    } finally { await runtime.close(); await rm(root, { recursive: true, force: true }); }
+  }, 30_000);
+
+  // Opening the workspace manager probes Git. With workspaces disabled nothing needs a
+  // clone, so a plain directory has to boot and run; the Git requirement belongs to the
+  // operation that actually wants isolation, where the error names something to fix.
+  test("runs in a plain directory when workspaces are disabled and defers the Git demand to isolation", async () => {
+    const root = await mkdtemp(join(tmpdir(), "lyra-plain-"));
+    await mkdir(join(root, ".lyra"), { recursive: true });
+    await writeFile(join(root, ".lyra", "config.toml"), "[workspace]\nenabled = false\n");
+    const transport: ProviderTransport = { id: "fixture", apiType: "openai_completions", async *stream() { yield { type: "text_delta", text: "ran without git" }; yield { type: "complete", stopReason: "end_turn" }; } };
+    const environment = { provider: new ReliableProvider(transport), providerName: "fixture", model: "fixture-model", config: { providers: { fixture: { base_url: "http://fixture.invalid/v1", api_type: "openai_completions" as const, auth: { type: "none" as const }, models: ["fixture-model"] } }, roles: { default: "fixture/fixture-model" } } };
+    const runtime = await LyraRuntime.create({ origin: root, session: "plain-dir", environment, home: join(root, "home") });
+    try {
+      expect(runtime.app.workspace.path).toBe(runtime.app.origin);
+      expect((await runtime.prompt("prove it boots")).assistant.content).toEqual([{ type: "text", text: "ran without git" }]);
+      expect((await runtime.command("/health")).error).toBeUndefined();
+      const isolated = await runtime.app.tools.execute("spawn", { task: "needs its own clone", blocking: true, isolated: true }, { signal: new AbortController().signal, sessionId: "plain-dir", workspace: runtime.app.workspace.path, callId: "spawn-isolated" });
+      expect(isolated.isError).toBe(true);
+      expect(isolated.content.toString()).toContain("not a Git working repository");
     } finally { await runtime.close(); await rm(root, { recursive: true, force: true }); }
   }, 30_000);
 });

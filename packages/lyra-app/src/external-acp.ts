@@ -1,3 +1,4 @@
+import { ACP_DEFAULT_TURN_TIMEOUT_MS } from "@lyra/acp";
 import type { IrcBus, SpawnExecutorContext, SpawnRequest } from "@lyra/core";
 
 interface Pending { resolve(value: unknown): void; reject(error: unknown): void; timer: ReturnType<typeof setTimeout>; }
@@ -22,7 +23,10 @@ export async function runExternalAcpAgent(command: string, request: SpawnRequest
     const created = await client.request("session/new", { cwd: context.workspace, mcpServers: [] });
     const sessionId = recordString(created, "sessionId") ?? recordString(created, "id");
     const prompt = request.context ? `${request.context}\n\n${request.task}` : request.task;
-    const response = await client.request("session/prompt", { ...(sessionId === undefined ? {} : { sessionId }), prompt: [{ type: "text", text: prompt }] });
+    // The same split the daemon makes in the other direction: `initialize` and `session/new`
+    // are questions and keep the 60s default, but this one *is* the external agent's turn and
+    // gets the turn-scale deadline. A cancel still arrives through `context.signal` at once.
+    const response = await client.request("session/prompt", { ...(sessionId === undefined ? {} : { sessionId }), prompt: [{ type: "text", text: prompt }] }, ACP_DEFAULT_TURN_TIMEOUT_MS);
     return { acp: nestedString(initialized, "agentInfo", "name") ?? "external", ...(sessionId === undefined ? {} : { sessionId }), content: chunks.join(""), stopReason: recordString(response, "stopReason") ?? "end_turn", response };
   } finally {
     context.signal.removeEventListener("abort", abort);

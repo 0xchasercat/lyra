@@ -1,3 +1,5 @@
+import type { AcpCommandResultKind } from "@lyra/acp";
+
 export interface SlashServices {
   copy(target?: string): Promise<unknown>;
   dump(): Promise<unknown>;
@@ -16,18 +18,72 @@ export interface SlashServices {
   sessions(operation: "fork" | "resume" | "list", value?: string): Promise<unknown>;
   health(): Promise<unknown>;
 }
-export interface SlashResult { command: string; output?: unknown; error?: string; }
-export const SLASH_COMMANDS = ["copy", "dump", "settings", "provider", "model", "loop", "context", "compact", "clear", "agents", "kill", "workspaces", "cleanup", "gitmode", "review", "apply", "rollback", "skills", "mcp", "install", "fork", "resume", "sessions", "health"] as const;
-const COMMAND_SET = new Set<string>(SLASH_COMMANDS);
+/**
+ * Every slash command the router accepts, with the one-line description the TUI's `/`
+ * popup renders and the shape its output takes.
+ *
+ * This table is the single declaration of the command surface (DESIGN §4: "one command
+ * declaration is reachable by key, palette, and `/name`"). `session/commands` serves it
+ * verbatim, the router dispatches from it, and a conformance test asserts the two never
+ * diverge — so a command that exists is listed and a listed command exists.
+ */
+export interface SlashCommandSpec {
+  readonly name: string;
+  readonly description: string;
+  /** Present only when the command takes arguments. */
+  readonly usage?: string;
+  readonly resultKind: AcpCommandResultKind;
+}
+export const SLASH_COMMAND_CATALOG: readonly SlashCommandSpec[] = Object.freeze([
+  { name: "copy", description: "Copy the last assistant reply, or one addressed by entry id, to the clipboard.", usage: "/copy [entryId]", resultKind: "report" },
+  { name: "dump", description: "Copy the whole transcript to the clipboard as JSON.", resultKind: "report" },
+  { name: "settings", description: "Show the effective runtime settings, or change the Git mode for this session.", usage: "/settings [git.mode observe|stage|auto]", resultKind: "report" },
+  // `edit` and `delete` are advertised here and intercepted by the client: one opens the
+  // setup form filled in from `provider/get` and saves it with `provider/add` (persist
+  // "keep" when the key is not being rotated), the other confirms and calls `provider/remove`.
+  // They are in the catalog because the `/` popup is built from it — a command a user cannot
+  // discover is a command that does not exist — and the daemon answers them with what to do
+  // instead, rather than mistaking "edit" for a provider name.
+  { name: "provider", description: "Show the configured providers, switch to one and pick its model, or edit or delete one.", usage: "/provider [name [model]|edit <name>|delete <name>]", resultKind: "report" },
+  { name: "model", description: "List every configured provider's models, switch to one across providers, or declare one an endpoint cannot list.", usage: "/model [id|provider/id|@role|refresh|add <provider> <id>]", resultKind: "models" },
+  { name: "loop", description: "Run the agent autonomously for a count, a duration, or until a condition holds.", usage: "/loop <count|duration|until \"condition\">", resultKind: "report" },
+  { name: "context", description: "Break down what the next request would send, section by section, with repairs and losses.", resultKind: "context" },
+  { name: "compact", description: "Summarise the transcript now instead of waiting for the automatic threshold.", resultKind: "report" },
+  { name: "clear", description: "Clear the context behind a boundary; nothing leaves the transcript on disk.", resultKind: "report" },
+  { name: "agents", description: "List spawned agents with their workspace and status.", resultKind: "agents" },
+  { name: "kill", description: "Cancel a running agent by id.", usage: "/kill <agentId>", resultKind: "report" },
+  { name: "workspaces", description: "List every agent workspace and its lifecycle state.", resultKind: "workspaces" },
+  { name: "cleanup", description: "Drop archived workspaces older than the configured retention.", resultKind: "workspaces" },
+  { name: "gitmode", description: "Set how the Git pipeline behaves: observe, stage, or auto-commit.", usage: "/gitmode observe|stage|auto", resultKind: "report" },
+  { name: "review", description: "Assemble a merge preview of every completed agent workspace.", resultKind: "report" },
+  { name: "apply", description: "Apply a reviewed merge preview to the origin repository.", usage: "/apply [--preview <id>]", resultKind: "report" },
+  { name: "rollback", description: "Roll the repository back to a snapshot taken before an apply.", usage: "/rollback [--to <snapshot>]", resultKind: "report" },
+  { name: "skills", description: "List discovered skills and where each was found.", resultKind: "skills" },
+  { name: "mcp", description: "Re-index the configured MCP servers and list the tools they advertise.", resultKind: "mcp" },
+  { name: "install", description: "Install a bundled MCP integration.", usage: "/install draco", resultKind: "report" },
+  { name: "fork", description: "Fork the transcript at an entry, leaving the original branch intact.", usage: "/fork [entryId]", resultKind: "report" },
+  { name: "resume", description: "Load a saved session by name, replacing the active transcript.", usage: "/resume <session>", resultKind: "report" },
+  { name: "sessions", description: "List the saved sessions on disk with their ids.", resultKind: "sessions" },
+  { name: "health", description: "Report durable metrics: turn latency, retries, compactions, and tool reliability.", resultKind: "health" },
+] satisfies readonly SlashCommandSpec[]);
+
+export interface SlashResult { command: string; resultKind: AcpCommandResultKind; output?: unknown; error?: string; }
+export const SLASH_COMMANDS: readonly string[] = Object.freeze(SLASH_COMMAND_CATALOG.map((entry) => entry.name));
+const COMMAND_SET = new Map(SLASH_COMMAND_CATALOG.map((entry) => [entry.name, entry] as const));
 
 export class SlashCommandRouter {
   constructor(private readonly services: SlashServices) {}
+  /** Every command the router routes, in the order the popup should list them. */
+  list(): readonly SlashCommandSpec[] { return SLASH_COMMAND_CATALOG; }
   async execute(input: string): Promise<SlashResult> {
-    if (typeof input !== "string" || !input.startsWith("/")) return { command: "", error: "Slash commands must begin with /." };
+    // A failure has no declared output shape, so it reports as free-form text — the one
+    // resultKind that is always renderable.
+    if (typeof input !== "string" || !input.startsWith("/")) return { command: "", resultKind: "report", error: "Slash commands must begin with /." };
     let tokens: string[];
-    try { tokens = tokenize(input.slice(1)); } catch (error) { return { command: "", error: error instanceof Error ? error.message : String(error) }; }
+    try { tokens = tokenize(input.slice(1)); } catch (error) { return { command: "", resultKind: "report", error: error instanceof Error ? error.message : String(error) }; }
     const command = tokens.shift()?.toLowerCase() ?? "";
-    if (!COMMAND_SET.has(command)) return { command, error: `Unknown command /${command}. Available: ${SLASH_COMMANDS.map((name) => `/${name}`).join(", ")}.` };
+    const spec = COMMAND_SET.get(command);
+    if (!spec) return { command, resultKind: "report", error: `Unknown command /${command}. Available: ${SLASH_COMMANDS.map((name) => `/${name}`).join(", ")}.` };
     try {
       let output: unknown;
       switch (command) {
@@ -52,12 +108,16 @@ export class SlashCommandRouter {
         case "mcp": output = await this.services.mcp(); break;
         case "install": if (!tokens[0]) throw new Error("/install requires a tool name."); output = await this.services.install(tokens[0]); break;
         case "fork": output = await this.services.sessions("fork", tokens[0]); break;
-        case "resume": if (!tokens[0]) throw new Error("/resume requires a session name."); output = await this.services.sessions("resume", tokens[0]); break;
+        // The name is required *here* because a report cannot be a picker. A client that
+        // can show a list intercepts the bare form and shows one (the Rust TUI opens the
+        // same overlay `/sessions` does); every other client is pointed at the listing
+        // rather than told to guess an id it has never been shown.
+        case "resume": if (!tokens[0]) throw new Error("/resume needs a session name — run /sessions to see them."); output = await this.services.sessions("resume", tokens[0]); break;
         case "sessions": output = await this.services.sessions("list"); break;
         case "health": output = await this.services.health(); break;
       }
-      return { command, output };
-    } catch (error) { return { command, error: error instanceof Error ? error.message : String(error) }; }
+      return { command, resultKind: spec.resultKind, output };
+    } catch (error) { return { command, resultKind: spec.resultKind, error: error instanceof Error ? error.message : String(error) }; }
   }
 }
 

@@ -2,6 +2,18 @@ import { chmod, copyFile, mkdir, readFile, realpath, rm, symlink, unlink, writeF
 import { homedir } from "node:os";
 import { basename, join, relative, resolve } from "node:path";
 
+/**
+ * Builds one platform bundle: `lyra` (the daemon and entry point), `lyra-tui`
+ * (the terminal client it spawns), and the JIT runner.
+ *
+ * The two binaries must land in the *same directory*: interactive `lyra`
+ * resolves `lyra-tui` as a sibling of its own executable, so the layout here is
+ * load-bearing, not cosmetic.
+ *
+ * The canonical ACP schema needs no copy step — `@lyra/acp` imports
+ * `schema/protocol.json` as a module, so `bun build --compile` embeds it. A
+ * path-relative read would resolve inside the repo and fail in the bundle.
+ */
 const root = resolve(import.meta.dir, "..");
 const platform = `${process.platform}-${process.arch}`;
 const extension = process.platform === "win32" ? ".exe" : "";
@@ -10,6 +22,8 @@ const install = process.argv.includes("--install");
 
 await rm(bundle, { recursive: true, force: true });
 await mkdir(bundle, { recursive: true, mode: 0o755 });
+// The Rust client is part of `bun run build`, not a separate step someone can forget:
+// a bundle whose `lyra-tui` is stale or missing has no interactive mode at all.
 await run(["cargo", "build", "--release", "-q", "-p", "lyra-tui", "--bin", "lyra-tui"]);
 await run([process.execPath, "build", "--compile", "packages/lyra-app/src/cli.ts", "--outfile", join(bundle, `lyra${extension}`)]);
 await run([process.execPath, "build", "--compile", "packages/lyra-runtime/src/jit-runner.ts", "--outfile", join(bundle, `lyra-jit-runner${extension}`)]);

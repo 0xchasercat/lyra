@@ -4,6 +4,8 @@ export * from "./commands.ts";
 export * from "./integrated-tools.ts";
 export * from "./app.ts";
 export * from "./soak.ts";
+export * from "./completion.ts";
+export * from "./plugins.ts";
 export * from "./provider.ts";
 export * from "./agent-executor.ts";
 export * from "./provider-setup.ts";
