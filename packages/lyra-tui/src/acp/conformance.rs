@@ -287,6 +287,11 @@ fn maximal_samples() -> Vec<(&'static str, Value)> {
                             "code":"model_not_found","status":404}}),
         ),
         (
+            "round_start",
+            json!({"sessionUpdate":"round_start","turnId":"turn-1","round":1,
+                   "startedAtMs":1_700_000_000_000_i64}),
+        ),
+        (
             "message_start",
             json!({"sessionUpdate":"message_start","turnId":"turn-1",
                    "messageId":"turn-1-msg-1","role":"assistant"}),

@@ -303,8 +303,26 @@ F2 — "the model just stops" — is almost always one of: a stream that ended w
 reason, a stream that stalled without closing, or an assistant turn with no content and no
 tool call. All three are detectable.
 
-- **Stall detection.** No token for `stream_stall_timeout` (default 45s) with the socket
-  still open → cancel, classify `transient`, retry from the last clean boundary.
+- **Stall detection, after output has begun.** Once the stream has produced its first
+  content event, no further liveness for `stream_stall_timeout` (default 45s) with the
+  socket still open → cancel, classify `transient`, retry from the last clean boundary. That
+  is the genuine F2 signature: a stream that *flowed and then died*. The retry says which
+  phase it was — "Provider stream went silent for 45s after output began" — so a user never
+  has to guess what the watchdog saw.
+- **No stall deadline before the first token.** A reasoning model that thinks for minutes
+  before emitting anything is the workload, not a fault, and through a proxy that does not
+  stream thinking it is byte-for-byte identical to a healthy silence. Applying the 45s gap
+  there cancelled healthy turns, resent the whole context at full input cost, and started
+  the thinking over — on a hard enough problem, once per attempt until the retry budget ran
+  out. Nothing is lost by removing it: a connection that never answers dies on the headers
+  deadline (§3.4, 30s), and a server that accepted the request and then went silent forever
+  is bounded by the total-turn deadline (§3.4). Everything between those two is a model
+  thinking. A client is told the wait is real rather than left guessing — the ACP
+  `round_start` update marks a request in flight before any content arrives.
+- **Liveness is bytes, not just parsed events.** SSE comment lines (`: ping`), blank
+  heartbeats and any other raw chunk reset the inter-token clock, because a proxy that
+  keep-alives while the model thinks is proving the connection is alive. Thinking and
+  reasoning deltas are output like any other and reset it too.
 - **Malformed completion.** Stream ends with no stop reason, or with an unterminated tool
   call → `content_shape`, repair, retry once.
 - **Empty turn.** Assistant turn with no text, no thinking, and no tool call is **not** a
@@ -321,7 +339,8 @@ has a defined expiry behavior.
 | Operation | Deadline | On expiry |
 |---|---|---|
 | HTTP request headers | 30s | `transient`, retry |
-| Stream token gap | 45s | §3.3 |
+| Time to first token | None of its own — the turn deadline bounds it | §3.3 |
+| Stream gap, once output began | 45s of no bytes at all | §3.3 |
 | Total turn | 30m | Cancel, keep partial, surface |
 | ACP request | 60s — except `session/prompt`, `session/steer`, `session/command` and `agent/spawn`, which carry a turn and get `reliability.turn_timeout` | Abort the handler, answer `-32001` |
 | Tool call (default) | 120s | Kill, return timeout to model |
@@ -371,7 +390,7 @@ malformed message sequence, and the sequence is checkable.
 | No empty content blocks | Drop |
 | Thinking blocks precede content in the same turn | Reorder |
 | Thinking signatures intact where the provider requires them | Drop the turn's thinking rather than send an invalid signature |
-| Image blocks well-formed and under the size cap | Downscale or drop with a marker |
+| Image blocks well-formed and under the size cap — including images *inside* a `tool_result`, which is the route a screenshot actually takes | Drop with an in-band marker naming the problem; Lyra bundles no image library, so an oversized image is refused with the artifact id rather than downscaled or truncated |
 | Total tokens under the model's window | Compact (§13) |
 
 **Repair is always logged and always visible in `/context`.** A silent repair is a lie
@@ -1242,9 +1261,47 @@ So the semaphore is classed, and capped below core count.
 binaries to classes. The model cannot accidentally starve the host by mislabeling, and does
 not have to think about it.
 
-**Everything heavy is a job.** `bash` returns a handle immediately — never a blocked agent
-behind a 3-minute build. Poll or `hub wait`. Composes with `lyra.exec()` in orchestration
-scripts (§8), which is where 64-way concurrency actually happens.
+### Blocking is a second, independent question
+
+The semaphore class says *where a command queues*. It does not say *who waits for it*, and
+conflating the two was a real ergonomic failure: `cargo build` is heavy, so it returned a
+handle, so the model fired a build and then chased a job id for output it was about to be
+handed. A build's output **is** the answer to the call.
+
+So there is a second pattern table, read off the same command string:
+
+| Execution | Meaning | Examples |
+|---|---|---|
+| `inline` | Terminates, and the call blocks for it | `npm run build`, `npm test`, `npx tsc`, `cargo build/check/test`, `bun test`, `make`, `pytest`, `go build`, `vitest run`, `webpack`, `jest` |
+| `job` | Terminates eventually, but not on the agent's timescale — a handle now | `npm install`, `npm ci`, `docker build`, `cargo run`, `go run`, `sleep 3600`, `yes`, `tail -f`, unknown `npm run <name>` |
+| `server` | Never exits on its own — a handle now, said distinctly | `npm run dev`, `npm start`, `vite`, `next dev`, `tsc --watch`, `vitest`, `python -m http.server`, `serve`, `nodemon`, `*:watch` scripts |
+
+The two axes are orthogonal. `cargo build` is `heavy` *and* `inline`: it queues in the
+eight-wide disk lane and still blocks the tool call. A compound line takes the more severe
+answer — one `server` segment makes the line a server.
+
+**Still by command pattern, never by the model's declaration** (the rule above applies to
+both tables). npm scripts are opaque — nothing can read a `package.json` that may not exist
+yet — so `npm run <name>` is classified by the naming conventions every project shares:
+`build`, `test`, `lint`, `typecheck`, `check`, `format`, `coverage`, `e2e` and their
+`build:prod`-style variants terminate; anything containing `dev`, `serve`, `server`, `start`,
+`preview`, `watch` or `storybook` is a server; a name matching neither keeps the heavy
+default of a job. `npx <tool>` is classified as `<tool>`.
+
+**A job is never a killed command.** An `inline` command that outlives the inline budget
+(120 s, or the `timeoutMs` the model chose) is *handed back* as a job and keeps running — a
+build slower than the agent's patience costs a round trip, not the work (§3.8). The response
+names which rule fired, and a server's response says it will not exit rather than dressing
+it as a pending build.
+
+**Nothing blocks forever.** `bash` returns a handle rather than a blocked agent for anything
+unbounded. Poll or `hub wait`. Composes with `lyra.exec()` in orchestration scripts (§8),
+which is where 64-way concurrency actually happens.
+
+**A turn says what it left running.** When a turn ends with jobs its own session started
+still running — or finished and never collected — the fact is reported once: the client
+renders it now, and the same line is a transcript entry, so the model reads it at the top of
+its next turn. Visibility only; nothing is gated, delayed, or cancelled (§1).
 
 **cgroups on Linux, opt-in.** `exec.cgroup = true` wraps heavy jobs in `systemd-run` with
 memory and CPU limits and a private pid namespace. A counting semaphore does not stop one
@@ -1418,10 +1475,10 @@ Thirteen. Each finished.
 
 | Tool | Notes |
 |---|---|
-| `read` | Files, directories, URLs, images, `skill://`, `artifact://`. Line ranges. Returns `#TAG`. |
+| `read` | Files, directories, URLs, images, `skill://`, `artifact://`. Line ranges **clamp to the end of the document** and say so in band (`[lines 1-18 of 18 — requested 1-100, clamped]`) — a range nobody could size in advance is not an error. A `startLine` past the end still is: there is nothing to return. An `image/*` artifact returns a real image block, so a screenshot spilled by the MCP gateway reaches a vision model; over the §3.6 size limit it refuses with the artifact id and what would make it readable, because there is no image library to downscale with. Returns `#TAG`. |
 | `write` | Create or overwrite. First-class edit path for small files and pervasive change (§6.4). |
 | `edit` | §6. |
-| `bash` | Semaphore-classed (§11). Heavy → job handle. |
+| `bash` | Semaphore-classed (§11), and separately classed for blocking: builds and test suites run inline, installs and servers hand back a job id. |
 | `grep` | Regex, ripgrep-backed, `io`-classed. |
 | `glob` | Patterns, gitignore-aware. |
 | `lsp` | definition, references, hover, rename, diagnostics, code actions. **Auto-started per detected language** (§2). Degrades to text tools on timeout, warns once. |
@@ -1717,11 +1774,13 @@ gui = "auto"
 archive_after = "7d"   # retention for child agent workspaces, and for /cleanup
 
 [tui]
-theme  = "default"
-accent = "#7aa2f7"
+theme    = "default"
+accent   = "#7aa2f7"
+thinking = "collapsed"   # reasoning traces: dim while live, `∴ thought for 23s` after.
+                         # "full" commits the trace itself; "off" renders none of it.
 
 [reliability]
-stream_stall_timeout = "45s"
+stream_stall_timeout = "45s"   # gap *after* output began; time to first token is unbounded (§3.3)
 turn_timeout         = "30m"
 max_retries          = 8
 compact_at           = 0.80

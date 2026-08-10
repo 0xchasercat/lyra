@@ -276,6 +276,10 @@ export class OpenAIWebSocketTransport implements ProviderTransport {
     try {
       while (true) {
         const data = await inbox.next(context.signal);
+        // Every frame is liveness, whether or not the decoder makes an event of it: the
+        // socket's own keep-alives and progress frames are how a thinking model proves the
+        // connection is alive (§3.3).
+        context.onLiveness?.();
         const value = await decodeSocketData(data);
         let event: unknown;
         try {

@@ -105,6 +105,20 @@ export type ProviderEvent =
 export interface TransportContext {
   signal: AbortSignal;
   headersTimeoutMs: number;
+  /**
+   * Raw liveness: called the moment bytes arrive from the provider, *before* parsing decides
+   * whether those bytes contained an event.
+   *
+   * The §3.3 stall watchdog asks "is this socket dead?", and the honest answer lives at the
+   * byte level. An SSE comment (`: ping`), a blank heartbeat line, a partial frame — none of
+   * them parse into a `ProviderEvent`, and all of them are the proxy in front of a reasoning
+   * model proving the connection is alive while the model thinks. A watchdog fed only parsed
+   * events cancels those turns; a watchdog fed this tick does not.
+   *
+   * Optional because a transport that never calls it is merely held to the event-level clock,
+   * which is the old behaviour and still correct — just less generous.
+   */
+  onLiveness?: () => void;
 }
 
 export interface TransportFallbackEvent {

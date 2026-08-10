@@ -129,6 +129,31 @@ describe("deriveContext", () => {
     expect(repairCodes(derived).filter((code) => code === "image_dropped")).toHaveLength(2);
   });
 
+  /**
+   * A screenshot's only route into the context is a tool result, and §3.6 was checked on
+   * top-level blocks only — so the one path a picture actually takes reached the provider
+   * unvalidated, and an oversized one came back as a 400 instead of a marker.
+   */
+  test("applies the image limit to images carried inside a tool result", () => {
+    const good = { type: "image" as const, mediaType: "image/png" as const, data: "AQIDBA==" };
+    const entries = transcript([
+      message("a1", "assistant", [{ type: "tool_use", id: "call-a", name: "read", input: {} }, { type: "tool_use", id: "call-b", name: "read", input: {} }]),
+      message("u1", "user", [
+        { type: "tool_result", toolUseId: "call-a", content: [{ type: "text", text: "shot" }, good] },
+        { type: "tool_result", toolUseId: "call-b", content: [{ type: "image", mediaType: "image/png", data: "AQIDBAUGBwgJCgsM" }] },
+      ]),
+    ]);
+
+    const derived = deriveContext(entries, { ...baseOptions, imageByteLimit: 8 });
+    const results = derived.request.messages[1]?.content as Array<{ toolUseId: string; content: ContentBlock[] }>;
+
+    // Under the limit it stays an image the model can actually see.
+    expect(results[0]?.content).toEqual([{ type: "text", text: "shot" }, good]);
+    // Over it, an in-band marker the model can read and act on.
+    expect(results[1]?.content).toEqual([expect.objectContaining({ type: "marker", reason: "image_dropped" })]);
+    expect(repairCodes(derived)).toContain("image_dropped");
+  });
+
   test("drops orphan results and synthesizes every missing parallel result before user text", () => {
     const entries = transcript([
       message("a1", "assistant", [

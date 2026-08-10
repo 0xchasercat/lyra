@@ -346,11 +346,13 @@ export function runProviderConformance(adapter: ProviderFixtureAdapter): void {
       }
     });
 
-    test("stalls expire, abort the attempt, and resume", async () => {
+    test("stalls after output began expire, abort the attempt, and resume", async () => {
       const fixture = adapter.create({
         id: "stall-deadline",
         attempts: [
-          { termination: { type: "stall" } },
+          // The stall only counts once the stream has flowed: that is the F2 signature the
+          // deadline exists for. Silence *before* the first token is a model thinking.
+          { events: [{ type: "text_delta", text: "half a " }], termination: { type: "stall" } },
           { events: SUCCESS_EVENTS },
         ],
       });
@@ -361,10 +363,22 @@ export function runProviderConformance(adapter: ProviderFixtureAdapter): void {
       expect(fixture.invocations[0]?.context.signal.aborted).toBe(true);
       if (outcome.type === "complete") {
         expect(retries(outcome.events)[0]).toEqual(expect.objectContaining({
-          reason: "transient: Provider stream stalled for 5ms",
-          resetsPartialOutput: false,
+          reason: "transient: Provider stream went silent for 5ms after output began",
+          resetsPartialOutput: true,
         }));
       }
+    });
+
+    test("silence before the first token is never cancelled as a stall", async () => {
+      const fixture = adapter.create({
+        id: "slow-first-token",
+        attempts: [{ events: SUCCESS_EVENTS, openingDelayMs: 60 }],
+      });
+      const provider = reliable(fixture, { streamStallTimeoutMs: 5 });
+      const outcome = await settle(provider.stream(baseRequest()));
+      expectComplete(outcome, "end_turn");
+      expect(fixture.invocations).toHaveLength(1);
+      if (outcome.type === "complete") expect(retries(outcome.events)).toHaveLength(0);
     });
 
     test("external cancellation is terminal and the next turn can resume", async () => {
@@ -553,7 +567,17 @@ export function deterministicChaosCases(seed: number): ChaosCase[] {
   const reset = Object.assign(new Error("chaos reset"), { code: "ECONNRESET" });
   const cases: ChaosCase[] = [
     { name: "drop", attempt: { termination: { type: "throw", error: reset } } },
-    { name: "stall", attempt: { termination: { type: "stall" } } },
+    // Silence *after* output began — the only silence §3.3 treats as a stall.
+    {
+      name: "stall",
+      attempt: {
+        events: [{ type: "text_delta", text: "chaos partial" }],
+        termination: { type: "stall" },
+      },
+    },
+    // Silence *before* the first token, bounded only by the turn deadline: the model is
+    // thinking, and the attempt has to survive it rather than cancel a healthy request.
+    { name: "slow-first-token", attempt: { openingDelayMs: 25, events: SUCCESS_EVENTS } },
     { name: "empty", attempt: { events: [{ type: "complete", stopReason: "end_turn" }] } },
     {
       name: "truncated-tool-json",

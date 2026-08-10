@@ -114,9 +114,10 @@ lyra (bun cli.ts, thin) ──spawn──▶ lyra-tui (Rust binary)
   event channel, drains everything queued (bounded per tick so a loud turn
   cannot starve the keyboard), and renders **once**. A burst therefore costs one
   frame; an isolated event wakes the park and renders immediately. The only
-  timers are the ones a *surface* needs — a 1 Hz retry countdown, the stall
-  colour, an expiring armed gesture — and they set the park length, not the
-  flush.
+  timers are the ones a *surface* needs — a 1 Hz retry countdown, the spinner's
+  frame, an expiring armed gesture — and they set the park length, not the
+  flush. None of them is a *judgement*: no client-side timer decides that a turn
+  has gone wrong (see Motion, §3).
 
 ## 3. Visual system (§19, made concrete)
 
@@ -199,8 +200,25 @@ lyra (bun cli.ts, thin) ──spawn──▶ lyra-tui (Rust binary)
   three bundled themes; terminal-adaptive `system` theme from the 16-color
   palette with background alpha 0; live re-theme on DEC 2031; OSC 11
   luminance for auto light/dark.
-- **Glyphs**: pure Unicode (`● ◆ ▸ └─ ⟳`, plus the child vocabulary
+- **Glyphs**: pure Unicode (`● ◆ ▸ └─ ⟳ ∴`, plus the child vocabulary
   `◎ ◍ ○ ✓ ✗ ↻ ⇄`), zero Nerd Font, zero PUA.
+- **Thinking traces** are rendered, and the split is by *surface* rather than by
+  secrecy. Live, reasoning streams into the live region under a dim `∴ thinking`
+  marker — transient by construction, so it costs nothing permanent and answers
+  "what is it doing" during the long silence before a reasoning model speaks.
+  Committed, the whole trace collapses to one dim line, `∴ thought for 23s`
+  (client-timed from `part_start` to `part_end`; the figure is omitted rather
+  than guessed when the part was not seen opening), because scrollback buried
+  under deliberation is scrollback nobody reads (§19). `Tab` still expands the
+  last *tool call* and nothing else — expanding a thought would need its own
+  affordance, and the trace is already in the session store for `/context` and
+  any future viewer to show. Reading a model's output and debugging a model's
+  reasoning want opposite things from the same bytes, so `[tui] thinking =
+  "collapsed" | "full" | "off"` (default `collapsed`) chooses: `full` commits the
+  dim trace itself, `off` renders none of it on any surface. History replay obeys
+  the same setting. The signature sealing a thinking block is never rendered in
+  any mode — opaque provider bytes are not reasoning — so a redacted part earns
+  its one-liner and nothing else.
 - **Anti-jitter rules** (Claude Code's lessons, adopted): fixed-height chrome
   rows that never collapse 0↔1; transient hints display ≥700ms; width
   degradation leaves a visible `…`; wide content truncates, the page never
@@ -212,9 +230,17 @@ lyra (bun cli.ts, thin) ──spawn──▶ lyra-tui (Rust binary)
   line, never per token) + monotonic stable-prefix parsing (only the trailing
   unstable block re-parses). h2/h3 modest, code spans accent-colored, tables
   degrade to key-value when narrow.
-- **Motion**: zero decorative. Spinner is a minimal state glyph; stall >3s
-  shifts it toward error color (state, not animation). `prefers-reduced-motion`
-  honored by not needing it.
+- **Motion**: zero decorative, and exactly one non-decorative exception — the
+  activity glyph spins **smoothly and continuously for as long as the turn
+  runs**, carrying one bit ("this turn is still ours") and nothing finer. It does
+  *not* stop or change colour on the client's own estimate of a stall: a model
+  thinking silently for a minute is the workload, not a fault, and this client
+  holds no provider connection, no request deadline and no way to tell a long
+  thought from a hang. The daemon owns stall truth and reports it — `round_start`
+  says a request is in flight (the strip says "waiting for the model"), and a
+  `retry` says the round is in trouble, which is the only thing that turns the
+  glyph amber. It keeps spinning while amber, because the retry countdown beside
+  it is ticking. `prefers-reduced-motion` honored by not needing it.
 
 ## 4. Input
 

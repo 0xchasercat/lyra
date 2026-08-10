@@ -10,6 +10,11 @@ import type {
 export interface ReliableProviderOptions {
   maxAttempts?: number;
   headersTimeoutMs?: number;
+  /**
+   * The §3.3 inter-token deadline: how long the stream may be silent *after* it has produced
+   * output. It deliberately does not apply before the first token — see
+   * {@link withStallDeadline} for why the pre-first-token phase has no deadline of its own.
+   */
   streamStallTimeoutMs?: number;
   turnTimeoutMs?: number;
   random?: () => number;
@@ -54,6 +59,7 @@ export class ReliableProvider {
     for (let attempt = 1; attempt <= this.options.maxAttempts; attempt += 1) {
       const attemptController = new AbortController();
       const attemptSignal = AbortSignal.any([outerSignal, attemptController.signal]);
+      const liveness = new StreamLiveness();
       let produced = false;
       let completion: Extract<ProviderEvent, { type: "complete" }> | undefined;
       const toolCalls = new Map<string, string>();
@@ -62,9 +68,11 @@ export class ReliableProvider {
           this.transport.stream(request, {
             signal: attemptSignal,
             headersTimeoutMs: this.options.headersTimeoutMs,
+            onLiveness: () => liveness.tick(),
           }),
           this.options.streamStallTimeoutMs,
           attemptController,
+          liveness,
         )) {
           if (completion !== undefined) {
             throw malformedCompletion("Provider emitted data after completing the turn");
@@ -244,34 +252,119 @@ function retryDelay(attempt: number, random: () => number): number {
   return Math.round(base * (0.5 + random()));
 }
 
-async function* withStallDeadline<T>(
-  source: AsyncIterable<T>,
+/** When the provider last proved it was alive: an event, or raw bytes on the socket. */
+class StreamLiveness {
+  #lastAt = Date.now();
+
+  tick(): void {
+    this.#lastAt = Date.now();
+  }
+
+  idleMs(): number {
+    return Date.now() - this.#lastAt;
+  }
+}
+
+interface ArmedDeadline {
+  readonly expired: Promise<never>;
+  dispose(): void;
+}
+
+/**
+ * The §3.3 stall watchdog, in two phases.
+ *
+ * **Before the first output event there is no stall deadline at all.** A model that thinks
+ * for five minutes before its first token — routine for a reasoning model, and invisible
+ * through a proxy that does not stream thinking — is the workload, not a fault, and it is
+ * indistinguishable from a hung server by any measurement short of waiting. The two failures
+ * that phase could catch are already caught: a connection that never answers dies on the
+ * headers deadline (§3.4, 30s), and a server that accepted the request and then went silent
+ * forever is bounded by the total-turn deadline (§3.4, 30m). Cancelling at 45s instead
+ * killed healthy turns, resent the whole context at full input cost, and started the
+ * thinking over — sometimes on every attempt until the retry budget ran out.
+ *
+ * **After output has started, the tight inter-token deadline applies.** That is the real F2
+ * signature: a stream that flowed and then died with the socket still open. Any liveness at
+ * all resets it — an event, or bare bytes via {@link StreamLiveness}, since a proxy sending
+ * `: ping` while the model thinks is proving the connection is alive.
+ */
+async function* withStallDeadline(
+  source: AsyncIterable<TransportEvent>,
   timeoutMs: number,
   controller: AbortController,
-): AsyncGenerator<T> {
+  liveness: StreamLiveness,
+): AsyncGenerator<TransportEvent> {
   const iterator = source[Symbol.asyncIterator]();
+  let streaming = false;
   while (true) {
-    let timer: ReturnType<typeof setTimeout> | undefined;
+    liveness.tick();
+    const deadline = streaming ? armStallDeadline(timeoutMs, liveness, controller) : undefined;
+    let next: IteratorResult<TransportEvent>;
     try {
-      const next = await Promise.race([
-        iterator.next(),
-        new Promise<never>((_, reject) => {
-          timer = setTimeout(() => {
-            const fault = classifyProviderError({
-              code: "stream_stalled",
-              message: `Provider stream stalled for ${timeoutMs}ms`,
-            });
-            controller.abort(fault);
-            reject(fault);
-          }, timeoutMs);
-        }),
-      ]);
-      if (next.done) return;
-      yield next.value;
+      const pending = iterator.next();
+      if (deadline === undefined) {
+        next = await pending;
+      } else {
+        try {
+          next = await Promise.race([pending, deadline.expired]);
+        } catch (error) {
+          // The abandoned read rejects once the attempt is aborted; it has no other reader.
+          void pending.catch(() => undefined);
+          throw error;
+        }
+      }
     } finally {
-      if (timer !== undefined) clearTimeout(timer);
+      deadline?.dispose();
     }
+    if (next.done) return;
+    // Usage and transport-fallback notices are bookkeeping, not the model's output, so they
+    // do not arm the inter-token phase — the same test `produced` uses for an empty turn.
+    if (isContentEvent(next.value)) streaming = true;
+    yield next.value;
   }
+}
+
+function armStallDeadline(
+  timeoutMs: number,
+  liveness: StreamLiveness,
+  controller: AbortController,
+): ArmedDeadline {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let disposed = false;
+  const expired = new Promise<never>((_, reject) => {
+    const schedule = (delayMs: number): void => {
+      timer = setTimeout(() => {
+        if (disposed) return;
+        // Bytes may have arrived while this timer was pending. Silence is measured from the
+        // last sign of life, so a keep-alive re-arms the deadline instead of being ignored.
+        const idleMs = liveness.idleMs();
+        if (idleMs < timeoutMs) {
+          schedule(Math.max(1, timeoutMs - idleMs));
+          return;
+        }
+        const fault = classifyProviderError({
+          code: "stream_stalled",
+          message: `Provider stream went silent for ${formatDuration(timeoutMs)} after output began`,
+        });
+        controller.abort(fault);
+        reject(fault);
+      }, delayMs);
+    };
+    schedule(timeoutMs);
+  });
+  return {
+    expired,
+    dispose(): void {
+      disposed = true;
+      if (timer !== undefined) clearTimeout(timer);
+    },
+  };
+}
+
+function formatDuration(ms: number): string {
+  if (ms >= 60_000 && ms % 60_000 === 0) return `${ms / 60_000}m`;
+  if (ms >= 1_000) return `${Number((ms / 1_000).toFixed(3))}s`;
+  return `${ms}ms`;
 }
 
 async function abortableSleep(ms: number, signal: AbortSignal): Promise<void> {

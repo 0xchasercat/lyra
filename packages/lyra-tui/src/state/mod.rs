@@ -505,6 +505,11 @@ pub struct SessionStore {
     tool_index: HashMap<String, (MessageId, PartId)>,
     phase: TurnPhase,
     turn: Option<ActiveTurn>,
+    /// The provider round in flight, when one is: `Some(n)` from `round_start`
+    /// until the next update of that round closes it. The one thing that
+    /// distinguishes "waiting on the model" from "idle", which no other frame
+    /// says (see [`wire::RoundStart`]).
+    round: Option<u32>,
     /// Retry that has not yet been superseded, kept for the countdown.
     retry: Option<RetryState>,
     usage: Option<UsageTotals>,
@@ -564,6 +569,17 @@ impl SessionStore {
     #[must_use]
     pub const fn turn(&self) -> Option<&ActiveTurn> {
         self.turn.as_ref()
+    }
+
+    /// The provider round in flight, when the daemon has said one is.
+    ///
+    /// `Some(n)` means a request went out and nothing has come back — a wait
+    /// that is legitimate and can be minutes long on a reasoning model. It is
+    /// the positive signal that replaced the client's old habit of reading
+    /// silence as a stall.
+    #[must_use]
+    pub const fn round_in_flight(&self) -> Option<u32> {
+        self.round
     }
 
     /// The retry in flight, for the footer countdown.
@@ -740,6 +756,31 @@ impl SessionStore {
             .and_then(|id| self.message(id))
     }
 
+    /// The part currently being produced: the last unfinished part of the
+    /// assistant message in flight.
+    ///
+    /// What the activity strip asks so it can name the *state* — "thinking" —
+    /// rather than the mechanism. Taking the last unfinished part rather than
+    /// the last part is what keeps a completed thinking block from still
+    /// claiming the strip while prose streams underneath it.
+    #[must_use]
+    pub fn current_part(&self) -> Option<&Part> {
+        self.active_assistant()?
+            .parts
+            .iter()
+            .rev()
+            .find(|part| !part.complete)
+    }
+
+    /// Whether the model is mid-thought: the part in flight is a thinking part.
+    #[must_use]
+    pub fn is_thinking(&self) -> bool {
+        matches!(
+            self.current_part().map(|part| &part.body),
+            Some(PartBody::Thinking { .. })
+        )
+    }
+
     // -- mutation ----------------------------------------------------------
 
     /// Insert (or return) a message, keeping `messages` ordered by `seq`.
@@ -801,6 +842,7 @@ impl SessionStore {
             wire::Update::TurnStart(start) => self.on_turn_start(start),
             wire::Update::TurnResume(resume) => self.on_turn_resume(resume),
             wire::Update::TurnEnd(end) => self.on_turn_end(end),
+            wire::Update::RoundStart(start) => self.on_round_start(start),
             wire::Update::MessageStart(start) => self.on_message_start(start),
             wire::Update::PartStart(start) => self.on_part_start(start),
             wire::Update::Delta(delta) => self.on_delta(delta),
@@ -963,6 +1005,7 @@ impl SessionStore {
     // -- variant handlers --------------------------------------------------
 
     fn on_turn_start(&mut self, start: &wire::TurnStart) {
+        self.close_round();
         self.turn = Some(ActiveTurn {
             id: start.turn_id.clone(),
             source: start.source.clone(),
@@ -981,6 +1024,7 @@ impl SessionStore {
     }
 
     fn on_turn_end(&mut self, end: &wire::TurnEnd) {
+        self.close_round();
         if let Some(slot) = self
             .current_assistant
             .as_ref()
@@ -1004,7 +1048,22 @@ impl SessionStore {
         self.current_assistant = None;
     }
 
+    /// A provider round went out. The wait that follows is legitimate and can be
+    /// long, so it is *recorded* rather than inferred from the absence of frames
+    /// — the absence is what the old client mistook for a stall.
+    fn on_round_start(&mut self, start: &wire::RoundStart) {
+        self.resume_streaming();
+        self.round = Some(start.round);
+    }
+
+    /// The wait ends at the next update of the round, and the schema names
+    /// them: `message_start`, `retry`, `turn_end`. There is no `round_end`.
+    fn close_round(&mut self) {
+        self.round = None;
+    }
+
     fn on_message_start(&mut self, start: &wire::MessageStart) {
+        self.close_round();
         self.resume_streaming();
         let turn_id = start.turn_id.clone();
         let role = if start.role == "assistant" {
@@ -1173,6 +1232,7 @@ impl SessionStore {
     }
 
     fn on_retry(&mut self, retry: &wire::Retry) {
+        self.close_round();
         let state = RetryState {
             attempt: retry.attempt,
             max_attempts: retry.max_attempts,
@@ -2107,6 +2167,71 @@ mod tests {
         assert!(!store.hydrated());
         assert_eq!(store.descriptor().unwrap().session_id, "s-2");
         assert_eq!(*store.phase(), TurnPhase::Idle);
+    }
+
+    #[test]
+    fn a_round_in_flight_is_recorded_and_closed_by_the_frame_that_answers_it() {
+        // The positive signal for "waiting on the model", which no other frame
+        // carries: `message_start` fires when content *arrives*, so before this
+        // existed the wait and an idle client looked identical.
+        let mut store = SessionStore::new();
+        apply(
+            &mut store,
+            json!({"sessionUpdate":"turn_start","turnId":"t1","source":"user","startedAtMs":0}),
+        );
+        assert_eq!(store.round_in_flight(), None);
+        apply(
+            &mut store,
+            json!({"sessionUpdate":"round_start","turnId":"t1","round":2,"startedAtMs":10}),
+        );
+        assert_eq!(store.round_in_flight(), Some(2));
+        assert_eq!(*store.phase(), TurnPhase::Streaming);
+        // There is no `round_end`: the next update of the round says the wait is
+        // over, and each of the three the schema names does it.
+        for answer in [
+            json!({"sessionUpdate":"message_start","turnId":"t1","messageId":"m1",
+                   "role":"assistant"}),
+            json!({"sessionUpdate":"retry","attempt":1,"maxAttempts":3,
+                   "classification":"overloaded","providerMessage":"busy","delayMs":1_000,
+                   "retryAtMs":0,"resetsPartialOutput":false}),
+            json!({"sessionUpdate":"turn_end","turnId":"t1","status":"completed","durationMs":1,
+                   "partialRetained":false}),
+        ] {
+            apply(
+                &mut store,
+                json!({"sessionUpdate":"round_start","turnId":"t1","round":3,"startedAtMs":20}),
+            );
+            assert_eq!(store.round_in_flight(), Some(3));
+            apply(&mut store, answer.clone());
+            assert_eq!(store.round_in_flight(), None, "{answer}");
+        }
+    }
+
+    #[test]
+    fn the_part_in_flight_is_what_the_activity_strip_names() {
+        let mut store = SessionStore::new();
+        begin(&mut store);
+        assert!(!store.is_thinking(), "nothing is in flight yet");
+        for update in [
+            json!({"sessionUpdate":"message_start","turnId":"t1","messageId":"m1",
+                   "role":"assistant"}),
+            json!({"sessionUpdate":"part_start","messageId":"m1","partId":"p1","kind":"thinking"}),
+        ] {
+            apply(&mut store, update);
+        }
+        assert!(store.is_thinking());
+        // A finished thought does not go on claiming the strip.
+        apply(
+            &mut store,
+            json!({"sessionUpdate":"part_end","messageId":"m1","partId":"p1"}),
+        );
+        assert!(!store.is_thinking());
+        apply(
+            &mut store,
+            json!({"sessionUpdate":"part_start","messageId":"m1","partId":"p2","kind":"text"}),
+        );
+        assert!(!store.is_thinking());
+        assert_eq!(store.current_part().map(|part| part.id.as_str()), Some("p2"));
     }
 
     #[test]

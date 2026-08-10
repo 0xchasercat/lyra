@@ -27,6 +27,7 @@ import {
   type WireError,
 } from "@lyra/acp";
 import { LspManager } from "@lyra/lsp";
+import type { JobHandle } from "@lyra/host";
 import { discoverModels, loadProviderConfig, mergeModelLists, resolveModelRole, resolveProvider, type ModelInfo, type ProviderUsage } from "@lyra/provider";
 import { TranscriptStore, type MessageEntry, type TranscriptEntry } from "@lyra/session";
 import { CheckpointStore } from "@lyra/git";
@@ -198,6 +199,9 @@ export class LyraRuntime {
       contextWindowVerified: options.contextWindow !== undefined,
       onEvent: emitEvent,
       onUpdate: emitUpdate,
+      // The session writes its own transcript half, so this carries only the human half —
+      // calling the application's `onReport` here would append the line to the store twice.
+      onReport: async (message) => { await options.onReport?.(message); },
       updateEnvironment: (next) => { currentEnvironment = next; },
       // Only a configuration this call read is a configuration this session may re-read.
       ...(options.environment === undefined ? { configPaths: providerConfigPaths(origin, options.home) } : {}),
@@ -225,6 +229,11 @@ interface MainSessionOptions {
   contextWindowVerified?: boolean;
   onEvent?: (event: AgentEvent) => void | Promise<void>;
   onUpdate?: (update: SessionUpdate) => void;
+  /**
+   * Where a turn-end observation goes so a human sees it now. The transcript half is written
+   * by [`MainSession.report`], which is what carries the same fact into the model's next turn.
+   */
+  onReport?: (message: string) => void | Promise<void>;
   updateEnvironment(environment: EnvironmentProvider): void;
   /** Where `providers.toml` lives, so `provider/add` writes and re-reads the same file. */
   home?: string;
@@ -255,6 +264,7 @@ export class MainSession {
   readonly contextWindow: number;
   readonly #onEvent: ((event: AgentEvent) => void | Promise<void>) | undefined;
   readonly #onUpdate: ((update: SessionUpdate) => void) | undefined;
+  readonly #onReport: ((message: string) => void | Promise<void>) | undefined;
   readonly #updateEnvironment: (environment: EnvironmentProvider) => void;
   readonly #sessionRoot: string;
   readonly #contextWindowVerified: boolean;
@@ -285,6 +295,7 @@ export class MainSession {
     this.#contextWindowVerified = options.contextWindowVerified === true;
     this.#onEvent = options.onEvent;
     this.#onUpdate = options.onUpdate;
+    this.#onReport = options.onReport;
     this.#updateEnvironment = options.updateEnvironment;
     this.#home = options.home;
     this.#configPaths = options.configPaths;
@@ -1019,6 +1030,7 @@ export class MainSession {
       this.#lastTurnHardStop ||= terminal.hardStopRequested === true;
       const partialRetained = retainedOutput(terminal);
       this.#lastPromptTrimmed = this.#trimCancelledPrompt(terminal, partialRetained);
+      await this.#reportPendingJobs();
       this.#emit(this.#encoder.endTurn({
         status: turnStatusOf(terminal.stopReason),
         stopReason: terminal.stopReason,
@@ -1037,6 +1049,7 @@ export class MainSession {
       // failure the caller is waiting for, so a transcript that cannot be written stays silent.
       try { this.#appendTurnUsage(turnUsage); } catch { /* the original error is the one worth raising */ }
       await this.app.metrics.record({ type: "turn", latencyMs: Date.now() - started, success: false });
+      await this.#reportPendingJobs();
       this.#emit(this.#encoder.endTurn({ status: "error", partialRetained: false, error: wireError(error) }));
       throw error;
     } finally {
@@ -1056,6 +1069,25 @@ export class MainSession {
     this.#store.fork(prompt.parentId);
     this.#emit([{ sessionUpdate: "session_changed", descriptor: { ...this.#store.descriptor }, reason: "rewind" }]);
     return true;
+  }
+
+  /**
+   * Jobs this session started and never collected, said out loud when its turn ends.
+   *
+   * Visibility only, never a gate (§1): nothing waits, nothing is cancelled, and a turn that
+   * left a build running is still a finished turn. The `[report]` line is the seam that
+   * carries one fact to both audiences at once — the client renders it now, and because it is
+   * a transcript entry the model reads it at the top of its next turn, the way a loop warning
+   * rides back on a tool result.
+   */
+  async #reportPendingJobs(): Promise<void> {
+    try {
+      const note = describePendingJobs(this.app.processes.list(), this.#store.descriptor.sessionId);
+      if (note === undefined) return;
+      this.report(note);
+      this.#emit([{ sessionUpdate: "report", message: note }]);
+      await this.#onReport?.(note);
+    } catch { /* bookkeeping about a turn must never be able to fail one */ }
   }
 
   #emit(updates: readonly SessionUpdate[]): void {
@@ -1549,6 +1581,36 @@ function turnStatusOf(stopReason: AgentTurnResult["stopReason"]): TurnStatus {
 /** True when the transcript kept real assistant content, not just a cancellation marker. */
 function retainedOutput(result: AgentTurnResult): boolean {
   return result.assistant.content.some((block) => block.type !== "marker");
+}
+
+/** One line of a job list, with the command cut to something a report line can hold. */
+function describeJob(job: JobHandle): string {
+  const command = job.command.replace(/\s+/g, " ").trim();
+  return `${job.id} (${command.length > 60 ? `${command.slice(0, 59)}…` : command})`;
+}
+
+function listJobs(jobs: readonly JobHandle[]): string {
+  const shown = jobs.slice(0, 4).map(describeJob).join(", ");
+  return jobs.length > 4 ? `${shown}, and ${jobs.length - 4} more` : shown;
+}
+
+/**
+ * The turn-end sentence about jobs this session started and nobody read.
+ *
+ * A job is *this* session's when it carries its id — the host is shared with every child, and
+ * claiming a sibling's build would be worse than saying nothing. A cancelled job is left out:
+ * its output was abandoned on purpose. Exported for its own test.
+ */
+export function describePendingJobs(jobs: readonly JobHandle[], sessionId: string): string | undefined {
+  const mine = jobs.filter((job) => job.owner === sessionId && job.collected !== true && job.status !== "cancelled");
+  const running = mine.filter((job) => job.status === "queued" || job.status === "running");
+  const finished = mine.filter((job) => job.status === "completed" || job.status === "failed");
+  if (running.length === 0 && finished.length === 0) return undefined;
+  const parts: string[] = [];
+  if (running.length > 0) parts.push(`${running.length} job${running.length === 1 ? "" : "s"} still running: ${listJobs(running)}`);
+  if (finished.length > 0) parts.push(`${finished.length} finished job${finished.length === 1 ? "" : "s"} whose output was never read: ${listJobs(finished)}`);
+  const first = (running[0] ?? finished[0])!.id;
+  return `${parts.join("; ")} — not yet collected. Read the output with bash({ job: ${JSON.stringify(first)} }).`;
 }
 
 function wireError(error: unknown): WireError {

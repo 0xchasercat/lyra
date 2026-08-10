@@ -37,6 +37,7 @@ use crate::ui::agent::{self, AgentEvent};
 use crate::ui::diff::{self, DiffOptions, FileDiff};
 use crate::ui::markdown::{self, MarkdownStream};
 use crate::ui::reliability::{self, Retry, TurnEnd};
+use crate::ui::thinking::{self, ThinkingMode};
 use crate::ui::tool_row::{self, ToolView};
 use crate::ui::Row;
 
@@ -98,6 +99,17 @@ pub enum Entry {
     },
     /// A non-ordinary turn end.
     TurnEnd(TurnEnd),
+    /// A finished thinking part. Rendered as one dim line by default, or as the
+    /// dim trace itself when `full` — decided at commit time by
+    /// [`ThinkingMode`], so replay cannot disagree with what was printed.
+    Thinking {
+        /// The trace. Empty for a redacted part, and unrendered unless `full`.
+        text: String,
+        /// How long the part was open, when this client saw it open.
+        seconds: Option<u64>,
+        /// Whether the trace itself is on screen.
+        full: bool,
+    },
     /// A dim one-line audit row (DESIGN.md §3's "dim one-line audit rows").
     Audit(String),
     /// A dim `─── label ───` rule, for the brackets around replayed history.
@@ -115,6 +127,13 @@ pub struct Transcript {
     entry_cap: usize,
     /// The in-flight assistant block, streaming into scrollback.
     stream: Option<MarkdownStream>,
+    /// The in-flight thinking trace, live-region only. Deliberately *not* a
+    /// [`MarkdownStream`]: thinking publishes nothing to scrollback while it
+    /// streams, so it has no stable prefix to maintain and no commit path to
+    /// share with the answer.
+    thinking_live: Option<String>,
+    /// What to do with thinking traces, from `[tui] thinking`.
+    thinking_mode: ThinkingMode,
     /// Survey calls held back so the run can collapse before committing.
     pending_run: Vec<ToolView>,
     /// Child-agent transitions held back for the same reason. A separate buffer
@@ -133,6 +152,8 @@ impl Transcript {
             entries: VecDeque::new(),
             entry_cap: DEFAULT_ENTRY_CAP,
             stream: None,
+            thinking_live: None,
+            thinking_mode: ThinkingMode::default(),
             pending_run: Vec::new(),
             pending_agents: Vec::new(),
         }
@@ -143,6 +164,25 @@ impl Transcript {
     pub const fn with_entry_cap(mut self, cap: usize) -> Self {
         self.entry_cap = cap;
         self
+    }
+
+    /// Set what happens to thinking traces.
+    #[must_use]
+    pub const fn with_thinking(mut self, mode: ThinkingMode) -> Self {
+        self.thinking_mode = mode;
+        self
+    }
+
+    /// Set what happens to thinking traces, after construction.
+    pub const fn set_thinking(&mut self, mode: ThinkingMode) {
+        self.thinking_mode = mode;
+    }
+
+    /// The thinking policy in force. Read by the history replay, so a resumed
+    /// session shows reasoning exactly as a live one would have.
+    #[must_use]
+    pub const fn thinking_mode(&self) -> ThinkingMode {
+        self.thinking_mode
     }
 
     /// Remembered entries, oldest first.
@@ -231,6 +271,74 @@ impl Transcript {
     /// End the assistant block, flushing its final rows.
     pub fn end_assistant(&mut self) -> Vec<Row> {
         self.close_stream()
+    }
+
+    /// Append a thinking delta.
+    ///
+    /// Returns nothing, always, and the signature says so: thinking publishes to
+    /// the **live region only** while it streams. It shares no state with
+    /// [`Self::assistant_delta`] — no [`MarkdownStream`], no stable prefix, no
+    /// entry — because a trace that leaked into the answer's markdown stream
+    /// would end up in the answer's scrollback, which is the one thing this
+    /// design will not do.
+    pub fn thinking_delta(&mut self, delta: &str) {
+        if !self.thinking_mode.shows() {
+            return;
+        }
+        let buffer = self.thinking_live.get_or_insert_with(String::new);
+        buffer.push_str(delta);
+        thinking::trim_live(buffer);
+    }
+
+    /// Whether a thinking part is streaming into the live region right now.
+    #[must_use]
+    pub const fn thinking_live(&self) -> bool {
+        self.thinking_live.is_some()
+    }
+
+    /// A thinking part ended: collapse the live block to what the mode commits.
+    ///
+    /// `text` is the *complete* trace from the session store, not the bounded
+    /// live buffer, so `full` commits the whole thing however long it ran.
+    /// `seconds` is how long the part was open, when this client saw it open.
+    pub fn end_thinking(&mut self, text: &str, seconds: Option<u64>) -> Vec<Row> {
+        let was_live = self.thinking_live.take().is_some();
+        if !self.thinking_mode.shows() {
+            return Vec::new();
+        }
+        // A part that neither said anything nor was ever seen streaming is one
+        // this client has nothing to report about — an attach mid-thought, or a
+        // part_end for a part that never opened. Silence beats a bare marker.
+        if !was_live && text.trim().is_empty() && seconds.is_none() {
+            return Vec::new();
+        }
+        self.push(Entry::Thinking {
+            text: text.to_owned(),
+            seconds,
+            full: self.thinking_mode.commits_text() && !text.trim().is_empty(),
+        })
+    }
+
+    /// A thinking block recovered from a persisted transcript.
+    ///
+    /// The same policy as the live path, from the same field, so a resumed
+    /// session looks like the session it resumes. Nothing at all under
+    /// `collapsed` unless the entry carried a duration: see
+    /// [`crate::app::history`] for why a one-liner with no figure is worse than
+    /// no row.
+    pub fn replayed_thinking(&mut self, text: &str, seconds: Option<u64>) -> Vec<Row> {
+        if !self.thinking_mode.shows() {
+            return Vec::new();
+        }
+        let full = self.thinking_mode.commits_text() && !text.trim().is_empty();
+        if !full && seconds.is_none() {
+            return Vec::new();
+        }
+        self.push(Entry::Thinking {
+            text: text.to_owned(),
+            seconds,
+            full,
+        })
     }
 
     /// A tool call reached a state worth showing.
@@ -367,8 +475,13 @@ impl Transcript {
 
     // -- reading -----------------------------------------------------------
 
-    /// What the live region should show: the streaming markdown tail and the
-    /// survey run that has not settled yet.
+    /// What the live region should show: the streaming markdown tail, the
+    /// survey run that has not settled yet, and the thinking trace in flight.
+    ///
+    /// Thinking goes last because it is the newest thing happening: a turn
+    /// thinks *after* the reads it ordered and *before* the prose it is working
+    /// towards, so the nearest row to the composer is the one that answers
+    /// "what now".
     #[must_use]
     pub fn live_rows(&self) -> Vec<Row> {
         let mut rows = self
@@ -377,6 +490,9 @@ impl Transcript {
             .map(MarkdownStream::live_rows)
             .unwrap_or_default();
         rows.extend(self.run_rows());
+        if let Some(text) = &self.thinking_live {
+            rows.extend(thinking::live_rows(text, &self.theme, self.width));
+        }
         rows
     }
 
@@ -568,6 +684,17 @@ pub fn render_entry(entry: &Entry, theme: &Theme, width: u16) -> Vec<Row> {
             theme,
         )],
         Entry::TurnEnd(end) => vec![reliability::turn_end(*end, theme)],
+        Entry::Thinking {
+            text,
+            seconds,
+            full,
+        } => {
+            if *full {
+                thinking::full_rows(text, *seconds, theme, width)
+            } else {
+                vec![thinking::collapsed_row(*seconds, theme)]
+            }
+        }
         Entry::Audit(text) => vec![Row::styled(format!("  {text}"), theme.faint())],
         Entry::Rule(label) => vec![reliability::rule_row(label, theme, width)],
         Entry::Blank => vec![Row::blank()],
@@ -723,6 +850,87 @@ mod tests {
         let _ = transcript.user("hello");
         assert!(transcript.expand_last_tool().is_empty());
         assert_eq!(transcript.last_tool_expanded(), None);
+    }
+
+    #[test]
+    fn thinking_lives_in_the_live_region_and_commits_as_one_line() {
+        let mut transcript = transcript(60);
+        transcript.thinking_delta("weighing it up");
+        assert!(
+            transcript.thinking_live(),
+            "a trace in flight is a live block, not an entry"
+        );
+        assert_eq!(
+            texts(&transcript.live_rows()),
+            ["∴ thinking", "  weighing it up"]
+        );
+        let rows = texts(&transcript.end_thinking("weighing it up", Some(23)));
+        assert_eq!(rows, ["∴ thought for 23s"]);
+        assert!(transcript.live_rows().is_empty());
+        // And it replays as what was printed, not as the trace behind it.
+        assert_eq!(texts(&transcript.render_all(60)), ["∴ thought for 23s"]);
+    }
+
+    #[test]
+    fn a_thinking_commit_closes_the_answer_above_it_first() {
+        // Order is the whole point: a trace committed above unflushed prose
+        // would put the reasoning before the sentence it came after.
+        let mut transcript = transcript(60);
+        let _ = transcript.assistant_delta("a line with no newline yet");
+        transcript.thinking_delta("second thoughts");
+        let rows = texts(&transcript.end_thinking("second thoughts", Some(2)));
+        assert_eq!(rows, ["a line with no newline yet", "∴ thought for 2s"]);
+    }
+
+    #[test]
+    fn the_thinking_mode_decides_what_a_finished_trace_leaves_behind() {
+        for (mode, expected) in [
+            (
+                ThinkingMode::Full,
+                vec!["∴ thought for 2s".to_owned(), "  weighing it up".to_owned()],
+            ),
+            (ThinkingMode::Collapsed, vec!["∴ thought for 2s".to_owned()]),
+            (ThinkingMode::Off, Vec::new()),
+        ] {
+            let mut transcript = Transcript::new(theme(), 60).with_thinking(mode);
+            transcript.thinking_delta("weighing it up");
+            assert_eq!(
+                transcript.thinking_live(),
+                mode != ThinkingMode::Off,
+                "{mode:?}: nothing is buffered when nothing will be shown"
+            );
+            assert_eq!(
+                texts(&transcript.end_thinking("weighing it up", Some(2))),
+                expected,
+                "{mode:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_thinking_part_nobody_saw_leaves_nothing_behind() {
+        // A `part_end` for a part this client attached after: no live block, no
+        // text, no timing. There is nothing true to say about it.
+        let mut transcript = transcript(60);
+        assert!(transcript.end_thinking("", None).is_empty());
+    }
+
+    #[test]
+    fn a_replayed_trace_needs_a_duration_or_the_mode_that_asked_for_it() {
+        let mut collapsed = transcript(60);
+        assert!(
+            collapsed.replayed_thinking("a private musing", None).is_empty(),
+            "no duration survives a persisted transcript, so there is no line to draw"
+        );
+        assert_eq!(
+            texts(&collapsed.replayed_thinking("a private musing", Some(7))),
+            ["∴ thought for 7s"]
+        );
+        let mut full = Transcript::new(theme(), 60).with_thinking(ThinkingMode::Full);
+        assert_eq!(
+            texts(&full.replayed_thinking("a private musing", None)),
+            ["∴ thought", "  a private musing"]
+        );
     }
 
     #[test]

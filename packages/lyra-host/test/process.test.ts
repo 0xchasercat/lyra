@@ -8,6 +8,7 @@ import {
   ProcessQueueTimeoutError,
   Semaphore,
   classifyCommand,
+  classifyExecution,
   INLINE_WAIT_BUDGET_MS,
 } from "../src/process.ts";
 
@@ -49,6 +50,57 @@ describe("classed process execution", () => {
     // The genuinely unbounded ones are unchanged: neither ever ends on its own.
     expect(classifyCommand("yes")).toBe("heavy");
     expect(classifyCommand("tail -f app.log")).toBe("heavy");
+  });
+
+  /**
+   * The semaphore class says where a command queues; the execution class says who waits.
+   * A build is heavy *and* blocking: backgrounding it left the model chasing a handle for
+   * output it was about to be handed.
+   */
+  test("classifies finite work as inline, servers as servers, and leaves the rest a job", () => {
+    for (const command of [
+      "npm run build", "npm test", "npx tsc", "cargo build", "cargo check", "cargo test", "bun test",
+      "yarn build", "pnpm lint", "bun run typecheck", "make", "pytest -q", "go build ./...", "vitest run",
+      "npm run build:prod", "cd app && npm run build", "deno test", "webpack", "jest",
+    ]) expect([command, classifyExecution(command)]).toEqual([command, "inline"]);
+
+    for (const command of [
+      "npm install", "npm ci", "yarn install", "bun install", "cargo run", "go run main.go",
+      "docker build .", "npm run migrate-the-world", "sleep 3600", "yes", "tail -f app.log",
+      "npm install && npm run build",
+    ]) expect([command, classifyExecution(command)]).toEqual([command, "job"]);
+
+    for (const command of [
+      "npm run dev", "npm start", "vite", "next dev", "python -m http.server", "tsc --watch",
+      "vitest", "npm run test:watch", "serve -s build", "nodemon index.js", "rollup -w",
+      "bash -lc \"npm run dev\"", "php -S localhost:8000", "webpack serve",
+    ]) expect([command, classifyExecution(command)]).toEqual([command, "server"]);
+
+    // The two axes are independent, and a compound line takes the more severe answer.
+    expect(classifyCommand("cargo build")).toBe("heavy");
+    expect(classifyExecution("cargo build")).toBe("inline");
+    expect(classifyExecution("npm run build && npm run dev")).toBe("server");
+  });
+
+  test("a finite command blocks, and one that outlives the budget is handed back rather than killed", async () => {
+    const root = await mkdtemp(join(tmpdir(), "lyra-host-process-"));
+    roots.push(root);
+    const host = new ProcessHost({ nproc: 1 });
+    hosts.push(host);
+
+    const inline = await host.run({ command: "printf finite", cwd: root, inlineBudgetMs: 5_000 });
+    expect(inline).toMatchObject({ stdout: "finite", exitCode: 0 });
+    expect(host.status("job-000001")?.collected).toBe(true);
+
+    const slow = await host.run({ command: "printf partial; sleep 2", cwd: root, inlineBudgetMs: 30, owner: "session-a" });
+    expect("id" in slow).toBe(true);
+    if (!("id" in slow)) return;
+    // Handed back, not killed: the process is still alive and nobody has its output yet.
+    expect(host.status(slow.id)).toMatchObject({ status: "running", owner: "session-a" });
+    expect(host.status(slow.id)?.collected).toBeUndefined();
+    const collected = await host.wait(slow.id);
+    expect(collected).toMatchObject({ stdout: "partial", exitCode: 0, signal: null });
+    expect(host.status(slow.id)?.collected).toBe(true);
   });
 
   test("enforces class limits and expires queued tickets", async () => {

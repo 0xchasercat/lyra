@@ -1052,6 +1052,32 @@ pub struct TurnEnd {
     pub error: Option<ProviderError>,
 }
 
+/// `round_start` — a request is in flight to the provider, and nothing has come
+/// back yet.
+///
+/// The gap this closes is the one the client used to guess at. `message_start`
+/// and `part_start` fire when content *arrives*; between sending a round and the
+/// first token there was no frame at all, so "waiting on the model" and "idle"
+/// looked identical from here — which is precisely what the old three-second
+/// stall inference was invented to paper over, and precisely why it was wrong.
+/// A reasoning model thinking for minutes is the workload, not a fault, and the
+/// daemon now says so out loud.
+///
+/// There is no `round_end`: the next update of the round — `message_start`,
+/// `retry`, `turn_end` — already says the wait is over.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RoundStart {
+    /// Owning turn.
+    pub turn_id: String,
+    /// Which provider call of this turn is in flight, counted from 1. One round
+    /// per assistant reply: the first, then one more after each batch of tool
+    /// results. Retries *within* a round are `retry` and do not advance it.
+    pub round: u32,
+    /// When the round went out.
+    pub started_at_ms: i64,
+}
+
 /// `message_start` — an assistant message opened.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -1505,7 +1531,7 @@ pub struct AgentUpdate {
     pub error: Option<String>,
 }
 
-/// One semantic event: the 25-variant union `#/$defs/update` declares.
+/// One semantic event: the 26-variant union `#/$defs/update` declares.
 ///
 /// The `sessionUpdate` tag discriminates. Dispatch on [`Update::tag`] rather
 /// than re-reading raw JSON — nothing outside `acp::` should name a wire key.
@@ -1517,6 +1543,8 @@ pub enum Update {
     TurnResume(TurnResume),
     /// A turn reached a terminal state.
     TurnEnd(TurnEnd),
+    /// A provider round went out and nothing has come back yet.
+    RoundStart(RoundStart),
     /// An assistant message opened.
     MessageStart(MessageStart),
     /// A content part opened.
@@ -1570,10 +1598,11 @@ pub enum Update {
 /// `acp::conformance` asserts this equals the schema's declared `oneOf`
 /// titles, which is what makes a daemon-side addition a *test* failure here
 /// rather than a silent shrug at runtime.
-pub const UPDATE_TAGS: [&str; 25] = [
+pub const UPDATE_TAGS: [&str; 26] = [
     "turn_start",
     "turn_resume",
     "turn_end",
+    "round_start",
     "message_start",
     "part_start",
     "delta",
@@ -1606,6 +1635,7 @@ impl Update {
             Self::TurnStart(_) => "turn_start",
             Self::TurnResume(_) => "turn_resume",
             Self::TurnEnd(_) => "turn_end",
+            Self::RoundStart(_) => "round_start",
             Self::MessageStart(_) => "message_start",
             Self::PartStart(_) => "part_start",
             Self::Delta(_) => "delta",
@@ -1657,6 +1687,7 @@ impl Update {
             Self::TurnStart(payload) => encode!("turn_start", payload),
             Self::TurnResume(payload) => encode!("turn_resume", payload),
             Self::TurnEnd(payload) => encode!("turn_end", payload),
+            Self::RoundStart(payload) => encode!("round_start", payload),
             Self::MessageStart(payload) => encode!("message_start", payload),
             Self::PartStart(payload) => encode!("part_start", payload),
             Self::Delta(payload) => encode!("delta", payload),
@@ -1709,6 +1740,7 @@ impl Update {
             "turn_start" => decode!(Self::TurnStart),
             "turn_resume" => decode!(Self::TurnResume),
             "turn_end" => decode!(Self::TurnEnd),
+            "round_start" => decode!(Self::RoundStart),
             "message_start" => decode!(Self::MessageStart),
             "part_start" => decode!(Self::PartStart),
             "delta" => decode!(Self::Delta),

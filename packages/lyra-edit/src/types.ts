@@ -22,6 +22,14 @@ export interface ReadResult {
   totalLines: number;
   content: string;
   numbered: string;
+  /**
+   * The `endLine` that was asked for, present only when it ran past the end of the file and
+   * was clamped to `totalLines`. A range that overshoots the file is a guess about a length
+   * the caller could not know — `read({ startLine: 1, endLine: 100 })` on an 18-line file is
+   * the whole file, not a mistake — so the lines come back and the overshoot is reported in
+   * band rather than raised as an error.
+   */
+  requestedEndLine?: number;
 }
 
 export type EditRequest =

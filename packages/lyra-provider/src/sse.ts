@@ -5,9 +5,15 @@ export interface SseEvent {
   retry?: number;
 }
 
+/**
+ * @param onLiveness Called once per received chunk, before the chunk is parsed. Comments,
+ *   blank keep-alive lines and half-frames are swallowed by the parser by design — this is
+ *   the hook that lets the §3.3 watchdog still see them as proof the socket is alive.
+ */
 export async function* parseSse(
   body: ReadableStream<Uint8Array>,
   signal?: AbortSignal,
+  onLiveness?: () => void,
 ): AsyncGenerator<SseEvent> {
   const reader = body.getReader();
   const decoder = new TextDecoder();
@@ -28,7 +34,10 @@ export async function* parseSse(
     while (true) {
       const { done, value } = await readChunk(reader, signal);
       if (done) buffer += decoder.decode();
-      else buffer += decoder.decode(value, { stream: true });
+      else {
+        onLiveness?.();
+        buffer += decoder.decode(value, { stream: true });
+      }
 
       const split = splitLines(buffer, done);
       buffer = split.rest;

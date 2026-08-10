@@ -9,6 +9,10 @@ const SERVER = `let buffer = ""; for await (const chunk of Bun.stdin.stream()) {
 // and echoes whatever the client answered back through tools/call.
 const SAMPLING_SERVER = `let buffer = ""; let answer = null; process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: 1, method: "sampling/createMessage", params: {} }) + "\\n"); for await (const chunk of Bun.stdin.stream()) { buffer += new TextDecoder().decode(chunk); let index = buffer.indexOf("\\n"); while (index >= 0) { const line = buffer.slice(0, index); buffer = buffer.slice(index + 1); index = buffer.indexOf("\\n"); const message = JSON.parse(line); if (message.method === undefined) { answer = message; continue; } if (message.id === undefined) continue; const result = message.method === "initialize" ? { protocolVersion: "2025-11-25", capabilities: {}, serverInfo: { name: "sampler", version: "1" } } : { content: [{ type: "text", text: JSON.stringify(answer) }] }; process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: message.id, result }) + "\\n"); } }`;
 
+/** A real, complete 1×1 PNG, as an MCP image part would carry it. */
+const ONE_PIXEL_PNG = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+const IMAGE_SERVER = `let buffer = ""; for await (const chunk of Bun.stdin.stream()) { buffer += new TextDecoder().decode(chunk); let index = buffer.indexOf("\\n"); while (index >= 0) { const line = buffer.slice(0, index); buffer = buffer.slice(index + 1); index = buffer.indexOf("\\n"); const message = JSON.parse(line); if (message.id === undefined) continue; let result; if (message.method === "initialize") result = { protocolVersion: "2025-11-25", capabilities: { tools: {} }, serverInfo: { name: "shots", version: "1" } }; else if (message.method === "tools/list") result = { tools: [{ name: "screenshot", description: "Take a screenshot", inputSchema: { type: "object" } }] }; else if (message.method === "tools/call") result = { content: [{ type: "text", text: "captured" }, { type: "image", data: "${ONE_PIXEL_PNG}", mimeType: "image/png" }] }; else result = {}; process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: message.id, result }) + "\\n"); } }`;
+
 function context() { return { signal: new AbortController().signal, sessionId: "mcp", workspace: ".", callId: "mcp-call" }; }
 async function fixture(source: string): Promise<{ root: string; script: string }> {
   const root = await mkdtemp(join(tmpdir(), "lyra-mcp-"));
@@ -53,6 +57,32 @@ describe("MCP client and Draco installer", () => {
       expect(client.closed).toBe(false);
       expect((await gateway.execute({ op: "call", server: "fake", tool: "echo", args: { value: 4 } }, context())).content.toString()).toContain("value");
       await expect(gateway.execute({ op: "describe", server: "fake", tool: "missing" }, context())).resolves.toMatchObject({ isError: true });
+    } finally { await registry.close(); await rm(root, { recursive: true, force: true }); }
+  });
+
+  /**
+   * A screenshot has to leave the gateway as *an image*. Serialized into the result JSON it
+   * is a wall of base64 no model can see, and spilling that JSON wholesale stores it as
+   * `application/json` — so reading the artifact back gives text, and the picture is lost
+   * between an MCP server and a vision model that could have read it.
+   */
+  test("gateway stores an MCP image part as an image artifact rather than as JSON", async () => {
+    const { root, script } = await fixture(IMAGE_SERVER);
+    const registry = new McpRegistry(root, { timeoutMs: 1_000 });
+    await registry.set("shots", { command: process.execPath, args: [script], cwd: root });
+    const stored: Array<{ mimeType?: string; bytes: number }> = [];
+    const gateway = new McpGateway(registry, {
+      put: async (content, options) => { stored.push({ mimeType: options?.mimeType, bytes: content.length }); return "artifact://png"; },
+    });
+    try {
+      const called = await gateway.execute({ op: "call", server: "shots", tool: "screenshot", args: {} }, context());
+      expect(called.isError).not.toBe(true);
+      expect(stored).toEqual([{ mimeType: "image/png", bytes: 70 }]);
+      const body = called.content.toString();
+      expect(body).toContain("artifact://png");
+      expect(body).toContain("captured");
+      // The base64 is gone from the transcript; the artifact holds the exact bytes.
+      expect(body).not.toContain(ONE_PIXEL_PNG);
     } finally { await registry.close(); await rm(root, { recursive: true, force: true }); }
   });
 

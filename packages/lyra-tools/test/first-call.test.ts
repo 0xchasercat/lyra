@@ -283,6 +283,30 @@ describe("first-call ergonomics", () => {
     } finally { await close(); }
   });
 
+  /**
+   * A build and a dev server are both "heavy", and treating them the same taught the model
+   * to chase a handle for a build it was about to be handed — and to wait for a server that
+   * will never finish. They are told apart by pattern, and the server says so distinctly.
+   */
+  test("a finite build blocks while a development server is a job that says it will not exit", async () => {
+    const { registry, context, close } = await fixture();
+    try {
+      // Finite: the output *is* the answer, so the call blocks for it.
+      const build = await registry.execute("bash", { command: "make --version" }, context);
+      expect(text(build)).toContain("exit_code:");
+      expect(text(build)).not.toContain("Started bash job");
+
+      const server = await registry.execute("bash", { command: "vite" }, context);
+      expect(server.isError).not.toBe(true);
+      expect(String(server.metadata?.execution)).toBe("server");
+      expect(text(server)).toContain("development server");
+      expect(text(server)).toContain("will not exit on its own");
+      // Never dressed as a pending build.
+      expect(text(server)).not.toContain("backgrounded: matched heavy pattern");
+      await registry.execute("bash", { job: String(server.metadata?.jobId), timeoutMs: 2_000 }, context);
+    } finally { await close(); }
+  });
+
   /** JSON-mode emitters stringify scalars; "$args.timeoutMs must be integer" teaches nothing. */
   test("numbers and booleans that arrive as strings are read as what they are", async () => {
     const { root, registry, context, close } = await fixture();
@@ -649,6 +673,58 @@ describe("first-call ergonomics", () => {
       expect(sliced.isError).not.toBe(true);
       expect(text(sliced)).toContain("beta");
       expect(text(sliced)).not.toContain("gamma");
+    } finally { await close(); }
+  });
+
+  /**
+   * A range past the end of the file used to be an error, which meant `read({ startLine: 1,
+   * endLine: 100 })` failed on an 18-line file — a request for the whole file, refused for
+   * being right. It clamps and says so, on every spelling of a range.
+   */
+  test("a range past the end of a file returns the file, clamped, and says what it clamped", async () => {
+    const { root, registry, context, close } = await fixture();
+    try {
+      await writeFile(join(root, "short.ts"), Array.from({ length: 18 }, (_, index) => `line ${index + 1}`).join("\n"));
+
+      const overshoot = await registry.execute("read", { path: "short.ts", startLine: 1, endLine: 100 }, context);
+      expect(overshoot.isError).not.toBe(true);
+      expect(text(overshoot)).toContain("[lines 1-18 of 18 — requested 1-100, clamped]");
+      expect(text(overshoot)).toContain("[18] line 18");
+
+      // Claude Code's offset/limit is the same request in another spelling, and its default
+      // limit is far larger than most files.
+      const alias = await registry.execute("read", { file_path: "short.ts", offset: 10, limit: 2000 }, context);
+      expect(alias.isError).not.toBe(true);
+      expect(text(alias)).toContain("[lines 10-18 of 18 — requested 10-2009, clamped]");
+      expect(text(alias)).toContain("[10] line 10");
+
+      // …as is the text-editor tool's view_range.
+      const view = await registry.execute("read", { path: "short.ts", view_range: [1, 100] }, context);
+      expect(text(view)).toContain("clamped");
+
+      // An exact range says nothing extra.
+      const exact = await registry.execute("read", { path: "short.ts", startLine: 2, endLine: 4 }, context);
+      expect(text(exact)).not.toContain("clamped");
+
+      // A start past the end has nothing to return, so it is still an error — and one that
+      // names the length the model did not know.
+      const past = await registry.execute("read", { path: "short.ts", startLine: 40, endLine: 60 }, context);
+      expect(past.isError).toBe(true);
+      expect(text(past)).toContain("past the end");
+      expect(text(past)).toContain("18 lines");
+
+      const backwards = await registry.execute("read", { path: "short.ts", startLine: 9, endLine: 3 }, context);
+      expect(backwards.isError).toBe(true);
+
+      // Artifacts and URLs gained ranges recently and follow the same rule.
+      const id = await context.artifactStore.put(new TextEncoder().encode("alpha\nbeta\ngamma"), { mimeType: "text/plain", name: "three.txt" });
+      const artifact = await registry.execute("read", { path: id, startLine: 1, endLine: 90 }, context);
+      expect(artifact.isError).not.toBe(true);
+      expect(text(artifact)).toContain("[lines 1-3 of 3 — requested 1-90, clamped]");
+      expect(text(artifact)).toContain("gamma");
+      const artifactPast = await registry.execute("read", { path: id, startLine: 9 }, context);
+      expect(artifactPast.isError).toBe(true);
+      expect(text(artifactPast)).toContain("past the end");
     } finally { await close(); }
   });
 

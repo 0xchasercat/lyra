@@ -199,6 +199,47 @@ describe("AgentLoop", () => {
     store.close();
   });
 
+  test("announces every provider round before the request that begins it", async () => {
+    const store = createStore();
+    const registry: ToolRegistry = {
+      definitions: () => [toolDefinition("read")],
+      async execute() {
+        return { content: "file contents" };
+      },
+    };
+    const fixture = scriptedTransport([
+      async function* () {
+        yield { type: "tool_call_start", id: "call-1", name: "read" };
+        yield { type: "tool_call_delta", id: "call-1", argumentsDelta: "{}" };
+        yield { type: "tool_call_end", id: "call-1" };
+        yield { type: "complete", stopReason: "tool_use" };
+      },
+      async function* () {
+        yield { type: "text_delta", text: "done" };
+        yield { type: "complete", stopReason: "end_turn" };
+      },
+    ]);
+    const loop = new AgentLoop({
+      provider: reliable(fixture.transport),
+      store,
+      tools: registry,
+      model: "fixture-model",
+      system: "stable",
+      contextWindow: 32_000,
+      workspace: "/workspace",
+    });
+
+    const outcome = await settleTurn(loop.runTurn("read the file"));
+    const rounds = outcome.events.filter((event) => event.type === "provider_round_start");
+    expect(rounds.map((event) => event.round)).toEqual([1, 2]);
+    // The marker is what a client renders "waiting on the model" from, so it has to precede
+    // the round's first content — §3.3 no longer bounds how long that gap can be.
+    const types = outcome.events.map((event) => event.type);
+    expect(types.indexOf("provider_round_start")).toBeLessThan(types.indexOf("tool_call_start"));
+    expect(types.lastIndexOf("provider_round_start")).toBeLessThan(types.indexOf("text_delta"));
+    store.close();
+  });
+
   test("logs context repairs before the request that consumes them", async () => {
     const store = createStore();
     store.append({

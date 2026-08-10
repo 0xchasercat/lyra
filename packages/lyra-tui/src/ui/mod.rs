@@ -18,6 +18,7 @@
 //! | [`diff`] | *the* diff renderer, for every surface |
 //! | [`tool_row`] | `▸ edit src/auth.ts +12 −4` and its `└─` children |
 //! | [`reliability`] | "never render nothing" |
+//! | [`thinking`] | the model's reasoning: dim while live, one line after |
 //! | [`transcript`] | user bands, session header, run collapsing, replay |
 //!
 //! Build phase 6 adds the two interactive ones, on the same primitive:
@@ -42,6 +43,7 @@ pub mod queue;
 pub mod reliability;
 pub mod results;
 pub mod syntax;
+pub mod thinking;
 pub mod tool_row;
 pub mod transcript;
 

@@ -6,6 +6,11 @@ export interface EnvironmentProviderOptions {
   configPaths?: readonly string[];
   model?: string;
   maxAttempts?: number;
+  /**
+   * `reliability.stream_stall_timeout`: the gap allowed *between* events once the stream has
+   * produced output (§3.3). Time to first token is not bounded by it — that wait is a model
+   * thinking, and only the turn deadline bounds it.
+   */
   streamStallTimeoutMs?: number;
   turnTimeoutMs?: number;
   /** Home directory auth plugins are read from. Defaults to the real one; tests point it away. */

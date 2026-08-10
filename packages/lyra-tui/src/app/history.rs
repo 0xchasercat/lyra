@@ -320,9 +320,17 @@ fn user_rows(transcript: &mut Transcript, blocks: &[Value]) -> Vec<Row> {
 }
 
 /// An assistant turn, in block order: prose as markdown, tool calls as collapsed
-/// rows. Thinking and reasoning are deliberately absent — DESIGN.md keeps them
-/// out of scrollback live, and a replay that showed them would contradict the
-/// session the user actually watched.
+/// rows, thinking under whatever `[tui] thinking` says — because a replay that
+/// showed more (or less) than the live path would contradict the session the
+/// user actually watched.
+///
+/// The default (`collapsed`) shows nothing here, and that is not an oversight:
+/// the live one-liner's whole content is a *duration*, which a persisted
+/// transcript does not carry. `∴ thought` with no figure would be a row that
+/// tells a reader only that a model thought, which every row in a transcript
+/// already implies. `full` renders the trace, which is the mode that asked for
+/// it. Should the daemon ever persist a thinking duration, this is the one place
+/// that has to change.
 fn assistant_rows(
     transcript: &mut Transcript,
     blocks: &[Value],
@@ -345,6 +353,19 @@ fn assistant_rows(
                 let view = tool_view(block, outcomes);
                 rows.extend(transcript.tool(view));
             }
+            Some("thinking") => {
+                let text = block
+                    .get("thinking")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                // Never `signature`: it is opaque provider bytes, it is not
+                // reasoning, and it is not shown in any mode (`ui::thinking`).
+                let seconds = block.get("durationMs").and_then(Value::as_u64).map(seconds);
+                if !text.trim().is_empty() || seconds.is_some() {
+                    rows.extend(flush(transcript, &mut prose));
+                    rows.extend(transcript.replayed_thinking(text, seconds));
+                }
+            }
             Some("marker") => {
                 let reason = block
                     .get("reason")
@@ -365,8 +386,8 @@ fn assistant_rows(
                 };
                 rows.extend(transcript.audit(&marker));
             }
-            // Thinking, reasoning, images, tool results in an assistant turn, and
-            // anything a newer daemon invents: nothing on screen, no complaint.
+            // Reasoning, images, tool results in an assistant turn, and anything
+            // a newer daemon invents: nothing on screen, no complaint.
             _ => {}
         }
     }
@@ -496,6 +517,11 @@ fn text_of(blocks: &[Value]) -> String {
         }
     }
     text
+}
+
+/// Milliseconds as whole seconds, for a duration a transcript happened to keep.
+const fn seconds(millis: u64) -> u64 {
+    millis / 1_000
 }
 
 /// Collapse to one line, for the rows that are one line by contract.

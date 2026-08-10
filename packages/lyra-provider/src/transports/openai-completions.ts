@@ -84,7 +84,7 @@ export class OpenAICompletionsTransport implements ProviderTransport {
       );
     }
 
-    yield* parseCompletionStream(response.body, response.headers, context.signal);
+    yield* parseCompletionStream(response.body, response.headers, context.signal, context.onLiveness);
   }
 }
 
@@ -287,6 +287,7 @@ async function* parseCompletionStream(
   body: ReadableStream<Uint8Array>,
   responseHeaders: Headers,
   signal: AbortSignal,
+  onLiveness?: () => void,
 ): AsyncGenerator<ProviderEvent> {
   const state: StreamState = {
     toolCalls: new Map(),
@@ -295,7 +296,7 @@ async function* parseCompletionStream(
   };
   let completed = false;
 
-  for await (const event of parseSse(body, signal)) {
+  for await (const event of parseSse(body, signal, onLiveness)) {
     const data = event.data.trim();
     if (data === "[DONE]") {
       if (state.stopReason === undefined) {

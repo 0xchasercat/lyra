@@ -117,7 +117,7 @@ export class AnthropicMessagesTransport implements ProviderTransport {
     let usage: ProviderUsage = { inputTokens: 0, outputTokens: 0 };
     let started = false;
 
-    for await (const sse of parseSse(response.body, context.signal)) {
+    for await (const sse of parseSse(response.body, context.signal, context.onLiveness)) {
       let event: JsonRecord;
       try {
         const parsed: unknown = JSON.parse(sse.data);

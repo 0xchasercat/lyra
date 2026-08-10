@@ -243,10 +243,37 @@ function normalizeBlock(
       addRepair(repairs, "empty_content", `Dropped tool call ${block.id} from a user message`, entry.id, block);
       return undefined;
     case "tool_result":
-      if (entry.role === "user") return block;
+      if (entry.role === "user") return normalizeToolResult(block, entry, imageByteLimit, repairs);
       addRepair(repairs, "orphan_tool_result", `Dropped tool result ${block.toolUseId} from an assistant message`, entry.id, block);
       return undefined;
   }
+}
+
+/**
+ * A tool result may carry images — a screenshot spilled to an artifact and read back is the
+ * whole point of the browser path — and §3.6 applies to those exactly as it applies to an
+ * image a user pasted. Validating only top-level blocks left the one route a picture actually
+ * takes into the context unchecked, so an oversized or malformed one reached the provider as
+ * a 400 instead of a marker the model could read.
+ */
+function normalizeToolResult(
+  block: ToolResultBlock,
+  entry: MessageEntry,
+  imageByteLimit: number,
+  repairs: ContextRepair[],
+): ToolResultBlock {
+  if (typeof block.content === "string") return block;
+  let repaired = false;
+  const content: ContentBlock[] = [];
+  for (const nested of block.content) {
+    if (nested.type !== "image") { content.push(nested); continue; }
+    const issue = imageIssue(nested.mediaType, nested.data, imageByteLimit);
+    if (issue === undefined) { content.push(nested); continue; }
+    addRepair(repairs, "image_dropped", `Dropped image in tool result ${block.toolUseId}: ${issue}`, entry.id, nested);
+    content.push({ type: "marker", reason: "image_dropped", detail: issue });
+    repaired = true;
+  }
+  return repaired ? { ...block, content } : block;
 }
 
 function mergeAdjacentRoles(messages: readonly WorkingMessage[], repairs: ContextRepair[]): WorkingMessage[] {

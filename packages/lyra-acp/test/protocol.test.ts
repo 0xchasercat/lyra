@@ -38,6 +38,7 @@ function scriptedTurn(): AgentEvent[] {
   return [
     { type: "context_measured", tokenEstimate: 4_200, sourceEntryCount: 7 },
     { type: "context_repaired", repairs: [{ code: "missing_tool_result", detail: "synthesised a missing result", entryId: "e-9", tokenEstimate: 12 }] },
+    { type: "provider_round_start", round: 1 },
     { type: "thinking_delta", thinking: "weigh" },
     { type: "thinking_delta", thinking: "ing" },
     { type: "thinking_signature", signature: "sig-1" },
@@ -170,7 +171,7 @@ describe("session update encoder conformance", () => {
     expect(tags[0]).toBe("turn_start");
     expect(tags.at(-1)).toBe("turn_end");
     for (const required of [
-      "turn_start", "context", "context_repair", "turn_resume", "message_start", "part_start",
+      "turn_start", "context", "context_repair", "turn_resume", "round_start", "message_start", "part_start",
       "delta", "part_end", "tool_call_start", "tool_call_update", "tool_call_end", "message_end",
       "usage", "steer", "retry", "transport_fallback", "compaction", "loop_warning",
       "reasoning_item", "turn_end",
@@ -178,6 +179,10 @@ describe("session update encoder conformance", () => {
       expect(tags).toContain(required);
     }
     // Ordering invariants a client's state machine relies on.
+    // The round is announced before any content of that round can arrive: that gap is the
+    // whole point of it, and with §3.3 no longer capping pre-first-token silence it can be
+    // minutes long.
+    expect(tags.indexOf("round_start")).toBeLessThan(tags.indexOf("message_start"));
     expect(tags.indexOf("message_start")).toBeLessThan(tags.indexOf("delta"));
     expect(tags.indexOf("part_start")).toBeLessThan(tags.indexOf("delta"));
     expect(tags.indexOf("tool_call_start")).toBeLessThan(tags.indexOf("tool_call_update"));
@@ -268,6 +273,29 @@ describe("session update encoder conformance", () => {
     ]);
     expect(retry).toMatchObject({ classification: "auth", providerMessage: "token expired" });
     validator.assertUpdate(retry);
+  });
+
+  test("a round in flight is announced before any of its content, and is never orphaned", () => {
+    const encoder = encoderWith(BARE_USAGE);
+    // Outside a turn there is nothing to attach the wait to, so nothing is claimed.
+    expect(runScript(encoder, [{ type: "provider_round_start", round: 1 }])).toEqual([]);
+
+    encoder.beginTurn("user");
+    const updates = runScript(encoder, [
+      { type: "provider_round_start", round: 1 },
+      { type: "text_delta", text: "reading" },
+      { type: "complete", stopReason: "tool_use" },
+      // A second provider call in the same turn, after tool results went back.
+      { type: "provider_round_start", round: 2 },
+      { type: "text_delta", text: "answering" },
+    ]);
+    const rounds = updates.filter((update) => update.sessionUpdate === "round_start");
+    expect(rounds.map((update) => (update as { round: number }).round)).toEqual([1, 2]);
+    expect(rounds.every((update) => (update as { turnId: string }).turnId === encoder.turnId)).toBe(true);
+    for (const update of updates) validator.assertNotification(frame(update));
+    // Each round's marker precedes the message that round produced.
+    expect(updates.indexOf(rounds[1]!))
+      .toBeLessThan(updates.findIndex((update, index) => update.sessionUpdate === "message_start" && index > updates.indexOf(rounds[1]!)));
   });
 
   test("every pause kind is bracketed and closed exactly once", () => {

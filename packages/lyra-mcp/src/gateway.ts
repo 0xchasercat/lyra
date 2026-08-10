@@ -81,13 +81,46 @@ export class McpGateway implements McpToolLike {
   }
 }
 
+interface McpImagePart { type: "image"; data: string; mimeType?: string }
+
+function isImagePart(value: unknown): value is McpImagePart {
+  return value !== null && typeof value === "object" && (value as { type?: unknown }).type === "image"
+    && typeof (value as { data?: unknown }).data === "string" && (value as { data: string }).data.length > 0;
+}
+
+/**
+ * Take image parts out of the JSON and store them as images.
+ *
+ * An MCP screenshot arrives as base64 inside a `content` array. Serialized whole it is a wall
+ * of base64 that no model can see and that blows the 128 KiB cap on its own; spilled with the
+ * rest of the JSON it becomes an `application/json` artifact, and reading *that* back gives
+ * text, not a picture. Each image therefore becomes its own artifact carrying its real
+ * `mimeType`, which is exactly what `read` needs to hand the model an image block. The part
+ * left in the JSON names the artifact, so nothing is lost and the model knows what to call.
+ */
+async function spillImages(value: unknown, store: McpArtifactStore | undefined): Promise<unknown> {
+  if (store === undefined || value === null || typeof value !== "object") return value;
+  const content = (value as { content?: unknown }).content;
+  if (!Array.isArray(content) || !content.some(isImagePart)) return value;
+  const parts = await Promise.all(content.map(async (part: unknown) => {
+    if (!isImagePart(part)) return part;
+    let bytes: Uint8Array;
+    try { bytes = new Uint8Array(Buffer.from(part.data, "base64")); } catch { return part; }
+    if (bytes.byteLength === 0) return part;
+    const mimeType = typeof part.mimeType === "string" && part.mimeType.trim().length > 0 ? part.mimeType.trim() : "image/png";
+    const id = await store.put(bytes, { mimeType, name: `mcp-image.${mimeType.split("/")[1] ?? "png"}` });
+    return { type: "image", mimeType, bytes: bytes.byteLength, artifact: id, note: `Call read({ path: ${JSON.stringify(id)} }) to see this image.` };
+  }));
+  return { ...(value as Record<string, unknown>), content: parts };
+}
+
 async function boundedResult(value: unknown, context: ToolExecutionContext, fallbackStore?: McpArtifactStore): Promise<string> {
-  const serialized = JSON.stringify(value);
+  const contextStore = (context as ToolExecutionContext & { artifactStore?: McpArtifactStore }).artifactStore;
+  const store = contextStore ?? fallbackStore;
+  const serialized = JSON.stringify(await spillImages(value, store));
   const limit = 128 * 1024;
   if (Buffer.byteLength(serialized) <= limit) return serialized;
   const preview = serialized.slice(0, 16 * 1024);
-  const contextStore = (context as ToolExecutionContext & { artifactStore?: McpArtifactStore }).artifactStore;
-  const store = contextStore ?? fallbackStore;
   if (!store) throw new McpError("output_too_large", "MCP result exceeded 128 KiB and no durable artifact store is configured.");
   return `${preview}\n[truncated MCP result; full content: ${await store.put(serialized, { mimeType: "application/json", name: "mcp-result.json" })}]`;
 }

@@ -166,16 +166,27 @@ export class EditEngine {
     const lines = splitLines(normalized);
     const totalLines = lines.length;
     const startLine = request.startLine ?? 1;
-    const endLine = request.endLine ?? totalLines;
-    if (startLine < 1 || endLine < startLine || endLine > totalLines) {
-      return error(path, "read", "invalid_range", `Line range ${startLine}-${endLine} is outside ${path} (1-${totalLines}).`);
+    const requestedEndLine = request.endLine ?? totalLines;
+    // An `endLine` past the last line is clamped, never refused: the caller cannot know a
+    // file's length before reading it, so `1-100` on an 18-line file is a request for the
+    // whole file. Only a range with nothing in it is an error — a `startLine` past the end
+    // (there are no such lines) or a range that runs backwards.
+    const endLine = Math.min(requestedEndLine, totalLines);
+    if (startLine > totalLines) {
+      return error(path, "read", "invalid_range", `startLine ${startLine} is past the end of ${path}, which has ${totalLines} ${totalLines === 1 ? "line" : "lines"}; there is nothing to return. Read from line ${totalLines} or earlier.`);
+    }
+    if (startLine < 1 || requestedEndLine < startLine) {
+      return error(path, "read", "invalid_range", `Line range ${startLine}-${requestedEndLine} is empty in ${path} (1-${totalLines}); endLine must be at least startLine.`);
     }
     const tag = snapshotTag(normalized);
     this.knownTags.set(path, tag);
     const selectedLines = lines.slice(startLine - 1, endLine);
     const content = selectedLines.join("\n");
     const numbered = selectedLines.map((line, index) => `[${startLine + index}] ${line}`).join("\n");
-    return { ok: true, path, tag, startLine, endLine, totalLines, content, numbered };
+    return {
+      ok: true, path, tag, startLine, endLine, totalLines, content, numbered,
+      ...(requestedEndLine > totalLines ? { requestedEndLine } : {}),
+    };
   }
 
   async apply(request: EditRequest): Promise<EditResult> {

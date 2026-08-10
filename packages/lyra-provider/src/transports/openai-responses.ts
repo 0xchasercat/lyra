@@ -206,7 +206,7 @@ export class OpenAIResponsesTransport implements ProviderTransport {
       });
     }
 
-    for await (const sse of parseSse(response.body, context.signal)) {
+    for await (const sse of parseSse(response.body, context.signal, context.onLiveness)) {
       if (sse.data === "[DONE]") break;
       let value: unknown;
       try {

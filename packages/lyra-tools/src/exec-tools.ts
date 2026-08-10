@@ -1,5 +1,5 @@
 import { resolve } from "node:path";
-import { ProcessHost, classifyCommand, type HostProcess, type JobHandle, type ProcessResult } from "@lyra/host";
+import { ProcessHost, classifyCommand, classifyExecution, type CommandExecution, type HostProcess, type JobHandle, type ProcessResult } from "@lyra/host";
 import type { ToolDefinition } from "@lyra/provider";
 import { foldToolAliases, toolArgs, type ToolAlias, type ToolExecutionContext, type ToolExecutionResult } from "@lyra/core";
 import { boundText } from "./filesystem-tools.ts";
@@ -25,7 +25,7 @@ export type BashCompleted = ProcessResult;
 
 export const BASH_DEFINITION: ToolDefinition = Object.freeze({
   name: "bash",
-  description: "Run a shell command from the model-selected working directory and report complete stdout, stderr, exit status, and cancellation details. Put the command in `command`; every other field is optional and is best left out. Heavy commands (builds, test suites, servers) return a job id immediately — a later call with `job` set to that id collects the complete output.",
+  description: "Run a shell command from the model-selected working directory and report complete stdout, stderr, exit status, and cancellation details. Put the command in `command`; every other field is optional and is best left out. Builds and test suites run inline and return their output. Dependency installs, development servers, and anything still running after the inline budget return a job id instead — a later call with `job` set to that id collects the complete output.",
   inputSchema: Object.freeze({
     type: "object",
     additionalProperties: false,
@@ -34,7 +34,7 @@ export const BASH_DEFINITION: ToolDefinition = Object.freeze({
       cwd: { type: "string", minLength: 1, description: "Optional absolute or cwd-relative working directory." },
       timeoutMs: { type: "integer", minimum: 1, maximum: 3_600_000, description: "Optional deadline in milliseconds. With job, how long to wait for the job to finish." },
       description: { type: "string", maxLength: 200, description: "Optional one-line summary of what the command does, shown in the UI. Has no effect on execution." },
-      run_in_background: { type: "boolean", description: "Return a job id immediately instead of blocking. Heavy commands do this regardless of this flag." },
+      run_in_background: { type: "boolean", description: "Return a job id immediately instead of blocking. Development servers and unbounded commands do this regardless of this flag." },
       job: { type: ["string", "null"], description: "A job id such as \"job-000001\" reported by an earlier background or heavy call. Sending it waits for that job and returns its complete output; any command sent alongside it is ignored and reported as ignored. Leave it out, empty, or null whenever you are running a command." },
     },
   }),
@@ -143,12 +143,39 @@ function heavyTrigger(command: string): string | undefined {
   return undefined;
 }
 
-function backgroundReason(command: string, heavy: boolean): string {
-  if (!heavy) return "backgrounded: run_in_background was set";
+/** The word that made a segment a server, for the same reason `heavyTrigger` names its own. */
+function serverTrigger(command: string): string | undefined {
+  for (const segment of command.split(/\|\||&&|[;|&\n]/)) {
+    const trimmed = segment.trim();
+    if (trimmed.length === 0 || classifyExecution(trimmed) !== "server") continue;
+    const word = trimmed.split(/\s+/).find((part) => !/^[A-Za-z_][A-Za-z0-9_]*=/.test(part));
+    if (word !== undefined) return word.split("/").pop();
+  }
+  return undefined;
+}
+
+function backgroundReason(command: string, asked: boolean, budgetMs: number): string {
+  if (asked) return "backgrounded: run_in_background was set";
+  // A command whose pattern says it terminates was blocked on, and only became a job because
+  // it outlived the caller's patience. Saying so is what stops the model reading a slow build
+  // as a rule it does not understand.
+  if (classifyExecution(command) === "inline") return `handed back as a job: it is still running after the ${budgetMs}ms inline budget, and was left running rather than killed`;
   const trigger = heavyTrigger(command);
   return trigger === undefined
     ? "backgrounded: classified heavy, and heavy commands never block the agent"
     : `backgrounded: matched heavy pattern ${JSON.stringify(trigger)}, and heavy commands never block the agent`;
+}
+
+/**
+ * A server is not a pending build, and reading it as one is how a model ends up waiting
+ * forever for `npm run dev` to "finish". The sentence says the one thing that distinguishes
+ * them — it will not exit — and what to do instead.
+ */
+function serverResponse(id: string, command: string): string {
+  const trigger = serverTrigger(command);
+  return `Started a development server as ${id}${trigger === undefined ? "" : ` (matched server pattern ${JSON.stringify(trigger)})`} — it will not exit on its own, so nothing is waiting for it. `
+    + `Call bash({ job: ${JSON.stringify(id)}, timeoutMs: 2000 }) to check whether it is still up; its complete output arrives once it stops. `
+    + `Stop it yourself when you are done with it — a kill command, or ending the session, which kills every job it started.`;
 }
 
 function runtime(context: ToolExecutionContext, root?: string): { cwd: string; origin: string; store: ArtifactStore } {
@@ -239,16 +266,28 @@ export class BashTool implements LyraTool {
     const request = parsed.request;
     const requested = request.cwd === undefined ? base.cwd : resolve(base.cwd, request.cwd);
     const cwd = requested;
-    const timeoutMs = request.timeoutMs ?? this.#options.maxInlineMs;
+    // A `timeoutMs` the model sent is a deadline it chose and is enforced as one. Without it,
+    // the budget is how long *this call* blocks — the command outlives it as a job rather
+    // than being killed for taking longer than the agent guessed (§3.8).
+    const budgetMs = this.#options.maxInlineMs;
+    const execution: CommandExecution = classifyExecution(request.command);
     this.#options.activity?.({ type: "bash_started", command: request.command, cwd });
     try {
-      const launched = await this.#host.run({ command: request.command, cwd, timeoutMs, signal: context.signal, ...(request.background === true ? { background: true } : {}) });
+      const launched = await this.#host.run({
+        command: request.command, cwd, signal: context.signal,
+        ...(request.timeoutMs === undefined ? { inlineBudgetMs: budgetMs } : { timeoutMs: request.timeoutMs }),
+        ...(typeof context.sessionId === "string" && context.sessionId.length > 0 ? { owner: context.sessionId } : {}),
+        ...(request.background === true ? { background: true } : {}),
+      });
       if (isJobHandle(launched)) {
         this.#options.activity?.({ type: "bash_started", command: request.command, cwd, jobId: launched.id });
         // Backgrounding a command the model expected to block is a surprise unless the
         // response says which rule fired (§3.7.1).
-        const why = backgroundReason(request.command, launched.class === "heavy");
-        return { content: `Started bash job ${launched.id} — ${why}. Call bash({ job: ${JSON.stringify(launched.id)} }) to wait for it and read the complete output.`, metadata: { jobId: launched.id, command: request.command, cwd, heavy: launched.class === "heavy", reason: why } };
+        if (execution === "server" && request.background !== true) {
+          return { content: serverResponse(launched.id, request.command), metadata: { jobId: launched.id, command: request.command, cwd, heavy: launched.class === "heavy", execution, reason: "long-running: the command pattern is a server, which never exits on its own" } };
+        }
+        const why = backgroundReason(request.command, request.background === true, request.timeoutMs ?? budgetMs);
+        return { content: `Started bash job ${launched.id} — ${why}. Call bash({ job: ${JSON.stringify(launched.id)} }) to wait for it and read the complete output.`, metadata: { jobId: launched.id, command: request.command, cwd, heavy: launched.class === "heavy", execution, reason: why } };
       }
       this.#options.activity?.({ type: "bash_finished", command: request.command, cwd, exitCode: launched.exitCode });
       return { content: await present(launched, base.store, this.#options.displayBudget), ...(launched.exitCode === 0 ? {} : { isError: true }) };

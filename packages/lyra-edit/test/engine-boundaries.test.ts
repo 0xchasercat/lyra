@@ -23,6 +23,36 @@ describe("EditEngine boundaries", () => {
     expect(read).toMatchObject({ ok: true, startLine: 1, endLine: 1, totalLines: 1, numbered: "[1] " });
   });
 
+  /**
+   * A range that runs past the end of the file is a guess about a length the caller could
+   * not know before reading it, so it returns the lines that exist and says it clamped.
+   * Only a range with nothing in it is still an error.
+   */
+  test("clamps an overshooting endLine and refuses a range with nothing in it", async () => {
+    const files = new MemoryFileSystem();
+    files.files.set("short.txt", Array.from({ length: 18 }, (_, index) => `line ${index + 1}`).join("\n"));
+    const engine = new EditEngine(files);
+
+    const clamped = await engine.read({ path: "short.txt", startLine: 1, endLine: 100 });
+    expect(clamped).toMatchObject({ ok: true, startLine: 1, endLine: 18, totalLines: 18, requestedEndLine: 100 });
+    expect(clamped.ok && clamped.numbered.endsWith("[18] line 18")).toBe(true);
+
+    // An exact range is not a clamp, and says nothing extra.
+    const exact = await engine.read({ path: "short.txt", startLine: 2, endLine: 18 });
+    expect(exact.ok && exact.requestedEndLine).toBeUndefined();
+
+    const past = await engine.read({ path: "short.txt", startLine: 20, endLine: 30 });
+    expect(past.ok).toBe(false);
+    if (!past.ok) {
+      expect(past.code).toBe("invalid_range");
+      expect(past.message).toContain("past the end");
+    }
+
+    const backwards = await engine.read({ path: "short.txt", startLine: 5, endLine: 3 });
+    expect(backwards.ok).toBe(false);
+    if (!backwards.ok) expect(backwards.code).toBe("invalid_range");
+  });
+
   test("allows untagged new writes but requires read/tag for existing files", async () => {
     const files = new MemoryFileSystem();
     files.files.set("existing.txt", "old");

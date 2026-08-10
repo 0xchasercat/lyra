@@ -16,7 +16,8 @@ use crate::input::actor::Router;
 use crate::input::history::History;
 use crate::keybind::Keymap;
 use crate::theme::Theme;
-use crate::ui::reliability::{SPINNER_FRAMES, STALL_AFTER};
+use crate::ui::reliability::SPINNER_FRAMES;
+use crate::ui::thinking::ThinkingMode;
 
 /// Records what reached the wire, and hands back scripted answers.
 #[derive(Debug, Default)]
@@ -147,20 +148,26 @@ fn live_text(app: &App) -> String {
 /// live transcript rows there happen to be, and a test that counted them would
 /// be asserting about the transcript instead of about the spinner.
 fn activity_glyph(app: &App, at: Instant) -> String {
+    strip(app, at).0
+}
+
+/// The activity strip's glyph and the style it is painted in.
+fn strip(app: &App, at: Instant) -> (String, crate::ui::Style) {
     app.live(app.desired_region_height(12), at)
         .rows
         .iter()
         .find_map(|row| {
-            let glyph = row.spans.first()?.text.trim_end();
+            let span = row.spans.first()?;
+            let glyph = span.text.trim_end();
             let known = SPINNER_FRAMES.contains(&glyph)
                 || glyph == Activity::Idle.glyph()
-                || glyph == Activity::Stalled.glyph();
-            known.then(|| glyph.to_owned())
+                || glyph == Activity::Streaming.glyph();
+            known.then(|| (glyph.to_owned(), span.style))
         })
         .expect("the live region always carries an activity strip")
 }
 
-/// Whether the glyph is one of the moving frames, i.e. "work is live".
+/// Whether the glyph is one of the moving frames, i.e. "a turn is running".
 fn spinning(glyph: &str) -> bool {
     SPINNER_FRAMES.contains(&glyph)
 }
@@ -516,10 +523,8 @@ fn the_activity_strip_names_the_running_tool_and_lets_go_of_it() {
 
 #[test]
 fn a_running_tool_keeps_the_spinner_turning_however_long_it_takes() {
-    // The bug: a turn that picked up a tool froze into the stall state after
-    // three seconds, because only text deltas counted as life. Execution is
-    // local — the wire has nothing to say while `bash` runs — and a four-second
-    // command is not a hang.
+    // Execution is local — the wire has nothing to say while `bash` runs — and a
+    // ten-minute command is not a hang. Nor is the silence after it finishes.
     let (mut app, mut daemon, (tx, rx)) = (app(), ScriptedDaemon::default(), wire());
     let start = Instant::now();
     press_at(&mut app, &mut daemon, &rx, b"run the tests\r", start);
@@ -537,23 +542,25 @@ fn a_running_tool_keeps_the_spinner_turning_however_long_it_takes() {
         assert!(spinning(&glyph), "frozen {after}s into a running tool: {glyph:?}");
     }
 
-    // And the moment the tool is done, silence is silence again.
     tx.send(update(
         r#"{"sessionUpdate":"tool_call_end","toolCallId":"c-1","status":"ok","durationMs":9}"#,
     ))
     .expect("channel open");
     let ended = start + Duration::from_secs(600);
     press_at(&mut app, &mut daemon, &rx, b"", ended);
-    assert_eq!(
-        activity_glyph(&app, ended + STALL_AFTER),
-        Activity::Stalled.glyph()
+    let glyph = activity_glyph(&app, ended + Duration::from_secs(30));
+    assert!(
+        spinning(&glyph),
+        "the turn is still running, so the spinner still spins: {glyph:?}"
     );
 }
 
 #[test]
-fn wire_silence_with_nothing_running_locally_still_freezes_the_glyph() {
-    // The signal is only worth keeping if it still fires: three seconds in which
-    // nothing arrived and nothing is executing is a genuinely quiet wire.
+fn wire_silence_mid_turn_never_freezes_the_spinner() {
+    // The owner decision this replaced a three-second heuristic with: a model
+    // thinking silently is a *normal* turn. The client holds no provider
+    // connection and cannot tell a long thought from a hang, so it stops
+    // guessing — the motion means "this turn is still ours" and nothing else.
     let (mut app, mut daemon, (tx, rx)) = (app(), ScriptedDaemon::default(), wire());
     let start = Instant::now();
     press_at(&mut app, &mut daemon, &rx, b"explain this\r", start);
@@ -564,61 +571,40 @@ fn wire_silence_with_nothing_running_locally_still_freezes_the_glyph() {
     .expect("channel open");
     press_at(&mut app, &mut daemon, &rx, b"", start);
 
-    assert!(spinning(&activity_glyph(&app, start + Duration::from_millis(2_900))));
-    assert_eq!(
-        activity_glyph(&app, start + STALL_AFTER),
-        Activity::Stalled.glyph(),
-        "the threshold is inclusive"
+    let theme = Theme::lyra();
+    for after in [3u64, 10, 60, 600] {
+        let (glyph, style) = strip(&app, start + Duration::from_secs(after));
+        assert!(spinning(&glyph), "froze after {after}s of wire silence: {glyph:?}");
+        assert_eq!(
+            style,
+            theme.accent(),
+            "and never went amber on the client's own say-so ({after}s)"
+        );
+    }
+
+    // Consecutive ticks are different frames: it is *smooth*, not a still.
+    let at = start + Duration::from_secs(10);
+    assert_ne!(
+        activity_glyph(&app, at),
+        activity_glyph(&app, at + Duration::from_millis(100)),
     );
 
-    // Text resuming unfreezes it — the stall is a state, not a latch.
-    let resumed = start + Duration::from_secs(10);
+    // And it stops when the turn does.
     tx.send(update(
-        r#"{"sessionUpdate":"delta","messageId":"m-1","partId":"p-1","field":"text",
-            "delta":" — here it is"}"#,
+        r#"{"sessionUpdate":"turn_end","turnId":"t-1","status":"completed","durationMs":1,
+            "partialRetained":false}"#,
     ))
     .expect("channel open");
-    press_at(&mut app, &mut daemon, &rx, b"", resumed);
-    assert!(spinning(&activity_glyph(&app, resumed)));
+    let done = start + Duration::from_secs(600);
+    press_at(&mut app, &mut daemon, &rx, b"", done);
+    assert_eq!(activity_glyph(&app, done), Activity::Idle.glyph());
 }
 
 #[test]
-fn any_update_at_all_counts_as_the_turn_being_alive() {
-    // Thinking, reasoning and usage are not prose and never reach scrollback,
-    // but each one is proof the far end is working. Under the old rule the glyph
-    // would have frozen three seconds after the last *text* delta while the
-    // model was mid-thought.
-    for body in [
-        r#"{"sessionUpdate":"delta","messageId":"m-1","partId":"p-1","field":"thinking","delta":"weighing it up"}"#,
-        r#"{"sessionUpdate":"reasoning_item","messageId":"m-1","partId":"p-1","itemId":"r-1","summary":"planning"}"#,
-        r#"{"sessionUpdate":"usage","inputTokens":10,"outputTokens":2}"#,
-        r#"{"sessionUpdate":"telemetry","frames":12}"#,
-    ] {
-        let (mut app, mut daemon, (tx, rx)) = (app(), ScriptedDaemon::default(), wire());
-        let start = Instant::now();
-        press_at(&mut app, &mut daemon, &rx, b"think about it\r", start);
-        tx.send(update(r#"{"sessionUpdate":"turn_start","turnId":"t-1","source":"user"}"#))
-            .expect("channel open");
-        press_at(&mut app, &mut daemon, &rx, b"", start);
-        assert_eq!(
-            activity_glyph(&app, start + STALL_AFTER),
-            Activity::Stalled.glyph(),
-            "the baseline: silence since turn_start does stall"
-        );
-
-        let spoke = start + Duration::from_millis(2_500);
-        tx.send(update(body)).expect("channel open");
-        press_at(&mut app, &mut daemon, &rx, b"", spoke);
-        let glyph = activity_glyph(&app, start + Duration::from_secs(4));
-        assert!(spinning(&glyph), "{body} did not count as life: {glyph:?}");
-    }
-}
-
-#[test]
-fn a_retry_countdown_is_a_bracket_not_a_stall() {
-    // The footer is showing `⟳ … · 4s` ticking down once a second. A frozen
-    // warning glyph beside a live countdown would have the strip contradicting
-    // the very pause it is explaining.
+fn a_retry_is_the_one_thing_that_turns_the_strip_amber() {
+    // Trouble is the *daemon's* word. The retry line carries the detail and the
+    // strip carries the state — and the glyph keeps moving, because a frozen
+    // warning beside a live countdown would contradict the pause it explains.
     let (mut app, mut daemon, (tx, rx)) = (app(), ScriptedDaemon::default(), wire());
     let start = Instant::now();
     press_at(&mut app, &mut daemon, &rx, b"go\r", start);
@@ -629,8 +615,278 @@ fn a_retry_countdown_is_a_bracket_not_a_stall() {
     ))
     .expect("channel open");
     press_at(&mut app, &mut daemon, &rx, b"", start);
-    let glyph = activity_glyph(&app, start + Duration::from_secs(20));
+    // The line the retry commits to scrollback is untouched by any of this.
+    let committed = scrollback(&mut app);
+    assert!(committed.contains("⟳ rate limited · retry 2/8"), "{committed}");
+
+    let (glyph, style) = strip(&app, start + Duration::from_secs(20));
     assert!(spinning(&glyph), "{glyph:?}");
+    assert_eq!(style, Theme::lyra().warning());
+    assert!(live_text(&app).contains("retry 2/8"), "{}", live_text(&app));
+}
+
+#[test]
+fn a_provider_reported_stall_needs_no_new_client_state() {
+    // The daemon's stall watchdog reports itself as an ordinary retry with a
+    // phase-named classification. The strip goes amber for it because it is
+    // trouble the daemon declared, and the line names it in the daemon's own
+    // words rather than in a vocabulary this client would have to keep in step.
+    let (mut app, mut daemon, (tx, rx)) = (app(), ScriptedDaemon::default(), wire());
+    let start = Instant::now();
+    press_at(&mut app, &mut daemon, &rx, b"go\r", start);
+    tx.send(update(
+        r#"{"sessionUpdate":"retry","attempt":1,"maxAttempts":3,
+            "classification":"provider_stalled","providerMessage":"no bytes for 60s",
+            "delayMs":5000,"retryAtMs":0,"resetsPartialOutput":false}"#,
+    ))
+    .expect("channel open");
+    press_at(&mut app, &mut daemon, &rx, b"", start);
+    let committed = scrollback(&mut app);
+    assert!(committed.contains("provider stalled"), "{committed}");
+    let (glyph, style) = strip(&app, start + Duration::from_secs(2));
+    assert!(spinning(&glyph), "{glyph:?}");
+    assert_eq!(style, Theme::lyra().warning());
+}
+
+// ---------------------------------------------------------------------------
+// Thinking traces
+// ---------------------------------------------------------------------------
+
+/// The frames a thinking part is made of, so each test says only what it is
+/// about. `THINK` opens it, `TRACE` streams it, `END` closes it.
+const THINK: &str =
+    r#"{"sessionUpdate":"part_start","messageId":"m-1","partId":"p-think","kind":"thinking"}"#;
+const TRACE: &str = r#"{"sessionUpdate":"delta","messageId":"m-1","partId":"p-think",
+    "field":"thinking","delta":"weighing the retry ladder against the queue"}"#;
+const END: &str =
+    r#"{"sessionUpdate":"part_end","messageId":"m-1","partId":"p-think"}"#;
+
+/// Drive a whole thinking part: opened at `start`, closed `seconds` later.
+fn think_for(
+    app: &mut App,
+    daemon: &mut ScriptedDaemon,
+    tx: &Sender<AcpEvent>,
+    rx: &Receiver<AcpEvent>,
+    start: Instant,
+    seconds: u64,
+) {
+    tx.send(update(THINK)).expect("channel open");
+    tx.send(update(TRACE)).expect("channel open");
+    press_at(app, daemon, rx, b"", start);
+    tx.send(update(END)).expect("channel open");
+    press_at(app, daemon, rx, b"", start + Duration::from_secs(seconds));
+}
+
+#[test]
+fn thinking_streams_dim_into_the_live_region_and_never_into_the_answer() {
+    // The plumbing was always there and the screen dropped it, so a model that
+    // thought for a minute before speaking looked like a client doing nothing.
+    let (mut app, mut daemon, (tx, rx)) = (app(), ScriptedDaemon::default(), wire());
+    let start = Instant::now();
+    press_at(&mut app, &mut daemon, &rx, b"think about it\r", start);
+    // The user band is already in scrollback; what follows is about the thought.
+    let _ = scrollback(&mut app);
+    tx.send(update(THINK)).expect("channel open");
+    tx.send(update(TRACE)).expect("channel open");
+    press_at(&mut app, &mut daemon, &rx, b"", start);
+
+    let live = live_text(&app);
+    assert!(live.contains("∴ thinking"), "{live}");
+    assert!(live.contains("weighing the retry ladder"), "{live}");
+    // Nothing committed: a trace is transient by construction.
+    assert_eq!(scrollback(&mut app), "");
+    // And the strip names the state rather than the mechanism.
+    assert!(live.contains("thinking"), "{live}");
+
+    // Dim, on every row of it: thinking must not read as the answer.
+    let region = app.live(app.desired_region_height(12), start);
+    let trace = region
+        .rows
+        .iter()
+        .find(|row| row.plain_text().contains("weighing"))
+        .expect("the trace is on screen");
+    for span in &trace.spans {
+        assert!(
+            span.style.modifiers.contains(crate::vendor::flywheel::Modifiers::DIM),
+            "{trace:?}"
+        );
+    }
+}
+
+#[test]
+fn a_thinking_delta_never_reaches_the_markdown_stream_or_the_answer_text() {
+    // The routing bug this guards: `Delta` dispatched on the *field*, so a
+    // thinking chunk that fell through to `assistant_delta` would be parsed as
+    // markdown, published at its line boundaries, and committed to scrollback as
+    // the model's reply — with the reasoning inside the answer.
+    let (mut app, mut daemon, (tx, rx)) = (app(), ScriptedDaemon::default(), wire());
+    let start = Instant::now();
+    press_at(&mut app, &mut daemon, &rx, b"think about it\r", start);
+    // The user band is already in scrollback; what follows is about the thought.
+    let _ = scrollback(&mut app);
+    tx.send(update(THINK)).expect("channel open");
+    tx.send(update(
+        r##"{"sessionUpdate":"delta","messageId":"m-1","partId":"p-think","field":"thinking",
+            "delta":"# not a heading\nand not a paragraph\n"}"##,
+    ))
+    .expect("channel open");
+    press_at(&mut app, &mut daemon, &rx, b"", start);
+    assert_eq!(
+        scrollback(&mut app),
+        "",
+        "a thinking delta published nothing, however markdown-shaped it was"
+    );
+
+    // The answer that follows is the answer alone, at every width.
+    tx.send(update(END)).expect("channel open");
+    tx.send(update(
+        r#"{"sessionUpdate":"delta","messageId":"m-1","partId":"p-text","field":"text",
+            "delta":"the answer\n"}"#,
+    ))
+    .expect("channel open");
+    press_at(&mut app, &mut daemon, &rx, b"", start + Duration::from_secs(2));
+    let committed = scrollback(&mut app);
+    assert!(committed.contains("the answer"), "{committed}");
+    assert!(!committed.contains("not a heading"), "{committed}");
+    let replayed: Vec<String> = ReplaySource::replay_rows(&mut app, 40, 2000)
+        .iter()
+        .map(Row::plain_text)
+        .collect();
+    assert!(
+        !replayed.iter().any(|row| row.contains("not a heading")),
+        "the trace stayed out of the transcript's answer entry: {replayed:?}"
+    );
+}
+
+#[test]
+fn a_thinking_part_ending_collapses_to_one_dim_line_with_its_duration() {
+    let (mut app, mut daemon, (tx, rx)) = (app(), ScriptedDaemon::default(), wire());
+    let start = Instant::now();
+    press_at(&mut app, &mut daemon, &rx, b"think about it\r", start);
+    let _ = scrollback(&mut app);
+    think_for(&mut app, &mut daemon, &tx, &rx, start, 23);
+
+    let committed = scrollback(&mut app);
+    assert_eq!(committed, "∴ thought for 23s", "{committed}");
+    assert!(
+        !live_text(&app).contains("weighing"),
+        "the live block is gone once it has been accounted for"
+    );
+}
+
+#[test]
+fn full_mode_commits_the_trace_and_off_mode_renders_none_of_it() {
+    for (mode, wants_trace, wants_line) in [
+        (ThinkingMode::Full, true, true),
+        (ThinkingMode::Off, false, false),
+    ] {
+        let (mut app, mut daemon, (tx, rx)) = (
+            app().with_thinking(mode),
+            ScriptedDaemon::default(),
+            wire(),
+        );
+        let start = Instant::now();
+        press_at(&mut app, &mut daemon, &rx, b"think about it\r", start);
+        tx.send(update(THINK)).expect("channel open");
+        tx.send(update(TRACE)).expect("channel open");
+        press_at(&mut app, &mut daemon, &rx, b"", start);
+        assert_eq!(
+            live_text(&app).contains("weighing the retry ladder"),
+            wants_trace,
+            "{mode:?}: live region"
+        );
+
+        tx.send(update(END)).expect("channel open");
+        press_at(&mut app, &mut daemon, &rx, b"", start + Duration::from_secs(9));
+        let committed = scrollback(&mut app);
+        assert_eq!(committed.contains("∴ thought for 9s"), wants_line, "{mode:?}: {committed}");
+        assert_eq!(
+            committed.contains("weighing the retry ladder"),
+            wants_trace,
+            "{mode:?}: {committed}"
+        );
+    }
+}
+
+#[test]
+fn a_redacted_thinking_part_is_timed_and_never_shows_its_signature() {
+    // Signature-only: provider-opaque bytes with nothing to say to a reader. The
+    // part still happened, and the line it earns says only that.
+    let (mut app, mut daemon, (tx, rx)) = (app(), ScriptedDaemon::default(), wire());
+    let start = Instant::now();
+    press_at(&mut app, &mut daemon, &rx, b"think about it\r", start);
+    // The user band is already in scrollback; what follows is about the thought.
+    let _ = scrollback(&mut app);
+    tx.send(update(THINK)).expect("channel open");
+    tx.send(update(
+        r#"{"sessionUpdate":"delta","messageId":"m-1","partId":"p-think","field":"signature",
+            "delta":"c2lnbmF0dXJlLWJ5dGVz"}"#,
+    ))
+    .expect("channel open");
+    press_at(&mut app, &mut daemon, &rx, b"", start);
+    assert!(!live_text(&app).contains("c2lnbmF0dXJl"), "{}", live_text(&app));
+
+    tx.send(update(END)).expect("channel open");
+    press_at(&mut app, &mut daemon, &rx, b"", start + Duration::from_secs(4));
+    let committed = scrollback(&mut app);
+    assert_eq!(committed, "∴ thought for 4s", "{committed}");
+}
+
+#[test]
+fn a_cancelled_turn_closes_the_thought_it_was_in_the_middle_of() {
+    // No `part_end` ever arrives for a cancelled thought. A live block that
+    // outlived its turn would sit above the next prompt claiming the model was
+    // still thinking.
+    let (mut app, mut daemon, (tx, rx)) = (app(), ScriptedDaemon::default(), wire());
+    let start = Instant::now();
+    press_at(&mut app, &mut daemon, &rx, b"think about it\r", start);
+    // The user band is already in scrollback; what follows is about the thought.
+    let _ = scrollback(&mut app);
+    tx.send(update(THINK)).expect("channel open");
+    tx.send(update(TRACE)).expect("channel open");
+    press_at(&mut app, &mut daemon, &rx, b"", start);
+    tx.send(update(
+        r#"{"sessionUpdate":"turn_end","turnId":"t-1","status":"cancelled","durationMs":5000,
+            "partialRetained":true}"#,
+    ))
+    .expect("channel open");
+    press_at(&mut app, &mut daemon, &rx, b"", start + Duration::from_secs(5));
+
+    let committed = scrollback(&mut app);
+    assert!(committed.contains("∴ thought for 5s"), "{committed}");
+    assert!(!committed.contains("weighing"), "{committed}");
+    assert!(!live_text(&app).contains("∴ thinking"), "{}", live_text(&app));
+}
+
+#[test]
+fn the_strip_says_waiting_before_the_first_token_and_thinking_once_it_arrives() {
+    // Two states the client used to have no word for, both now the daemon's:
+    // `round_start` says a request is out, and the part kind says what is
+    // arriving. The spinner turns throughout — the wait is the workload.
+    let (mut app, mut daemon, (tx, rx)) = (app(), ScriptedDaemon::default(), wire());
+    let start = Instant::now();
+    press_at(&mut app, &mut daemon, &rx, b"think about it\r", start);
+    tx.send(update(r#"{"sessionUpdate":"turn_start","turnId":"t-1","source":"user"}"#))
+        .expect("channel open");
+    tx.send(update(
+        r#"{"sessionUpdate":"round_start","turnId":"t-1","round":1,
+            "startedAtMs":1700000000000}"#,
+    ))
+    .expect("channel open");
+    press_at(&mut app, &mut daemon, &rx, b"", start);
+    assert!(live_text(&app).contains("waiting for the model"), "{}", live_text(&app));
+    assert!(spinning(&activity_glyph(&app, start + Duration::from_secs(90))));
+
+    tx.send(update(
+        r#"{"sessionUpdate":"message_start","turnId":"t-1","messageId":"m-1","role":"assistant"}"#,
+    ))
+    .expect("channel open");
+    tx.send(update(THINK)).expect("channel open");
+    tx.send(update(TRACE)).expect("channel open");
+    press_at(&mut app, &mut daemon, &rx, b"", start + Duration::from_secs(1));
+    let live = live_text(&app);
+    assert!(!live.contains("waiting for the model"), "the round is answered: {live}");
+    assert!(live.contains("thinking"), "{live}");
 }
 
 #[test]
@@ -3051,6 +3307,29 @@ fn loading_a_session_renders_its_history_through_a_snapshot_it_asks_for_itself()
     assert!(!committed.contains("private musing"), "{committed}");
     assert!(!committed.contains("telemetry"), "{committed}");
     assert!(!committed.contains("inputTokens"), "{committed}");
+}
+
+#[test]
+fn a_resumed_session_replays_thinking_under_the_same_rule_the_live_path_used() {
+    // `full` is the mode that asked to see reasoning, and a resumed session that
+    // hid what a live one showed would be the same inconsistency in reverse.
+    let mut verbose = app().with_thinking(ThinkingMode::Full);
+    verbose.adopt_snapshot(&snapshot_of("purple-falcon", history()));
+    let committed = scrollback(&mut verbose);
+    assert!(committed.contains("a private musing"), "{committed}");
+    // In block order, before the prose it preceded.
+    assert!(at(&committed, "a private musing") < at(&committed, "Looking at it now"));
+
+    // `off` is the mode that asked not to, and `collapsed` has nothing to say:
+    // the one-liner's whole content is a duration, and a persisted transcript
+    // carries none.
+    for mode in [ThinkingMode::Off, ThinkingMode::Collapsed] {
+        let mut quiet = app().with_thinking(mode);
+        quiet.adopt_snapshot(&snapshot_of("purple-falcon", history()));
+        let committed = scrollback(&mut quiet);
+        assert!(!committed.contains("a private musing"), "{mode:?}: {committed}");
+        assert!(!committed.contains('∴'), "{mode:?}: {committed}");
+    }
 }
 
 #[test]

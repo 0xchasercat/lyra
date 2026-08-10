@@ -142,6 +142,54 @@ describe("Lyra application composition", () => {
     } finally { await runtime.close(); await rm(root, { recursive: true, force: true }); }
   }, 30_000);
 
+  /**
+   * A turn that ends while a job it started is still running used to end silently: the user
+   * saw a finished turn, and the model's next turn had no idea the build existed. §1 says
+   * make it visible and never gate, so the fact is stated once, to both audiences — the
+   * client sees the line now, and because it is a transcript entry the model reads it at the
+   * top of its next turn.
+   */
+  test("says which jobs a turn left running, to the user now and the model next turn", async () => {
+    const root = await mkdtemp(join(tmpdir(), "lyra-jobs-"));
+    let round = 0;
+    const transport: ProviderTransport = { id: "fixture", apiType: "openai_completions", async *stream() {
+      round += 1;
+      if (round === 1) {
+        yield { type: "tool_call_start", id: "call-1", name: "bash" };
+        yield { type: "tool_call_delta", id: "call-1", argumentsDelta: JSON.stringify({ command: "sleep 30", run_in_background: true }) };
+        yield { type: "tool_call_end", id: "call-1" };
+        yield { type: "complete", stopReason: "tool_use" };
+        return;
+      }
+      yield { type: "text_delta", text: "started it" };
+      yield { type: "complete", stopReason: "end_turn" };
+    } };
+    const environment = { provider: new ReliableProvider(transport), providerName: "fixture", model: "fixture-model", config: { providers: { fixture: { base_url: "http://fixture.invalid/v1", api_type: "openai_completions" as const, auth: { type: "none" as const }, models: ["fixture-model"] } }, roles: { default: "fixture/fixture-model" } } };
+    const reports: string[] = [];
+    const runtime = await LyraRuntime.create({ origin: root, session: "jobs-test", environment, home: join(root, "home"), onReport: (message) => { reports.push(message); } });
+    try {
+      await runtime.prompt("start something long");
+      const note = reports.find((message) => message.includes("still running"));
+      expect(note).toBeDefined();
+      expect(note).toContain("1 job still running");
+      expect(note).toContain("sleep 30");
+      expect(note).toContain("not yet collected");
+      // The same sentence is in the transcript as a user-role `[report]` entry, which is what
+      // carries it into the model's next request — nothing was gated or delayed to do it.
+      const entries = runtime.session.entries().filter((entry) => entry.type === "message");
+      const reported = entries.filter((entry) => JSON.stringify(entry.content).includes("[report]"));
+      expect(reported).toHaveLength(1);
+      expect(reported[0]).toMatchObject({ role: "user" });
+      expect(JSON.stringify(reported[0]?.content)).toContain("still running");
+      // Once collected it is nobody's business again.
+      const job = runtime.app.processes.list()[0]!;
+      await runtime.app.processes.cancel(job.id);
+      await runtime.app.processes.wait(job.id);
+      await runtime.prompt("and now?");
+      expect(reports.filter((message) => message.includes("still running"))).toHaveLength(1);
+    } finally { await runtime.close(); await rm(root, { recursive: true, force: true }); }
+  }, 30_000);
+
   // Opening the workspace manager probes Git. With workspaces disabled nothing needs a
   // clone, so a plain directory has to boot and run; the Git requirement belongs to the
   // operation that actually wants isolation, where the error names something to fix.

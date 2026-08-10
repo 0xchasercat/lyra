@@ -839,13 +839,15 @@ fn run_acp(options: &Options) -> std::io::Result<()> {
     let mut wire = Wire::new(&client);
 
     let (width, height) = session.compositor.size();
-    let keymap = lyra_tui::keybind::Keymap::new(&key_overrides(user_config().as_deref()));
+    let config = user_config();
+    let keymap = lyra_tui::keybind::Keymap::new(&key_overrides(config.as_deref()));
     let mut app = App::new(
         session.theme.clone(),
         keymap,
         lyra_tui::input::Composer::new(prompt_history()),
         width,
-    );
+    )
+    .with_thinking(thinking_mode(config.as_deref()));
     bootstrap(&client, &mut app);
     // The command registry, fetched once the session exists — a list of the
     // commands *this* session routes is worth nothing before there is one.
@@ -914,9 +916,9 @@ fn run_acp(options: &Options) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Repaint interval while something on screen is driven by the clock: the retry
-/// countdown is 1 Hz, the stall colour flips at three seconds, armed gestures
-/// expire. 100 ms is under the resolution of all three.
+/// Repaint interval while something on screen is driven by the clock: the
+/// spinner advances one frame a tick, the retry countdown is 1 Hz, armed
+/// gestures expire. 100 ms is under the resolution of all three.
 const CLOCK_TICK: Duration = Duration::from_millis(100);
 
 /// Park length when nothing is moving. Long, because the `Select` wakes on the
@@ -1150,7 +1152,8 @@ impl app::Daemon for Wire<'_> {
     }
 }
 
-/// `~/.lyra/config.toml`, when there is one. Theme and keybindings are data.
+/// `~/.lyra/config.toml`, when there is one. Theme, keybindings and the
+/// thinking-trace policy are data.
 fn user_config() -> Option<String> {
     let home = std::env::var_os("HOME")?;
     std::fs::read_to_string(std::path::PathBuf::from(home).join(".lyra/config.toml")).ok()
@@ -1177,6 +1180,15 @@ fn resolve_theme(config: Option<&str>, palette: &adaptive::TerminalPalette) -> T
 fn key_overrides(config: Option<&str>) -> lyra_tui::keybind::config::KeyOverrides {
     config.map_or_else(Default::default, |source| {
         lyra_tui::keybind::config::KeyOverrides::from_document(source)
+    })
+}
+
+/// `[tui] thinking`, the reasoning-trace policy. Data, and lenient: an
+/// unreadable value leaves the default (`collapsed`) standing rather than
+/// refusing to start.
+fn thinking_mode(config: Option<&str>) -> lyra_tui::ui::thinking::ThinkingMode {
+    config.map_or_else(Default::default, |source| {
+        lyra_tui::ui::thinking::ThinkingMode::from_document(source)
     })
 }
 

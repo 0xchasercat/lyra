@@ -361,12 +361,197 @@ export function classifyCommand(command: string): ProcessClass {
   return result;
 }
 
+/**
+ * Whether a command ends on its own, and whether the caller should wait for it.
+ *
+ * This is a *different question* from the semaphore class above and is answered by its own
+ * table. `cargo build` is `heavy` — it belongs in the eight-wide disk queue — and it is also
+ * `inline`, because it finishes and its output is the answer the model asked for. Backgrounding
+ * it taught the model to fire a build and then chase a handle for a result it was about to
+ * get. The two axes stay separate:
+ *
+ * | Execution | Meaning | Examples |
+ * |---|---|---|
+ * | `inline` | Terminates, and the caller blocks for it under the inline budget | `npm run build`, `npm test`, `npx tsc`, `cargo build/check/test`, `bun test`, `make`, `pytest`, `go build` |
+ * | `job` | Terminates eventually, but not on a human's timescale — a handle now | `npm install`, `npm ci`, `docker build`, `sleep 3600`, unknown `npm run <name>` |
+ * | `server` | Never exits on its own; a handle now, and said so distinctly | `npm run dev`, `vite`, `next dev`, `python -m http.server`, `tsc --watch`, `npm start` |
+ *
+ * Classification is by command pattern, never by the model's declaration (§11). npm scripts
+ * are opaque — nothing can read a `package.json` that may not exist yet — so `npm run <name>`
+ * is classified by the naming conventions every project shares, and a name that matches
+ * neither keeps the heavy default of a job.
+ */
+export type CommandExecution = "inline" | "job" | "server";
+
+/** Long-lived by nature: none of these returns to a prompt without being killed. */
+const SERVER_EXECUTABLES: Readonly<Record<string, true>> = Object.freeze({
+  serve: true, "http-server": true, "https-server": true, "live-server": true, "lite-server": true,
+  "webpack-dev-server": true, "json-server": true, "browser-sync": true, nodemon: true, watchexec: true,
+  entr: true, nginx: true, caddy: true, httpd: true, uvicorn: true, gunicorn: true, hypercorn: true,
+  daphne: true, puma: true, storybook: true, "start-storybook": true, ngrok: true,
+});
+
+/** Script names that stand up something long-lived, anywhere in a `:`/`-`/`_` separated name. */
+const SERVER_SCRIPT = /(^|[:._-])(dev|serve|server|start|preview|watch|storybook|hmr|tunnel)([:._-]|$)/;
+/** Script-name stems that terminate. Everything else keeps the heavy default. */
+const FINITE_SCRIPT = /^(build|compile|bundle|test|tests|typecheck|types|tsc|check|checks|lint|format|fmt|coverage|cover|e2e|ci|verify|validate|docs|doc|clean|bench|audit)$/;
+
+const WATCH_ARGUMENTS: readonly string[] = ["--watch", "--watchall", "--watch-all", "--serve", "--hot", "--hmr", "--live-reload", "--reload", "--watch-poll"];
+/** Tools whose `-w` means "watch"; `grep -w` and `sort -w` mean something else entirely. */
+const SHORT_WATCH_TOOLS: Readonly<Record<string, true>> = Object.freeze({
+  tsc: true, rollup: true, esbuild: true, webpack: true, swc: true, babel: true, sass: true, tailwindcss: true, parcel: true, jest: true,
+});
+
+function watching(executable: string, args: readonly string[]): boolean {
+  return args.some((argument) => {
+    const value = argument.toLowerCase();
+    if (WATCH_ARGUMENTS.includes(value)) return true;
+    if (value.startsWith("--watch=")) return value !== "--watch=false";
+    return value === "-w" && SHORT_WATCH_TOOLS[executable] === true;
+  });
+}
+
+function words(args: readonly string[]): string[] {
+  return args.filter((argument) => !argument.startsWith("-")).map((argument) => argument.toLowerCase());
+}
+
+function scriptExecution(name: string | undefined): CommandExecution {
+  if (name === undefined || name.length === 0) return "job";
+  const lower = name.toLowerCase();
+  if (SERVER_SCRIPT.test(lower)) return "server";
+  return FINITE_SCRIPT.test(lower.split(":")[0]!) ? "inline" : "job";
+}
+
+/** Dependency work: finite, but on the network's timescale rather than the agent's (§11). */
+const INSTALL_SUBCOMMANDS: ReadonlySet<string> = new Set([
+  "install", "i", "ci", "add", "remove", "rm", "uninstall", "update", "up", "upgrade", "audit", "dedupe",
+  "prune", "rebuild", "link", "unlink", "publish", "pack", "init", "create", "exec", "dlx", "x", "import",
+]);
+
+function packageManagerExecution(manager: string, args: readonly string[]): CommandExecution {
+  const rest = words(args);
+  const first = rest[0];
+  if (first === undefined) return "job";
+  if (first === "run" || first === "run-script" || first === "task") return scriptExecution(rest[1]);
+  if (first === "test" || first === "t") return "inline";
+  if (first === "build" && (manager === "bun" || manager === "deno")) return "inline";
+  if (first === "start") return "server";
+  if (INSTALL_SUBCOMMANDS.has(first)) return "job";
+  if (manager === "deno") {
+    if (first === "serve") return "server";
+    return ["check", "lint", "fmt", "bundle", "compile", "cache", "info", "doc", "bench"].includes(first) ? "inline" : "job";
+  }
+  // yarn and pnpm let a script name stand alone — `yarn build` is `yarn run build`. npm and
+  // bun do not, so an unrecognised word there is something else entirely.
+  return manager === "yarn" || manager === "pnpm" ? scriptExecution(first) : "job";
+}
+
+/** `npx tsc` is `tsc`: the runner is a delivery mechanism, not the command. */
+function stripRunnerFlags(args: readonly string[]): string[] {
+  const rest: string[] = [];
+  for (let index = 0; index < args.length; index += 1) {
+    const argument = args[index]!;
+    if (argument === "-p" || argument === "--package" || argument === "-c" || argument === "--call") { index += 1; continue; }
+    if (argument.startsWith("-")) continue;
+    rest.push(...args.slice(index));
+    break;
+  }
+  return rest;
+}
+
+function subcommandExecution(subcommand: string | undefined, finite: readonly string[], server: readonly string[]): CommandExecution {
+  if (subcommand === undefined) return "job";
+  if (server.includes(subcommand)) return "server";
+  return finite.includes(subcommand) ? "inline" : "job";
+}
+
+function executionOfSegment(segment: string): CommandExecution {
+  const parsed = commandTokens(segment);
+  if (parsed === undefined) return "inline";
+  const { executable, args } = parsed;
+  if (executable === "bash" || executable === "sh" || executable === "zsh") {
+    const inlineIndex = args.findIndex((argument, index) => (argument === "-c" || argument === "-lc" || argument === "-ec") && args[index + 1] !== undefined);
+    if (inlineIndex >= 0) return classifyExecution(args[inlineIndex + 1]!);
+  }
+  if (executable === "npx" || executable === "bunx" || executable === "pnpx" || executable === "yarn-dlx") {
+    const rest = stripRunnerFlags(args);
+    return rest.length === 0 ? "job" : executionOfSegment(rest.join(" "));
+  }
+  if (SERVER_EXECUTABLES[executable] === true) return "server";
+  if (watching(executable, args)) return "server";
+  const rest = words(args);
+  const first = rest[0];
+  switch (executable) {
+    case "npm": case "pnpm": case "yarn": case "bun": case "deno":
+      return packageManagerExecution(executable, args);
+    case "cargo":
+      if (first === "watch") return "server";
+      return subcommandExecution(first, ["build", "b", "check", "c", "test", "t", "clippy", "fmt", "doc", "bench", "tree", "metadata", "fetch", "vendor", "package"], []);
+    case "go":
+      return subcommandExecution(first, ["build", "test", "vet", "fmt", "generate", "mod", "list", "doc", "work"], []);
+    case "tsc": case "esbuild": case "rollup": case "swc": case "babel": case "sass": case "tailwindcss":
+      return "inline";
+    case "vite": case "parcel": case "astro": case "nuxt": case "remix": case "wrangler":
+      // A bare `vite` *is* the dev server; only an explicit build or check terminates.
+      if (first === undefined) return "server";
+      return subcommandExecution(first, ["build", "check", "optimize", "types", "sync", "deploy"], ["dev", "serve", "preview", "start", "watch"]);
+    case "next": case "ng": case "react-scripts": case "vue-cli-service": case "expo": case "gatsby":
+      return subcommandExecution(first, ["build", "lint", "test", "export", "e2e", "info", "telemetry"], ["dev", "serve", "start", "preview", "watch"]);
+    case "webpack":
+      return first === "serve" || first === "watch" ? "server" : "inline";
+    case "vitest":
+      // `vitest` alone is watch mode; only `vitest run` ends.
+      return first === "run" || first === "bench" || first === "related" || first === "typecheck" ? "inline" : "server";
+    case "jest": case "mocha": case "ava": case "pytest": case "phpunit": case "rspec": case "tox": case "nox":
+      return "inline";
+    case "make": case "gmake": case "cmake": case "ninja": case "bazel": case "buck": case "gradle": case "mvn": case "maven":
+      return first !== undefined && SERVER_SCRIPT.test(first) ? "server" : "inline";
+    case "xcodebuild": case "swift": case "dotnet": case "rustc": case "clang": case "gcc": case "g++": case "javac":
+      return executable === "dotnet" || executable === "swift" ? subcommandExecution(first, ["build", "test", "publish", "restore", "pack", "format"], ["run", "watch"]) : "inline";
+    case "python": case "python3": case "python2":
+      // `python -m http.server` is the canonical throwaway web server.
+      if (args.some((argument) => /^http\.server$|^SimpleHTTPServer$/i.test(argument))) return "server";
+      break;
+    case "php":
+      return args.includes("-S") ? "server" : "inline";
+    case "docker": case "podman":
+      // Images and containers are the heavy-but-finite case, exactly like `npm install`:
+      // a handle now, output later. Only `up`/`start` never come back.
+      return first === "up" || first === "start" ? "server" : "job";
+    case "ruby":
+      return args.includes("-run") ? "server" : "inline";
+    default:
+      break;
+  }
+  // Everything the tables do not name keeps today's rule exactly: heavy is a job, and
+  // anything lighter has always blocked.
+  return classifySegment(segment) === "heavy" ? "job" : "inline";
+}
+
+/**
+ * Decide whether a command blocks the caller, hands back a job, or is a server. Composed
+ * across a compound command by severity: one server segment makes the whole line a server,
+ * and one job segment makes it a job.
+ */
+export function classifyExecution(command: string): CommandExecution {
+  if (typeof command !== "string" || command.trim().length === 0) return "inline";
+  let result: CommandExecution = "inline";
+  for (const segment of splitShellCommands(command)) {
+    const execution = executionOfSegment(segment);
+    if (execution === "server") return "server";
+    if (execution === "job") result = "job";
+  }
+  return result;
+}
+
 interface NormalizedRequest {
   command: string;
   cwd: string;
   timeoutMs?: number;
   signal?: AbortSignal;
   background?: boolean;
+  inlineBudgetMs?: number;
+  owner?: string;
 }
 
 function normalizeRequest(request: ProcessRequest): NormalizedRequest {
@@ -392,12 +577,22 @@ function normalizeRequest(request: ProcessRequest): NormalizedRequest {
   if (background !== undefined && typeof background !== "boolean") {
     throw new ProcessRequestError("Process background must be a boolean when provided");
   }
+  const inlineBudget = value.inlineBudgetMs;
+  if (inlineBudget !== undefined && (typeof inlineBudget !== "number" || !Number.isSafeInteger(inlineBudget) || inlineBudget <= 0)) {
+    throw new ProcessRequestError("Process inlineBudgetMs must be a positive safe integer when provided");
+  }
+  const owner = value.owner;
+  if (owner !== undefined && (typeof owner !== "string" || owner.length === 0)) {
+    throw new ProcessRequestError("Process owner must be a non-empty string when provided");
+  }
   return {
     command: value.command,
     cwd: value.cwd,
     ...(timeout === undefined ? {} : { timeoutMs: timeout }),
     ...(signal === undefined ? {} : { signal: signal as AbortSignal }),
     ...(background === undefined ? {} : { background }),
+    ...(inlineBudget === undefined ? {} : { inlineBudgetMs: inlineBudget }),
+    ...(owner === undefined ? {} : { owner }),
   };
 }
 
@@ -415,6 +610,8 @@ interface JobInternal {
   cancelRequested: boolean;
   deadlineRequested: boolean;
   settled: boolean;
+  /** Set once this job's output has actually reached someone. */
+  collected: boolean;
 }
 
 export interface ProcessHostOptions {
@@ -439,6 +636,10 @@ export interface ProcessStatus {
   readonly cwd: string;
   readonly startedAt: number;
   readonly status: JobHandle["status"];
+}
+
+function snapshotHandle(job: JobInternal): JobHandle {
+  return { ...job.handle, ...(job.collected ? { collected: true } : {}) };
 }
 
 function signalNameFromExitCode(exitCode: number | null): string | null {
@@ -523,10 +724,14 @@ export class ProcessHost implements HostProcess {
 
   classify(command: string): ProcessClass { return classifyCommand(command); }
 
+  /** The other axis: whether this command blocks the caller, is a job, or is a server. */
+  execution(command: string): CommandExecution { return classifyExecution(command); }
+
   async run(request: ProcessRequest): Promise<ProcessResult | JobHandle> {
     const normalized = normalizeRequest(request);
     if (this.#closed) throw new ProcessClosedError();
     const processClass = classifyCommand(normalized.command);
+    const execution = classifyExecution(normalized.command);
     const id = `job-${(++this.#sequence).toString(36).padStart(6, "0")}`;
     const handle: JobHandle = {
       id,
@@ -535,6 +740,7 @@ export class ProcessHost implements HostProcess {
       cwd: normalized.cwd,
       startedAt: Date.now(),
       status: "queued",
+      ...(normalized.owner === undefined ? {} : { owner: normalized.owner }),
     };
     let resolveResult!: (result: ProcessResult) => void;
     const resultPromise = new Promise<ProcessResult>((resolve) => { resolveResult = resolve; });
@@ -551,6 +757,7 @@ export class ProcessHost implements HostProcess {
       cancelRequested: false,
       deadlineRequested: false,
       settled: false,
+      collected: false,
     };
     this.#jobs.set(id, job);
 
@@ -563,24 +770,47 @@ export class ProcessHost implements HostProcess {
       if (normalized.signal.aborted) onRequestAbort();
     }
     void this.#execute(job, onRequestAbort);
-    if (processClass === "heavy" || normalized.background === true) return handle;
-    return resultPromise;
+    // The semaphore class decided *where this queues*; the execution class decides *who
+    // waits*. A finite build is heavy and still blocks, because its output is the answer.
+    if (execution !== "inline" || normalized.background === true) return handle;
+    if (normalized.inlineBudgetMs === undefined) { job.collected = true; return resultPromise; }
+    // Past the budget the command is handed back rather than killed: it keeps running under
+    // its own deadline and the caller collects it whenever it likes.
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const budget = new Promise<JobHandle>((resolve) => {
+      timer = setTimeout(() => resolve(handle), Math.min(normalized.inlineBudgetMs!, MAX_TIMER_MS));
+    });
+    try {
+      const settled = await Promise.race([resultPromise, budget]);
+      if (!("id" in settled)) job.collected = true;
+      return settled;
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
+    }
   }
 
+  /**
+   * A job whose result is handed back here is *collected*: someone has the output, so the
+   * turn-end report has nothing to say about it. A wait that times out collects nothing.
+   */
   async wait(id: string, timeoutMs?: number): Promise<ProcessResult | undefined> {
     if (typeof id !== "string" || id.length === 0) return undefined;
     const job = this.#jobs.get(id);
     if (job === undefined) return undefined;
-    if (timeoutMs === undefined) return job.resultPromise;
+    const collect = (result: ProcessResult | undefined): ProcessResult | undefined => {
+      if (result !== undefined) job.collected = true;
+      return result;
+    };
+    if (timeoutMs === undefined) return job.resultPromise.then(collect) as Promise<ProcessResult>;
     if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 0) throw new ProcessRequestError("wait timeoutMs must be a non-negative safe integer");
-    if (timeoutMs === 0) return job.result;
-    if (job.settled) return job.result;
+    if (timeoutMs === 0) return collect(job.result);
+    if (job.settled) return collect(job.result);
     let timer: ReturnType<typeof setTimeout> | undefined;
     const timeout = new Promise<undefined>((resolve) => {
       timer = setTimeout(() => resolve(undefined), Math.min(timeoutMs, MAX_TIMER_MS));
     });
     try {
-      return await Promise.race([job.resultPromise, timeout]);
+      return collect(await Promise.race([job.resultPromise, timeout]));
     } finally {
       if (timer !== undefined) clearTimeout(timer);
     }
@@ -598,14 +828,14 @@ export class ProcessHost implements HostProcess {
 
   /** A stable snapshot ordered by creation sequence, useful for status UIs and tests. */
   listJobs(): readonly JobHandle[] {
-    return [...this.#jobs.values()].map((job) => ({ ...job.handle }));
+    return [...this.#jobs.values()].map((job) => snapshotHandle(job));
   }
 
   list(): readonly JobHandle[] { return this.listJobs(); }
 
   status(id: string): JobHandle | undefined {
     const job = this.#jobs.get(id);
-    return job === undefined ? undefined : { ...job.handle };
+    return job === undefined ? undefined : snapshotHandle(job);
   }
 
   get(id: string): JobHandle | undefined { return this.status(id); }

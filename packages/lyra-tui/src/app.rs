@@ -90,11 +90,12 @@ use crate::input::composer::{ComposerMode, ComposerOutcome, Submission};
 use crate::input::esc::ARM_WINDOW;
 use crate::input::{Composer, EscLadder, EscStep, EscWorld, KeyEvent, QueueEffect, QueueMachine};
 use crate::keybind::{Action, Context, ContextStack, Keymap, Layer};
-use crate::state::SessionStore;
+use crate::state::{PartBody, SessionStore};
 use crate::theme::Theme;
 use crate::ui::footer::{FooterData, RetryStatus};
 use crate::ui::overlay::{Body, Choice, Panel, Ranking, Select};
 use crate::ui::reliability::Activity;
+use crate::ui::thinking::ThinkingMode;
 use crate::ui::tool_row::ToolView;
 use crate::ui::transcript::Transcript;
 use crate::ui::{self, Row, Span};
@@ -698,14 +699,18 @@ pub struct App {
     turn_output: bool,
     /// When this app was constructed; the spinner's phase reference.
     started: Instant,
-    /// When the running turn last proved itself alive — **any** `session/update`,
-    /// not just a text delta. The stall colour keys off this, so it means "the
-    /// wire has said nothing at all", not "the model is between tokens".
-    /// `None` while a prompt is out and nothing has come back yet.
-    last_activity: Option<Instant>,
     /// The tool the activity strip is naming, tracked from the lifecycle
     /// updates so the strip costs nothing to draw.
     running_tool: Option<String>,
+    /// What to do with thinking traces (`[tui] thinking`). Held here as well as
+    /// in the transcript because a `session_changed` builds a fresh transcript
+    /// and the user's preference must survive it.
+    thinking: ThinkingMode,
+    /// When the thinking part in flight opened, so its one-liner can say how
+    /// long it ran. The client's own clock: no wire field carries a
+    /// provider-side duration, and `None` — an attach mid-thought — omits the
+    /// figure rather than inventing one.
+    thinking_since: Option<Instant>,
     /// `Ctrl+C` armed at this instant; a second press within the window exits.
     exit_armed: Option<Instant>,
     /// A transient line above the composer.
@@ -777,8 +782,9 @@ impl App {
             in_flight: None,
             turn_output: false,
             started: Instant::now(),
-            last_activity: None,
             running_tool: None,
+            thinking: ThinkingMode::default(),
+            thinking_since: None,
             exit_armed: None,
             notice: None,
             overlay: None,
@@ -797,6 +803,18 @@ impl App {
             exit: false,
             closed: false,
         }
+    }
+
+    /// Adopt the thinking policy from `[tui] thinking`.
+    ///
+    /// A builder rather than a parameter on [`App::new`]: every existing caller
+    /// wants the default, and a fourth positional argument that four tests would
+    /// pass `Collapsed` to is not a design.
+    #[must_use]
+    pub fn with_thinking(mut self, mode: ThinkingMode) -> Self {
+        self.thinking = mode;
+        self.transcript.set_thinking(mode);
+        self
     }
 
     /// Ask the daemon for the things the interactive surfaces need.
@@ -1840,9 +1858,6 @@ impl App {
         }
         self.in_flight = Some(text.clone());
         self.turn_output = false;
-        // Nothing has come back yet, and a turn cannot be silent since a moment
-        // that never happened: the first update sets the reference point.
-        self.last_activity = None;
         daemon.send(Call::Prompt(text));
     }
 
@@ -2182,12 +2197,6 @@ impl App {
             _ => None,
         };
         self.store.apply(update);
-        // Every frame the daemon sends is proof the turn is moving, whatever it
-        // carries — a thinking delta, a tool-call lifecycle event, a reasoning
-        // item, usage, a retry, a steer ack, or something this build does not
-        // model. Narrowing this to text deltas is what made a working turn look
-        // stalled the moment the model picked up a tool.
-        self.last_activity = Some(now);
         match update {
             Update::TurnStart(_) => {
                 self.queue.turn_started();
@@ -2198,9 +2207,35 @@ impl App {
                 let rows = self.transcript.assistant_delta(&delta.delta);
                 self.commits.extend(rows);
             }
-            // Thinking, signatures and streamed tool arguments are the store's;
-            // they never reach scrollback as prose.
+            // Thinking is the live region's, and only the live region's, until
+            // the part ends. It is routed **by field**, into a buffer the
+            // markdown stream cannot see: a trace that reached
+            // `assistant_delta` would be parsed as the answer, published at its
+            // line boundaries, and committed to scrollback as the model's reply.
+            //
+            // A trace also does not set `turn_output`. Thinking is not output —
+            // a turn that only thought before being cancelled has said nothing,
+            // and is still rewindable (DESIGN.md §0.2).
+            Update::Delta(delta) if delta.field == DeltaField::Thinking => {
+                self.thinking_since.get_or_insert(now);
+                self.transcript.thinking_delta(&delta.delta);
+            }
+            // A signature seals a thinking block and is never rendered (see
+            // `ui::thinking`), but it is proof a redacted part is open, and a
+            // redacted part still earns its one-liner's duration.
+            Update::Delta(delta) if delta.field == DeltaField::Signature => {
+                self.thinking_since.get_or_insert(now);
+            }
+            // Streamed tool arguments are the store's; they never reach
+            // scrollback as prose.
             Update::Delta(_) => {}
+            // The honest start of the clock the one-liner reports, when the
+            // daemon brackets its parts. The delta arms above are the fallback
+            // for one that streams content without opening a part first.
+            Update::PartStart(start) if start.kind == wire::PartKind::Thinking => {
+                self.thinking_since = Some(now);
+            }
+            Update::PartEnd(end) => self.thinking_ended(end, now),
             // Two surfaces, and the split is deliberate. The presence strip
             // (drawn from the store, every frame) is the present tense; only the
             // three transitions that are *history* reach scrollback, collapsed,
@@ -2285,7 +2320,7 @@ impl App {
                 };
                 self.commits.extend(rows);
             }
-            Update::TurnEnd(end) => self.turn_ended(end, daemon),
+            Update::TurnEnd(end) => self.turn_ended(end, daemon, now),
             // The transcript underneath was replaced. The old one cannot be
             // reconciled with the new one, so it is dropped whole — and then
             // the new one is *fetched*, because a client that reset its
@@ -2310,7 +2345,8 @@ impl App {
                 }
                 let name = changed.descriptor.name.clone();
                 let reason = changed.reason.to_string();
-                self.transcript = Transcript::new(self.theme.clone(), self.width);
+                self.transcript =
+                    Transcript::new(self.theme.clone(), self.width).with_thinking(self.thinking);
                 self.store.reset_transcript();
                 self.audit(format!("session {reason} · {name}"));
                 let model = self.store.model().unwrap_or_default().to_owned();
@@ -2323,16 +2359,61 @@ impl App {
                 // still a fact about the session, so it gets an audit row.
                 self.audit(format!("· {} (not modelled by this build)", unknown.tag));
             }
-            Update::TurnResume(_)
+            // The store's, and only the store's: a round going out is the
+            // activity strip's business (it is why the strip can say "waiting
+            // for the model") and never a scrollback row.
+            Update::RoundStart(_)
+            | Update::TurnResume(_)
             | Update::MessageStart(_)
             | Update::PartStart(_)
-            | Update::PartEnd(_)
             | Update::ReasoningItem(_)
             | Update::MessageEnd(_)
             | Update::Context(_)
             | Update::Usage(_)
             | Update::ModelChanged(_) => {}
         }
+    }
+
+    /// Collapse a thinking block the wire never closed.
+    ///
+    /// The text comes from the store's current thinking part when there is one;
+    /// an empty trace still commits its line if a block was on screen, because
+    /// the user watched it happen.
+    fn close_thinking(&mut self, now: Instant) {
+        if !self.transcript.thinking_live() {
+            self.thinking_since = None;
+            return;
+        }
+        let text = self.store.current_part().and_then(thinking_text).unwrap_or_default();
+        self.commit_thinking(&text, now);
+    }
+
+    /// Commit a finished trace, with the duration this client observed.
+    fn commit_thinking(&mut self, text: &str, now: Instant) {
+        let seconds = self
+            .thinking_since
+            .take()
+            .map(|at| now.saturating_duration_since(at).as_secs());
+        let rows = self.transcript.end_thinking(text, seconds);
+        self.commits.extend(rows);
+    }
+
+    /// A part closed: if it was the thinking part, collapse its live block.
+    ///
+    /// The store has already applied the `part_end` — the part is still there,
+    /// still holding its body — so "was it thinking?" is a lookup rather than a
+    /// second piece of bookkeeping this method would have to keep in step. The
+    /// **complete** text comes from the store too, not from the transcript's
+    /// bounded live buffer, so `[tui] thinking = "full"` commits the whole trace
+    /// however long it ran.
+    fn thinking_ended(&mut self, end: &wire::PartEnd, now: Instant) {
+        let text = self
+            .store
+            .message(&end.message_id)
+            .and_then(|message| message.part(&end.part_id))
+            .and_then(thinking_text);
+        let Some(text) = text else { return };
+        self.commit_thinking(&text, now);
     }
 
     // -- children ----------------------------------------------------------
@@ -2422,12 +2503,16 @@ impl App {
             .any(|(_, at)| now.saturating_duration_since(*at) < ui::agent::SETTLED_LINGER)
     }
 
-    fn turn_ended(&mut self, end: &wire::TurnEnd, daemon: &mut dyn Daemon) {
+    fn turn_ended(&mut self, end: &wire::TurnEnd, daemon: &mut dyn Daemon, now: Instant) {
+        // A cancelled turn gets no `part_end` for the thought it was mid-way
+        // through, and a live block that outlived its turn would sit above the
+        // next prompt claiming the model was still thinking. The trace still
+        // earns the line it earned: it happened.
+        self.close_thinking(now);
         let rows = self.transcript.turn_end(end.status.as_str());
         self.commits.extend(rows);
         self.commits.push(Row::blank());
         self.in_flight = None;
-        self.last_activity = None;
         self.running_tool = None;
         // The turn boundary is the only place the presence strip is allowed to
         // shrink (DESIGN.md §3: chrome must not collapse 0↔1 mid-stream).
@@ -2849,12 +2934,18 @@ impl App {
             .min(MAX_REGION_HEIGHT)
     }
 
-    /// The one-line activity strip. The glyph spins while work is live and
-    /// freezes on stall — the one deliberate motion (see `reliability::Activity`).
+    /// The one-line activity strip. The glyph spins for as long as the turn
+    /// runs — the one deliberate motion (see `reliability::Activity`) — and
+    /// turns amber only when the daemon says the turn is in trouble.
+    ///
+    /// There is deliberately no clock in this: the client used to time the wire
+    /// and call three seconds of silence a stall, which made every quiet
+    /// thought look like a hang. Whether a turn is stuck is the daemon's to
+    /// report; whether it is *running* is all this row asks.
     fn activity_row(&self, now: Instant) -> Row {
         let running = self.turn_running();
-        let since = self.last_activity.map(|at| now.duration_since(at));
-        let activity = Activity::of(running, since, self.working_without_wire());
+        let troubled = matches!(self.store.phase(), crate::state::TurnPhase::Retrying(_));
+        let activity = Activity::of(running, troubled);
         let glyph = activity.glyph_at(now.duration_since(self.started));
         Row {
             spans: vec![
@@ -2862,21 +2953,6 @@ impl App {
                 Span::new(self.activity_text(running), self.theme.muted()),
             ],
         }
-    }
-
-    /// Whether work is provably under way without the wire having to say so.
-    ///
-    /// Two cases, and both are things the *client* can see:
-    ///
-    /// - **A tool is running.** Execution is local; a `bash` that takes a minute
-    ///   sends nothing until it finishes, and the turn is no less alive for it.
-    /// - **A retry is counting down.** The footer is showing a live 1 Hz
-    ///   countdown to the next attempt — the pause already has its bracket
-    ///   (`ui::reliability`), and freezing the glyph into the warning state
-    ///   beside it would say "stuck" about the one pause the surface is
-    ///   explaining second by second.
-    fn working_without_wire(&self) -> bool {
-        self.running_tool.is_some() || matches!(self.store.phase(), crate::state::TurnPhase::Retrying(_))
     }
 
     fn activity_text(&self, running: bool) -> String {
@@ -2896,7 +2972,17 @@ impl App {
                 }
             }
             // The spinner already says "tokens are flowing"; a label naming the
-            // mechanism said nothing the motion does not.
+            // mechanism said nothing the motion does not. Thinking is the
+            // exception, and it is a *state* rather than a mechanism: the tokens
+            // arriving are not the ones the user is waiting for, and saying so
+            // is the difference between a quiet turn and a suspicious one.
+            TurnPhase::Streaming if self.store.is_thinking() => "thinking".to_owned(),
+            // A round is out and nothing has come back. The daemon says so
+            // explicitly (`round_start`), which is what lets this row state the
+            // wait instead of the client inferring one from an empty wire.
+            TurnPhase::Streaming if self.store.round_in_flight().is_some() => {
+                "waiting for the model".to_owned()
+            }
             TurnPhase::Streaming => String::new(),
             TurnPhase::Retrying(retry) => format!(
                 "{} · retry {}/{}",
@@ -2987,6 +3073,17 @@ fn epoch_millis() -> i64 {
         .ok()
         .and_then(|elapsed| i64::try_from(elapsed.as_millis()).ok())
         .unwrap_or(0)
+}
+
+/// The reasoning text of a part, when it is a thinking part.
+///
+/// The signature is deliberately not returned: it is opaque provider bytes, it
+/// is not reasoning, and nothing on any surface renders it (`ui::thinking`).
+fn thinking_text(part: &crate::state::Part) -> Option<String> {
+    match &part.body {
+        PartBody::Thinking { text, .. } => Some(text.clone()),
+        _ => None,
+    }
 }
 
 /// `▸ edit src/auth.ts` — the transcript grammar's collapsed form, for the

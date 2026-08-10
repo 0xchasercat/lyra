@@ -54,6 +54,15 @@ export type SessionUpdate =
     hardStopRequested?: boolean;
     error?: WireError;
   }
+  /**
+   * A provider request is in flight and nothing has come back yet.
+   *
+   * `message_start` and `part_start` only fire when content *arrives*, which left the
+   * pre-first-token wait unrepresented on the wire — and that wait is now legitimately long,
+   * because §3.3 arms no stall deadline before the first token. There is no `round_end`: the
+   * next update of the round (`message_start`, `retry`, `turn_end`) closes it.
+   */
+  | { sessionUpdate: "round_start"; turnId: string; round: number; startedAtMs: number }
   | { sessionUpdate: "message_start"; turnId: string; messageId: string; role: "assistant" }
   | { sessionUpdate: "part_start"; messageId: string; partId: string; kind: PartKind; toolCallId?: string }
   | { sessionUpdate: "delta"; messageId: string; partId: string; field: DeltaField; delta: string }
@@ -494,6 +503,17 @@ export class SessionUpdateEncoder {
             ...(repair.tokenEstimate === undefined ? {} : { tokenEstimate: repair.tokenEstimate }),
           })),
         }];
+      case "provider_round_start": {
+        // Before any turn has been opened there is nothing to attach the wait to, and a
+        // client keys the marker off the turn — so an orphan is dropped rather than invented.
+        if (this.#turnId === undefined) return [];
+        return [{
+          sessionUpdate: "round_start",
+          turnId: this.#turnId,
+          round: event.round,
+          startedAtMs: this.#now(),
+        }];
+      }
       case "context_measured": {
         const contextWindow = this.#usage().contextWindow;
         return [{
@@ -652,7 +672,14 @@ export function summarizeResult(result: ToolExecutionResult): string | undefined
       .flatMap((block) => (block.type === "text" ? [block.text] : []))
       .join("\n");
   const first = text.split("\n").find((line) => line.trim().length > 0);
-  return first === undefined ? undefined : truncate(first.trim());
+  if (first !== undefined) return truncate(first.trim());
+  // An image-only result has no prose at all, and a blank row reads as "the tool did
+  // nothing" for the one call that returned a picture. Say what arrived instead.
+  if (typeof result.content !== "string") {
+    const images = result.content.filter((block) => block.type === "image");
+    if (images.length > 0) return truncate(images.length === 1 ? `image (${images[0]!.mediaType})` : `${images.length} images`);
+  }
+  return undefined;
 }
 
 function truncate(value: string, limit = 200): string {

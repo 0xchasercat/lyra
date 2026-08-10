@@ -1898,6 +1898,34 @@
           }
         },
         {
+          "title": "round_start",
+          "type": "object",
+          "description": "A request is in flight to the provider and nothing has come back yet. `message_start` and `part_start` only fire once content *arrives*, so without this a client cannot tell 'waiting on the model' from 'idle'. That wait is now legitimately long: §3.3 arms no stall deadline before the first token, because a reasoning model thinking for minutes is the workload rather than a fault. Closed implicitly by the next update of the round — `message_start`, `retry`, `turn_end` — so there is no `round_end`: each of those already says the wait is over.",
+          "required": [
+            "sessionUpdate",
+            "turnId",
+            "round",
+            "startedAtMs"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "sessionUpdate": {
+              "const": "round_start"
+            },
+            "turnId": {
+              "$ref": "#/$defs/turnId"
+            },
+            "round": {
+              "type": "integer",
+              "minimum": 1,
+              "description": "Which provider call of this turn is in flight, counted from 1. A turn runs one round per assistant reply: the first, then one more after each batch of tool results. Retries within a round are reported by `retry` and do not advance it."
+            },
+            "startedAtMs": {
+              "$ref": "#/$defs/timestampMs"
+            }
+          }
+        },
+        {
           "title": "message_start",
           "type": "object",
           "required": [

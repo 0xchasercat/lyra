@@ -134,6 +134,8 @@ export class AgentLoop {
     // token, which is the one place in a turn where latency is felt.
     void this.checkpoint("turn_start", prompt.id);
     const steering = options.steering;
+    /** Provider calls made by this turn: one per assistant reply, retries excluded. */
+    let round = 0;
     /**
      * Drains steering into standalone user messages. Returning the events rather than
      * yielding them keeps this a plain function the generator can splice in at each of the
@@ -258,6 +260,10 @@ export class AgentLoop {
 
         const assembly = new AttemptAssembly();
         let completedRound = false;
+        round += 1;
+        // Announced before the request goes out, so a client can say "waiting on the model"
+        // for the whole pre-first-token wait instead of showing nothing until content lands.
+        yield { type: "provider_round_start", round };
         try {
           for await (const event of this.provider.stream(derived.request, controller.signal)) {
             if (event.type === "retry" && event.resetsPartialOutput) assembly.reset();

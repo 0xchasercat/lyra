@@ -92,6 +92,16 @@ export type AgentEvent =
     firstKeptEntry: EntryId | null;
   }
   | { type: "context_measured"; tokenEstimate: number; sourceEntryCount: number }
+  /**
+   * A provider request has just been sent and nothing has come back yet.
+   *
+   * The stream events all report content *arriving*; none of them marks the wait before it.
+   * That wait is the part of a turn a user is most likely to mistake for a hang, and §3.3
+   * deliberately no longer bounds it at the inter-token deadline — a reasoning model may
+   * think for minutes before its first token. `round` counts provider calls within the turn
+   * (one per assistant reply); a retry inside a round is reported by the retry event.
+   */
+  | { type: "provider_round_start"; round: number }
   | {
     type: "steered";
     entryId: EntryId;

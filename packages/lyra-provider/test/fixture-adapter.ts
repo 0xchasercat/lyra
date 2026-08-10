@@ -16,6 +16,11 @@ export type FixtureTermination =
 export interface FixtureAttempt {
   readonly events?: readonly FixtureTransportEvent[];
   readonly termination?: FixtureTermination;
+  /**
+   * How long the transport accepts the request and says nothing before its first event —
+   * a reasoning model thinking. Not a stall: §3.3 arms no deadline before the first token.
+   */
+  readonly openingDelayMs?: number;
 }
 
 export interface FixtureScenario {
@@ -57,6 +62,8 @@ export class CanonicalFixtureAdapter implements ProviderFixtureAdapter {
         if (attempt === undefined) {
           throw new Error(`Fixture ${scenario.id} has no invocation ${index + 1}`);
         }
+
+        if (attempt.openingDelayMs !== undefined) await Bun.sleep(attempt.openingDelayMs);
 
         for (const event of attempt.events ?? []) {
           if (context.signal.aborted) throw context.signal.reason;

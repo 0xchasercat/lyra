@@ -44,10 +44,6 @@ pub const ESCALATE_AT: u32 = 4;
 /// The boundary rule character.
 const RULE: char = '─';
 
-/// How long a turn may go quiet — with nothing arriving on the wire *and*
-/// nothing provably running locally — before the activity glyph changes colour.
-pub const STALL_AFTER: Duration = Duration::from_secs(3);
-
 /// The working spinner's frames. Pure Unicode braille — no Nerd Font, and the
 /// cell width never changes between frames.
 pub const SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -55,62 +51,59 @@ pub const SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴"
 /// spinner advances exactly once per repaint while a turn is live.
 pub const SPINNER_FRAME_MS: u64 = 100;
 
-/// Whether a stream is producing, quiet, or stalled.
+/// Whether a turn is running, and whether the daemon has reported trouble with
+/// it.
 ///
 /// The working indicator is the one deliberate exception to DESIGN.md §3's
 /// zero-motion rule (owner decision, 2026-08-10): while a turn is running the
-/// glyph spins, because "work is happening" is state the motion itself
-/// carries. The exception stays honest by *stopping*: a stall freezes the
-/// spinner and shifts its colour — an animation that kept running would give
-/// exactly the reassurance a stalled harness must not give.
+/// glyph spins, because "work is happening" is state the motion itself carries.
+/// The motion is **continuous for as long as the turn runs** — it carries one
+/// bit, "this turn is still ours", and nothing finer.
+///
+/// # Why the client no longer infers a stall (superseded rationale)
+///
+/// This type used to say the exception "stays honest by *stopping*": three
+/// seconds in which nothing arrived froze the spinner and painted it amber. The
+/// reasoning was sound and the premise was not. A model thinking silently for
+/// forty seconds is an ordinary turn, not a hang, and this client cannot tell
+/// the two apart — it holds no provider connection, no request deadline, and no
+/// idea what the far end promised. Guessing after three seconds front-ran the
+/// only party that *can* know, and the guess was wrong far more often than it
+/// was right; a warning that cries wolf on healthy turns teaches exactly the
+/// distrust it was built to prevent.
+///
+/// So the division is now clean: **the daemon owns stall truth, the client
+/// renders it.** Motion means the turn is running. Colour means the daemon has
+/// said something is wrong with it — today a retry ([`Retry`]), tomorrow a
+/// provider-reported stall, which arrives as an ordinary retry update with a
+/// phase-named classification and therefore needs no new state here.
 ///
 /// The activity strip and footer belong to the input layer; this is the shared
-/// vocabulary, so the two surfaces cannot disagree about when a turn is stuck.
-///
-/// # What counts as life
-///
-/// Liveness is **any** proof the turn is still moving, not "text is arriving".
-/// Keying the stall off text deltas alone made every honest pause look like a
-/// hang: a tool running for four seconds, a provider thinking, a subagent
-/// working, a retry counting down — all froze the glyph and painted it amber
-/// while the harness was doing exactly what it was asked to. The signal is only
-/// worth having if it is rare, so it now means what it says: nothing has
-/// happened, anywhere, for [`STALL_AFTER`].
+/// vocabulary, so the two surfaces cannot disagree about what a turn is doing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Activity {
     /// Nothing is running.
     Idle,
-    /// The turn is provably alive.
+    /// A turn is running.
     Streaming,
-    /// Nothing has arrived, and nothing is running locally, for [`STALL_AFTER`].
-    Stalled,
+    /// A turn is running and the daemon has reported trouble with it.
+    Troubled,
 }
 
 impl Activity {
-    /// Classify from the time since the turn last proved itself alive.
+    /// Classify a turn.
     ///
-    /// `since_last_activity` is the age of the most recent update of *any*
-    /// kind — a delta of any field, a tool-call lifecycle event, a reasoning
-    /// item, a retry, usage, a steer ack. `None` means the turn has been sent
-    /// and the wire has not spoken yet, which is not a stall: there has been
-    /// nothing to be silent *since*.
-    ///
-    /// `working` is the client's own proof, independent of the wire: a local
-    /// tool is running, or a retry countdown is on screen. Either way work is
-    /// demonstrably in progress and silence is expected, so the spinner keeps
-    /// turning — a frozen warning glyph beside a ticking retry countdown would
-    /// be the surface contradicting itself.
+    /// `streaming` is the only thing the spinner keys off: if a turn is running
+    /// the glyph moves, full stop. `troubled` is the daemon's word rather than
+    /// the client's guess — a retry in flight today. Nothing here consults a
+    /// clock, which is the point: there is no elapsed time at which this client
+    /// starts calling a running turn stuck.
     #[must_use]
-    pub fn of(streaming: bool, since_last_activity: Option<Duration>, working: bool) -> Self {
-        if !streaming {
-            return Self::Idle;
-        }
-        if working {
-            return Self::Streaming;
-        }
-        match since_last_activity {
-            Some(elapsed) if elapsed >= STALL_AFTER => Self::Stalled,
-            _ => Self::Streaming,
+    pub const fn of(streaming: bool, troubled: bool) -> Self {
+        match (streaming, troubled) {
+            (false, _) => Self::Idle,
+            (true, false) => Self::Streaming,
+            (true, true) => Self::Troubled,
         }
     }
 
@@ -119,33 +112,45 @@ impl Activity {
     pub const fn glyph(self) -> &'static str {
         match self {
             Self::Idle => "◆",
-            Self::Streaming | Self::Stalled => "●",
+            Self::Streaming | Self::Troubled => "●",
         }
     }
 
-    /// The state glyph at a moment in time: the spinner while work is live,
-    /// the frozen [`Self::glyph`] otherwise. `since_start` is any monotonic
+    /// The state glyph at a moment in time: the spinner while a turn runs,
+    /// the frozen [`Self::glyph`] when none does. `since_start` is any monotonic
     /// duration (the app's uptime); only its progression matters.
+    ///
+    /// A troubled turn spins too. A retry *is* the turn still running, and the
+    /// countdown beside it is ticking; freezing the glyph next to a live
+    /// countdown would have the surface contradicting the very pause it is
+    /// explaining second by second.
     #[must_use]
     pub fn glyph_at(self, since_start: Duration) -> &'static str {
         match self {
-            Self::Streaming => {
+            Self::Streaming | Self::Troubled => {
                 let frame = (since_start.as_millis() / u128::from(SPINNER_FRAME_MS))
                     % SPINNER_FRAMES.len() as u128;
                 SPINNER_FRAMES[frame as usize]
             }
-            Self::Idle | Self::Stalled => self.glyph(),
+            Self::Idle => self.glyph(),
         }
     }
 
     /// The style for that glyph.
+    ///
+    /// Colour is where trouble shows, and it is the one thing this state adds
+    /// that the retry line does not: the line carries the detail (cause,
+    /// attempt, countdown) and the strip carries the ambient state, at a cost of
+    /// zero rows. Someone glancing at the composer learns "running, but not
+    /// well" without reading anything.
     #[must_use]
     pub fn style(self, theme: &Theme) -> crate::ui::Style {
         match self {
             Self::Idle => theme.faint(),
             Self::Streaming => theme.accent(),
-            // Towards error, not *at* it: the turn has not failed, it is slow.
-            Self::Stalled => theme.warning(),
+            // Towards error, not *at* it: the turn has not failed, it is in
+            // trouble the daemon expects to come back from.
+            Self::Troubled => theme.warning(),
         }
     }
 }
@@ -549,89 +554,66 @@ mod tests {
     }
 
     #[test]
-    fn a_stall_means_nothing_happened_anywhere_not_merely_that_text_stopped() {
-        // Wire silence with no local work is the only thing that stalls.
-        assert_eq!(
-            Activity::of(true, Some(Duration::from_secs(3)), false),
-            Activity::Stalled,
-            "the threshold is inclusive at three seconds"
-        );
-        // The same silence while a tool runs is not a stall: the client can see
-        // the work happening even though the wire has nothing to say about it.
-        assert_eq!(
-            Activity::of(true, Some(Duration::from_secs(30)), true),
-            Activity::Streaming
-        );
-        // And a turn that has only just gone out has been silent since nothing.
-        assert_eq!(Activity::of(true, None, false), Activity::Streaming);
-        assert_eq!(
-            Activity::of(true, Some(Duration::from_millis(2_999)), false),
-            Activity::Streaming
-        );
-        // Nothing running is idle whatever the wire or the tools are doing.
-        for working in [false, true] {
-            assert_eq!(Activity::of(false, None, working), Activity::Idle);
-            assert_eq!(
-                Activity::of(false, Some(Duration::from_secs(30)), working),
-                Activity::Idle
-            );
+    fn only_the_daemon_can_say_a_running_turn_is_in_trouble() {
+        // The classification takes no clock and no local heuristic: a turn is
+        // running or it is not, and it is troubled only because the daemon said
+        // so. This is the whole superseded stall inference, stated as a test.
+        assert_eq!(Activity::of(true, false), Activity::Streaming);
+        assert_eq!(Activity::of(true, true), Activity::Troubled);
+        for troubled in [false, true] {
+            assert_eq!(Activity::of(false, troubled), Activity::Idle);
         }
     }
 
     #[test]
-    fn activity_is_a_colour_state_and_never_an_animation() {
+    fn trouble_is_a_colour_and_never_a_different_glyph() {
         let theme = theme();
-        assert_eq!(Activity::of(false, None, false), Activity::Idle);
-        assert_eq!(
-            Activity::of(true, Some(Duration::from_millis(500)), false),
-            Activity::Streaming
-        );
-        assert_eq!(
-            Activity::of(true, Some(Duration::from_secs(3)), false),
-            Activity::Stalled,
-            "the threshold is inclusive at three seconds"
-        );
-        assert_eq!(Activity::of(true, None, false), Activity::Streaming);
-
-        // The glyph does not change when the state does; only the colour does,
-        // so nothing on screen moves.
-        assert_eq!(Activity::Streaming.glyph(), Activity::Stalled.glyph());
+        // The glyph does not change when the state does; only the colour does.
+        assert_eq!(Activity::Streaming.glyph(), Activity::Troubled.glyph());
         assert_ne!(
             Activity::Streaming.style(&theme),
-            Activity::Stalled.style(&theme)
+            Activity::Troubled.style(&theme)
         );
         assert_ne!(
-            Activity::Stalled.style(&theme),
+            Activity::Troubled.style(&theme),
             theme.error(),
-            "a stall is slow, not failed"
+            "a retry is trouble, not failure"
         );
     }
 
     #[test]
-    fn the_spinner_runs_only_while_the_turn_is_alive_and_freezes_on_stall() {
-        // Motion carries exactly one bit — "work is live" — so it must advance
-        // with time while streaming and be a frozen glyph everywhere else.
-        let early = Activity::Streaming.glyph_at(Duration::from_millis(0));
-        let later = Activity::Streaming.glyph_at(Duration::from_millis(SPINNER_FRAME_MS));
-        assert_ne!(early, later, "consecutive ticks are distinct frames");
-        assert!(SPINNER_FRAMES.contains(&early) && SPINNER_FRAMES.contains(&later));
-        // A full cycle returns to the first frame: the animation is periodic,
-        // not a random flicker.
-        let wrapped = Activity::Streaming
-            .glyph_at(Duration::from_millis(SPINNER_FRAME_MS * SPINNER_FRAMES.len() as u64));
-        assert_eq!(early, wrapped);
+    fn the_spinner_runs_continuously_for_as_long_as_the_turn_does() {
+        // Motion carries exactly one bit — "a turn is running" — so it advances
+        // with time in *both* running states and is frozen only when idle.
+        for state in [Activity::Streaming, Activity::Troubled] {
+            let early = state.glyph_at(Duration::from_millis(0));
+            let later = state.glyph_at(Duration::from_millis(SPINNER_FRAME_MS));
+            assert_ne!(early, later, "{state:?}: consecutive ticks are distinct frames");
+            assert!(SPINNER_FRAMES.contains(&early) && SPINNER_FRAMES.contains(&later));
+            // A full cycle returns to the first frame: the animation is
+            // periodic, not a random flicker.
+            let wrapped =
+                state.glyph_at(Duration::from_millis(SPINNER_FRAME_MS * SPINNER_FRAMES.len() as u64));
+            assert_eq!(early, wrapped, "{state:?}");
+            // And it never stops on its own, however long the turn has run.
+            for after in [Duration::from_secs(3), Duration::from_secs(600)] {
+                assert!(
+                    SPINNER_FRAMES.contains(&state.glyph_at(after)),
+                    "{state:?} froze after {after:?}"
+                );
+            }
+        }
 
-        // Stall and idle do not move, no matter how much time passes.
+        // Idle does not move, no matter how much time passes.
         for at in [0u64, 250, 999_999] {
             let at = Duration::from_millis(at);
-            assert_eq!(Activity::Stalled.glyph_at(at), Activity::Stalled.glyph());
             assert_eq!(Activity::Idle.glyph_at(at), Activity::Idle.glyph());
         }
     }
 
     #[test]
     fn every_activity_glyph_is_plain_unicode() {
-        for state in [Activity::Idle, Activity::Streaming, Activity::Stalled] {
+        for state in [Activity::Idle, Activity::Streaming, Activity::Troubled] {
             for ch in state.glyph().chars() {
                 assert!(
                     !('\u{E000}'..='\u{F8FF}').contains(&ch),

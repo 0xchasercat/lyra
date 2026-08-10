@@ -12,10 +12,23 @@ export interface FilesystemToolOptions {
   readonly engine?: EditEngine;
   /** Base directory used by direct calls without a runtime context. */
   readonly root?: string;
+  /** The §3.6 ceiling on one image block, in decoded bytes. */
+  readonly imageByteLimit?: number;
 }
 
 const DEFAULT_DISPLAY_BUDGET = 32 * 1024;
 export const DEFAULT_TOOL_DISPLAY_BUDGET = DEFAULT_DISPLAY_BUDGET;
+/**
+ * What one image may weigh, matching the context layer's own §3.6 limit.
+ *
+ * Kept apart from the text display budget on purpose. The display budget exists to stop a
+ * 4 MB log from eating the window as *prose*; measuring a screenshot against it refused
+ * every real one, because 32 KiB is smaller than any PNG a browser produces — and the
+ * refusal pointed at an artifact whose own read produced the same refusal. An image costs
+ * roughly a fixed number of tokens whatever its byte size, so the honest ceiling is the
+ * provider's, not the transcript's.
+ */
+export const DEFAULT_IMAGE_BYTE_LIMIT = 5 * 1024 * 1024;
 /** New files are created private; existing files keep whatever mode they already carry. */
 const DEFAULT_FILE_MODE = 0o600;
 
@@ -101,19 +114,21 @@ export async function boundText(value: string, store: ArtifactStore, options: { 
   return `${served}[truncated: ${servedBytes} of ${bytes.byteLength} bytes — ${id} for full]`;
 }
 
-async function boundImage(bytes: Uint8Array, mimeType: string, name: string | undefined, store: ArtifactStore, budget: number): Promise<string | ContentBlock[]> {
-  // Image data is sent as a provider image block only when it fits the budget;
-  // otherwise the marker points to the exact original bytes.
-  if (bytes.byteLength > budget) {
+/**
+ * An image reaches the model as an image, or it does not reach it at all.
+ *
+ * There is no third option here: Lyra bundles no image processing, so it cannot downscale an
+ * oversized one, and inventing a "preview" out of the first N bytes of a PNG would be a
+ * corrupt file dressed as data. Over the limit, the refusal says what the picture is, where
+ * its exact bytes are, and what would make it readable — everything the model needs to act,
+ * which is what separates a marker from a dead end (§3.7.1).
+ */
+async function boundImage(bytes: Uint8Array, mimeType: string, name: string | undefined, store: ArtifactStore, imageByteLimit: number): Promise<string | ContentBlock[]> {
+  if (bytes.byteLength > imageByteLimit) {
     const id = name === undefined ? await store.put(bytes, { mimeType }) : await store.put(bytes, { mimeType, name });
-    return `[truncated: 0 of ${bytes.byteLength} bytes — ${id} for full]`;
+    return `[image not sent: ${name ?? id} is ${bytes.byteLength} bytes of ${mimeType}, above the ${imageByteLimit}-byte limit one image may occupy. Its exact bytes are preserved at ${id}. Lyra carries no image library and will not send a truncated one, so resize or crop it with a shell command and read the smaller file.]`;
   }
-  const data = Buffer.from(bytes).toString("base64");
-  if (data.length > budget) {
-    const id = name === undefined ? await store.put(bytes, { mimeType }) : await store.put(bytes, { mimeType, name });
-    return `[truncated: 0 of ${bytes.byteLength} bytes — ${id} for full]`;
-  }
-  return [{ type: "image", mediaType: mimeType, data }];
+  return [{ type: "image", mediaType: mimeType, data: Buffer.from(bytes).toString("base64") }];
 }
 
 function ok(content: string | ContentBlock[], progress?: ToolExecutionResult["progress"]): ToolExecutionResult {
@@ -176,17 +191,35 @@ function directoryListing(pathValue: string, entries: readonly string[], ranged:
   return entries.length === 0 ? `${header}${note}` : `${header}\n${entries.map((entry) => `- ${entry}`).join("\n")}${note}`;
 }
 
+type RangeSlice = { ok: true; text: string } | { ok: false; message: string };
+
 /**
  * Ranges used to be accepted and ignored for URL and artifact reads, which §3.7.5 forbids.
  * The range is applied to the decoded text and the slice says what it is.
+ *
+ * An `endLine` past the last line is clamped rather than refused, exactly as it is for a
+ * file (§15): nobody can know a document's length before reading it, so `1-100` against 18
+ * lines is a request for all 18. The header then carries what was asked for beside what was
+ * returned, so the model can tell "that is the whole thing" from "there is more". Only a
+ * range with nothing in it stays an error.
  */
-function sliceRange(text: string, startLine: unknown, endLine: unknown): string {
-  if (startLine === undefined && endLine === undefined) return text;
+function sliceRange(text: string, startLine: unknown, endLine: unknown, label: string): RangeSlice {
+  if (startLine === undefined && endLine === undefined) return { ok: true, text };
   const lines = text.split("\n");
+  const total = lines.length;
   const start = typeof startLine === "number" ? Math.max(1, startLine) : 1;
-  const end = typeof endLine === "number" ? Math.min(lines.length, endLine) : lines.length;
-  if (start > lines.length || end < start) return `[lines ${start}-${typeof endLine === "number" ? endLine : lines.length} are outside this ${lines.length}-line document]\n${text}`;
-  return `[lines ${start}-${end} of ${lines.length}]\n${lines.slice(start - 1, end).join("\n")}`;
+  const requestedEnd = typeof endLine === "number" ? endLine : total;
+  const end = Math.min(requestedEnd, total);
+  if (start > total) {
+    return { ok: false, message: `startLine ${start} is past the end of ${label}, which has ${total} ${total === 1 ? "line" : "lines"}; there is nothing to return. Read from line ${total} or earlier.` };
+  }
+  if (requestedEnd < start) {
+    return { ok: false, message: `Line range ${start}-${requestedEnd} is empty in ${label} (1-${total}); endLine must be at least startLine.` };
+  }
+  const header = requestedEnd > total
+    ? `[lines ${start}-${end} of ${total} — requested ${start}-${requestedEnd}, clamped]`
+    : `[lines ${start}-${end} of ${total}]`;
+  return { ok: true, text: `${header}\n${lines.slice(start - 1, end).join("\n")}` };
 }
 
 /**
@@ -391,8 +424,12 @@ abstract class FileToolBase implements LyraTool {
     this.options = options;
     this.engine = options.engine ?? sharedEditEngine;
   }
-  protected runtime(context: ToolRuntimeContext | undefined): { store: ArtifactStore; budget: number } {
-    return { store: storeFor(context, this.options.artifactStore, this.options.root), budget: budgetFor(this.options) };
+  protected runtime(context: ToolRuntimeContext | undefined): { store: ArtifactStore; budget: number; imageLimit: number } {
+    return {
+      store: storeFor(context, this.options.artifactStore, this.options.root),
+      budget: budgetFor(this.options),
+      imageLimit: Number.isInteger(this.options.imageByteLimit) && this.options.imageByteLimit! > 0 ? this.options.imageByteLimit! : DEFAULT_IMAGE_BYTE_LIMIT,
+    };
   }
   abstract execute(args: unknown, context: ToolRuntimeContext): Promise<ToolExecutionResult>;
 }
@@ -408,28 +445,32 @@ export class ReadTool extends FileToolBase {
       if (!validObject(args)) return fail("read requires an object with a non-empty path.");
       const pathValue = argString(args, "path");
       if (!pathValue) return fail("read requires path as a non-empty string: the file, directory, http(s) URL, or artifact URI to read.");
-      const { store, budget } = this.runtime(context);
+      const { store, budget, imageLimit } = this.runtime(context);
       if (isArtifactUri(pathValue)) {
         const bytes = await store.read(pathValue);
         const metadata = await store.metadata?.(pathValue);
         const mime = metadata?.mimeType ?? "application/octet-stream";
-        if (mime.startsWith("image/")) return ok(await boundImage(bytes, mime, metadata?.name ?? pathValue, store, budget));
+        if (mime.startsWith("image/")) return ok(await boundImage(bytes, mime, metadata?.name ?? pathValue, store, imageLimit));
         let text: string;
         try { text = new TextDecoder("utf-8", { fatal: true }).decode(bytes); }
         catch { return fail(`Artifact ${pathValue} is binary ${mime} data; use the artifact URI to retrieve its complete ${bytes.byteLength} bytes.`); }
         if (bytes.includes(0)) return fail(`Artifact ${pathValue} is binary ${mime} data; use the artifact URI to retrieve its complete ${bytes.byteLength} bytes.`);
-        return ok(await boundText(sliceRange(text, args.startLine, args.endLine), store, { budget, mimeType: mime, name: metadata?.name ?? pathValue }));
+        const sliced = sliceRange(text, args.startLine, args.endLine, `artifact ${pathValue}`);
+        if (!sliced.ok) return fail(sliced.message);
+        return ok(await boundText(sliced.text, store, { budget, mimeType: mime, name: metadata?.name ?? pathValue }));
       }
       if (/^https?:\/\//i.test(pathValue)) {
         const response = await fetch(pathValue, { signal: context?.signal });
         if (!response.ok) return fail(`Unable to read URL ${pathValue}: HTTP ${response.status}. Check the URL and retry.`);
         const bytes = new Uint8Array(await response.arrayBuffer());
         const mime = response.headers.get("content-type")?.split(";", 1)[0]?.trim() || "text/plain";
-        if (mime.startsWith("image/")) return ok(await boundImage(bytes, mime, pathValue, store, budget));
+        if (mime.startsWith("image/")) return ok(await boundImage(bytes, mime, pathValue, store, imageLimit));
         let text: string;
         try { text = new TextDecoder("utf-8", { fatal: true }).decode(bytes); }
         catch { const id = await store.put(bytes, { mimeType: mime, name: pathValue }); return fail(`URL ${pathValue} is binary data; full content is preserved at ${id}.`); }
-        return ok(await boundText(sliceRange(text, args.startLine, args.endLine), store, { budget, mimeType: mime, name: pathValue }));
+        const sliced = sliceRange(text, args.startLine, args.endLine, `URL ${pathValue}`);
+        if (!sliced.ok) return fail(sliced.message);
+        return ok(await boundText(sliced.text, store, { budget, mimeType: mime, name: pathValue }));
       }
       const path = await resolveToolPath(pathValue, context, this.options.root);
       let info: Awaited<ReturnType<typeof stat>>;
@@ -446,7 +487,7 @@ export class ReadTool extends FileToolBase {
       }
       const bytes = new Uint8Array(await readFile(path));
       const mime = MIME_TYPES[Object.keys(MIME_TYPES).find((extension) => path.toLowerCase().endsWith(extension)) ?? ""] ?? "application/octet-stream";
-      if (mime.startsWith("image/")) return ok(await boundImage(bytes, mime, pathValue, store, budget), { filesRead: [path] });
+      if (mime.startsWith("image/")) return ok(await boundImage(bytes, mime, pathValue, store, imageLimit), { filesRead: [path] });
       let raw: string;
       try { raw = new TextDecoder("utf-8", { fatal: true }).decode(bytes); }
       catch { const id = await store.put(bytes, { mimeType: mime, name: pathValue }); return fail(`File ${pathValue} is binary data; full content is preserved at ${id}.`); }
@@ -457,7 +498,12 @@ export class ReadTool extends FileToolBase {
       if (endLine !== undefined && (!Number.isInteger(endLine) || (endLine as number) < 1)) return fail("endLine must be a positive integer.");
       const result = await this.engine.read({ path, ...(startLine !== undefined ? { startLine: startLine as number } : {}), ...(endLine !== undefined ? { endLine: endLine as number } : {}) });
       if (!result.ok) return fail(result.message);
-      const output = `[${pathValue}${result.tag}]\n${result.numbered}`;
+      // The clamp note is in band and only appears when it happened, so an ordinary ranged
+      // read is unchanged and an overshooting one says exactly how far the file went.
+      const clamped = result.requestedEndLine === undefined
+        ? ""
+        : `[lines ${result.startLine}-${result.endLine} of ${result.totalLines} — requested ${result.startLine}-${result.requestedEndLine}, clamped]\n`;
+      const output = `[${pathValue}${result.tag}]\n${clamped}${result.numbered}`;
       return ok(await boundText(output, store, { budget, mimeType: "text/plain; charset=utf-8", name: pathValue }), { filesRead: [path] });
     } catch (error) {
       return fail(`Unable to read the requested path: ${errorMessage(error)} Check the path, URL, and permissions, then retry.`);
