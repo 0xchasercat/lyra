@@ -420,8 +420,15 @@ pub fn turn_end(end: TurnEnd, theme: &Theme) -> Row {
 /// The session header, printed **once** into scrollback at session start.
 ///
 /// DESIGN.md §3: "A one-line header prints once at session start into
-/// scrollback (`lyra · project · branch · model · workspace`) — no persistent
+/// scrollback (`lyra · project · branch · model · directory`) — no persistent
 /// header row, no splash, no mascot, no tips."
+///
+/// The last field is `session/snapshot`'s `workspace`, which since the §10
+/// redesign is the launch directory itself for a main session (and a workspace
+/// path only for an isolated agent). It is a real path the user can `cd` into,
+/// so it is printed **verbatim** — no `~` collapsing, no basename, no
+/// abbreviation to a workspace name. Only the width degradation below touches
+/// it, and that leaves the visible `…` DESIGN.md §3 requires.
 #[must_use]
 pub fn session_header(fields: &[&str], theme: &Theme, width: u16) -> Row {
     let mut spans = vec![Span::new(

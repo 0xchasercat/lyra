@@ -948,8 +948,17 @@ fn bootstrap(client: &AcpClient, app: &mut App) {
             if !snapshot.model.is_empty() {
                 fields.push(snapshot.model.clone());
             }
-            if let Some(workspace) = snapshot.workspace.clone() {
-                fields.push(workspace);
+            // Last, and **verbatim**. This is a real path the user can `cd`
+            // into (DESIGN.md §3), not a workspace name, so nothing here
+            // shortens it, collapses `$HOME` to `~`, or takes its basename —
+            // the header's own width degradation is the only thing that may
+            // touch it, and it leaves a visible `…`.
+            if let Some(directory) = snapshot
+                .workspace
+                .clone()
+                .filter(|path| !path.trim().is_empty())
+            {
+                fields.push(directory);
             }
             Some(snapshot)
         }
@@ -1072,6 +1081,25 @@ impl app::Daemon for Wire<'_> {
                 params
             }
             app::Call::LoadSession(name) => serde_json::json!({ "name": name }),
+            // `why` never reaches the wire: it is how the answer finds the
+            // surface that asked, exactly as `Purpose` is for `provider/get`.
+            app::Call::Checkpoints { limit, .. } => serde_json::json!({ "limit": limit }),
+            app::Call::Restore { checkpoint, force } => {
+                // Omitted rather than sent `false`: the daemon's default is not
+                // to force, and a request that says so is a request that had an
+                // opinion about it.
+                if *force {
+                    serde_json::json!({ "checkpoint": checkpoint, "force": true })
+                } else {
+                    serde_json::json!({ "checkpoint": checkpoint })
+                }
+            }
+            app::Call::Rewind { entry_id } => match entry_id {
+                Some(entry_id) => serde_json::json!({ "entryId": entry_id }),
+                // No entry named: the daemon picks the newest anchored one,
+                // which is the same anchor a restore would use.
+                None => serde_json::json!({}),
+            },
             // `purpose` is this client's routing, not the daemon's business:
             // the method takes a provider id and nothing else.
             app::Call::ProviderGet { provider, .. } => {

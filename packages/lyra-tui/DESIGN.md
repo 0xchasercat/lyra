@@ -25,6 +25,16 @@ reconstruction — design lessons only, no code lifted), opencode, and grok-buil
      drain points are unchanged — only the trigger moves).
    - `Esc` → cancel turn, keep partial output, marked. `Esc Esc` → rewind.
      `Ctrl+C` → cancel; twice exits.
+   - **Rewind is two decisions, so it asks.** `Esc Esc` (and `/rewind`, which is
+     the same surface reached through a checkpoint picker) re-reads
+     `checkpoint/list` and opens a confirmation offering *the conversation
+     only*, *the code as well*, or — for a checkpoint anchored to no transcript
+     entry — the code alone, said out loud. Moving the head is `session/rewind`;
+     taking the working directory back is `checkpoint/restore`; they are
+     separate calls because rewinding what was said and reverting what was
+     written are independent choices. A restore never clobbers files that
+     changed outside Lyra's own tool calls: it reports them **by name** and only
+     then offers the `--force` that would revert them too.
    - Evidence: grok-build shipped bare-key mid-turn steering and migrated off
      it (a mid-turn message is ambiguous between "also do this" and "stop
      that"); ante ships queue+flush; Claude Code queues only. Explicit steer
@@ -45,8 +55,11 @@ viewport, no mouse capture.**
 
 - Finished output is printed to the terminal **once** and never touched again.
   Only a bottom **live region** is diffed and redrawn: the current streaming
-  block, activity strip, queue display, composer, footer. Bounded height
-  (~last 24 rows).
+  block, activity strip, queue display, presence strip, composer, hint line,
+  footer (§3 has the full order). Bounded height (~last 24 rows), and *bounded*
+  rather than fixed: an overlay or completion popup borrows rows and gives them
+  back when it closes, which is how a panel floats without a second rendering
+  mode.
 - Streaming commits **only provably-stable rows** into scrollback: text/code
   hold back the final row (it may reflow); markdown commits whole blocks as
   they stabilize (opencode's `RunScrollbackStream` protocol — the only serious
@@ -75,26 +88,87 @@ lyra (bun cli.ts, thin) ──spawn──▶ lyra-tui (Rust binary)
   `FrameRequest`/`UiRow`/`InteractiveUi`/`ProviderSetupUi`/`TuiBridge` code is
   deleted.
 - **No hand-mirrored schema.** The protocol is ACP itself. A single canonical
-  schema file (JSON Schema, checked into lyra-acp) defines every method and
-  notification; Rust serde types are generated/validated from it in CI. A
-  drifted field is a build failure, not a runtime surprise.
+  schema file (JSON Schema, `packages/lyra-acp/schema/protocol.json`) defines
+  every method and notification, and both sides are checked against *it* rather
+  than against each other: `protocol.test.ts` on the daemon side, and
+  `acp::conformance` on the client side, which embeds the schema with
+  `include_str!` so the file moving is a compile error and a drifted variant,
+  field, method name, `resultKind` or enum value is a red test. A drifted field
+  is a build failure, not a runtime surprise.
 - Events are **semantic deltas**, not UI state: `{sessionId, messageId,
   partId, field, delta}` for streaming; tool-call lifecycle
   (start/update/end with status); retry (attempt, max, reason, retry-at);
-  compaction boundary (token delta, first-kept); context repairs; usage.
+  compaction boundary (token delta, first-kept); context repairs; usage;
+  spawned-child lifecycle (`agent`, one event per transition, carrying the
+  transition itself as well as the state it left the child in — `started` and
+  `revived` are both `running`, so a client reading only the state sees one
+  thing where the daemon said two — and counts rather than paths, because the
+  paths belong to the child's own result). That is what the
+  presence strip and its audit rows are drawn from, and what
+  `session/snapshot`'s `agents` hydrates for a client that attached mid-session
+  (a transition already applied wins over the snapshot in flight beside it).
   Raw measurements over the wire — token counts as numbers, percentages
   derived client-side, absent limit ⇒ render nothing rather than a wrong
   number. Explicit turn-resume event closes every pause bracket.
-- Event coalescing client-side: flush on a 16ms timer only when events are
-  already bursty; isolated events render immediately.
+- Event coalescing client-side, without a frame timer: the loop parks on the
+  event channel, drains everything queued (bounded per tick so a loud turn
+  cannot starve the keyboard), and renders **once**. A burst therefore costs one
+  frame; an isolated event wakes the park and renders immediately. The only
+  timers are the ones a *surface* needs — a 1 Hz retry countdown, the stall
+  colour, an expiring armed gesture — and they set the park length, not the
+  flush.
 
 ## 3. Visual system (§19, made concrete)
 
 - **Layout** (top→bottom): transcript flowing into native scrollback → live
-  streaming block → activity strip (one line) → queue display (when nonempty)
-  → composer → footer. A one-line header prints once at session start into
-  scrollback (`lyra · project · branch · model · workspace`) — no persistent
-  header row, no splash, no mascot, no tips.
+  streaming block → activity strip (one line) → transient notice (when armed)
+  → queue display (when nonempty) → **agent presence strip** (when this session
+  has children) → completion popup (when open) → composer → contextual hint
+  line → footer. An overlay is modal: it replaces everything from the streaming
+  block down to the popup, so a panel never has to be squeezed in beside them.
+  A one-line header prints once at session start into scrollback
+  (`lyra · daemon name+version · session name · model · directory`) — every
+  field after `lyra` comes from `initialize` and `session/snapshot`, and a field
+  the daemon did not supply is omitted rather than faked. No persistent header
+  row, no splash, no mascot, no tips. The directory is `session/snapshot`'s
+  `workspace` field, which since the §10 redesign is the launch directory itself
+  for a main session (and a workspace path only for an isolated agent). It is a
+  real path the user can `cd` into, so it is rendered verbatim rather than
+  abbreviated to a workspace name.
+- **The presence strip** is §19's presence dots: one glyph per live child with
+  its peer name, a count for the ones still queued, coloured by state (accent
+  running, agent-tint inside a tool call, plain `✓` briefly on finish, error on
+  failure), degrading by shedding *names* into an honest `+N` rather than by
+  lying about how many there are. It is the only place the present tense of a
+  child lives — nothing a child does streams into the transcript while it works,
+  because six children each reporting every tool call would bury the
+  conversation they were spawned to serve. It is *chrome*, so the anti-jitter
+  rule below applies with one refinement — it **grows the region the moment a
+  child appears** (that is information arriving) and **shrinks only at a turn
+  boundary**, so a child finishing mid-stream never collapses the row underneath
+  the composer.
+- **Lifecycle rows** are the other half, and the split is the same one the tool
+  grammar makes between the activity strip and the collapsed `▸` row. The
+  transitions worth *history* — appeared, revived, finished, failed — commit as
+  dim one-line audit rows, run-collapsed like tool calls so a swarm costs a line
+  rather than a page, and counting **children** rather than transitions so a
+  child that spawned and finished inside one run is one agent with two things
+  said about it. A failure is never folded into a count of something else.
+  `started`, `running` and `awaiting_tool` earn nothing, because the present
+  tense belongs in the live region. A revival earns a row for the same reason it
+  earns a distinct wire event: it is the only way a child produces two `✓` rows
+  in one session, and a reader who never saw the restart cannot account for the
+  second one. The transition the daemon *declares* wins over one inferred from a
+  status diff; the diff is only the fallback for a daemon that predates the
+  field, and it is knowably weaker — a revival is invisible to it.
+- **Hub asides**: another agent speaking into this turn, which the daemon flags
+  as `steer.source: "hub"`, is **not** a `>` user band. It gets one dim
+  `⇄ peer: …` row, and the envelope the daemon wraps it in for the *model's*
+  benefit — a preamble naming the speaker and an instruction on how to reply —
+  is peeled off before it is shown, because the row already says both. Replay
+  reads the same envelope back off the persisted user-role message, so a
+  reloaded session does not re-attribute another agent's words to the person at
+  the keyboard.
 - **The signature** stays: the composer border is the single ambient
   indicator — a color state change while streaming (agent-identity tinted),
   no pulse, no travel, no shimmer.
@@ -102,6 +176,18 @@ lyra (bun cli.ts, thin) ──spawn──▶ lyra-tui (Rust binary)
   (dim while pending, accent on run, plain on success, error on failure);
   `└─` tree children for results/detail (`Tab` expands the *last* tool call,
   never mouse-only); `> user text` bands; dim one-line audit rows.
+- **Command results are rendered, never dumped.** A brace on the terminal is a
+  bug. Every `session/command` answer names its own shape with `resultKind`,
+  declared up front by `session/commands` and repeated on the answer, so the
+  client dispatches to a renderer instead of sniffing the payload: aligned
+  tables with a `▸` on the current row for `models`/`sessions`/`workspaces`/
+  `agents`/`skills`/`mcp`/`checkpoints`, label-value rows for `health`, raw
+  token counts for `context`, markdown for `report`. `/review` is the one that
+  answers *through the transcript* rather than beside it — its per-file rows
+  **are** collapsed tool rows, drawn by the same renderer and expandable by the
+  same `Tab` — and `/checkpoints` renders the rewind list as a table rather than
+  as a sentence. A kind this build has never heard of falls through to an
+  indented key/value tree, which is why no daemon change can put JSON on screen.
 - **Reliability, visible** ("never render nothing"):
   `⟳ rate limited · retry 2/8 · 4s` with a live 1 Hz countdown in the footer,
   escalating to full detail at attempt ≥4; `─ compacted · −38k tokens ─`
@@ -113,7 +199,8 @@ lyra (bun cli.ts, thin) ──spawn──▶ lyra-tui (Rust binary)
   three bundled themes; terminal-adaptive `system` theme from the 16-color
   palette with background alpha 0; live re-theme on DEC 2031; OSC 11
   luminance for auto light/dark.
-- **Glyphs**: pure Unicode (`● ◆ ▸ └─ ⟳`), zero Nerd Font, zero PUA.
+- **Glyphs**: pure Unicode (`● ◆ ▸ └─ ⟳`, plus the child vocabulary
+  `◎ ◍ ○ ✓ ✗ ↻ ⇄`), zero Nerd Font, zero PUA.
 - **Anti-jitter rules** (Claude Code's lessons, adopted): fixed-height chrome
   rows that never collapse 0↔1; transient hints display ≥700ms; width
   degradation leaves a visible `…`; wide content truncates, the page never
@@ -140,9 +227,21 @@ lyra (bun cli.ts, thin) ──spawn──▶ lyra-tui (Rust binary)
   contextual hint bar are generated from it (grok-build's structure). No
   scattered handlers. User remapping via `[tui.keys]` in config (data, not
   code).
-- **Esc policy is one ordered function** — overlay dismiss → composer clear
-  (armed) → cancel turn → rewind (armed) — documented order, no fall-through
-  surprises.
+- **Esc policy is one ordered function** — overlay dismiss → completion popup
+  dismiss → composer clear (armed) → unqueue the newest queued entry back into
+  the composer → cancel turn → rewind (armed) — documented order, no
+  fall-through surprises, and an `Esc` that reaches the end does nothing at all.
+  The unqueue rung is composer-adjacent state, which is why it sits with the
+  input rungs rather than after cancel: the ladder reads top to bottom as *undo
+  my most recent input intent, then stop the machine*. `Ctrl+C` still cancels
+  unconditionally at any depth.
+- **The mash is part of the policy.** The gesture a user makes when a turn goes
+  wrong is not one `Esc`, it is five, and a plain ordered function walked at
+  mash speed turns a cancel into a rewind. So the ladder is deaf for a
+  burst-length grace after any rung *acts*, and the same window is the floor on
+  confirming an arm — a press cannot confirm a destructive rung whose hint had
+  not yet been on screen when it was made. Holding `Esc` down therefore clears
+  and rewinds nothing.
 - **Composer**: readline/emacs set with kill-ring; undo groups (checkpoint on
   kind-change/cursor-jump; composite operations are one undo step); multiline
   via Shift+Enter (kitty) / Alt+Enter (fallback); paste chips — ≥3 lines or

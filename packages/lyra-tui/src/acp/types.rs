@@ -13,7 +13,7 @@
 //!
 //! One notification method, `session/update`, carrying one envelope
 //! ([`UpdateNotification`]) of `{sessionId, update}`, where `update` is a
-//! 24-variant union discriminated by `sessionUpdate` ([`Update`]).
+//! 25-variant union discriminated by `sessionUpdate` ([`Update`]).
 //!
 //! There is exactly one frame shape. The pre-rewrite `{event, stats, report}`
 //! frame the daemon emitted alongside this one during the transition is gone
@@ -289,6 +289,15 @@ pub mod method {
     pub const SESSION_CANCEL: &str = "session/cancel";
     /// Fork the transcript at an entry.
     pub const SESSION_FORK: &str = "session/fork";
+    /// Move this session's head back to an entry.
+    ///
+    /// The mechanism a fork uses, with the opposite intent: nothing is deleted
+    /// (the transcript is a DAG on disk), the turns after the entry simply stop
+    /// being ancestors of the head, and the daemon reports it as
+    /// `session_changed` with reason `rewind` rather than `fork`. Rewinding the
+    /// conversation and reverting the working directory are two calls —
+    /// this one and [`CHECKPOINT_RESTORE`] — because they are two decisions.
+    pub const SESSION_REWIND: &str = "session/rewind";
     /// Run a slash command server-side.
     pub const SESSION_COMMAND: &str = "session/command";
     /// Declare the slash commands this daemon routes, with their descriptions
@@ -355,6 +364,28 @@ pub mod method {
     /// none. The manual half of what `provider/add`'s discovery does
     /// automatically.
     pub const MODEL_ADD: &str = "model/add";
+    /// Every checkpoint of this session's working directory, newest first.
+    ///
+    /// A checkpoint is taken before every state-changing tool call and at both
+    /// turn boundaries, so this is what a rewind picker is built from: `label`
+    /// names the moment, `entryId` ties it to a transcript entry, and
+    /// `changedFiles` says how much moved.
+    pub const CHECKPOINT_LIST: &str = "checkpoint/list";
+    /// What changed between two checkpoints, or between one and the live tree.
+    ///
+    /// Asked with `patches: true` when a diff is going to be drawn: the patch is
+    /// per file rather than one blob, which is exactly the shape a renderer with
+    /// a summary row per path and expandable hunks wants.
+    pub const CHECKPOINT_DIFF: &str = "checkpoint/diff";
+    /// Rewind the working directory to a checkpoint. **The only checkpoint
+    /// method that writes.**
+    ///
+    /// Files that changed since the target *without* being attributed to one of
+    /// Lyra's own tool calls come back under `preserved` and are left alone;
+    /// `force` reverts those too and belongs behind a confirmation. Either way
+    /// the replaced state is checkpointed first and returned as `safety`, so the
+    /// restore is itself undoable.
+    pub const CHECKPOINT_RESTORE: &str = "checkpoint/restore";
     /// Measure the context payload.
     pub const CONTEXT_INSPECT: &str = "context/inspect";
     /// JSON-RPC cancellation of an in-flight request by id.
@@ -548,6 +579,76 @@ wire_enum! {
         ToolBoundary = "tool_boundary",
         /// Between turns.
         TurnBoundary = "turn_boundary",
+    }
+}
+
+wire_enum! {
+    /// Who a [`Steer`] came from.
+    ///
+    /// Absent on the wire means the user, so a daemon that predates the field is
+    /// never mistaken for one that only ever relays other agents.
+    SteerSource {
+        /// The person at the keyboard.
+        User = "user",
+        /// Another agent on the bus, folded in at a tool boundary.
+        Hub = "hub",
+    }
+}
+
+wire_enum! {
+    /// A spawned child's lifecycle, as `#/$defs/agentState` declares it.
+    ///
+    /// `timed_out` and `cancelled` are deliberately separate: a deadline and a
+    /// decision ask a reader for different next moves.
+    AgentState {
+        /// Accepted, not scheduled yet.
+        Queued = "queued",
+        /// Scheduled; its workspace or provider is still coming up.
+        Starting = "starting",
+        /// The model is working.
+        Running = "running",
+        /// Inside a tool call.
+        AwaitingTool = "awaiting_tool",
+        /// Finished with a result.
+        Completed = "completed",
+        /// Finished with an error.
+        Failed = "failed",
+        /// Its own deadline expired.
+        TimedOut = "timed_out",
+        /// Somebody stopped it.
+        Cancelled = "cancelled",
+    }
+}
+
+wire_enum! {
+    /// Which transition an `agent` update *is*, as distinct from the state it
+    /// left the child in (`#/$defs/update` → `agent.event`).
+    ///
+    /// The field exists because the state is not enough to recover the
+    /// transition. `started` and `revived` both leave a child
+    /// [`AgentState::Running`], so a client reading only `status` cannot tell a
+    /// child that resumed from one that never stopped — and reviving a parked
+    /// child is the only resume primitive there is, so a revival that renders as
+    /// silence followed by a *second* "finished" row is a session the user
+    /// cannot account for.
+    ///
+    /// Absent from a daemon that predates the field, which is read as "infer it
+    /// from the status diff" — see [`crate::app::App`]'s `agent_transition`.
+    AgentTransition {
+        /// Accepted. The first thing said about a child.
+        Spawned = "spawned",
+        /// It began running for the first time.
+        Started = "started",
+        /// It finished with a result.
+        Completed = "completed",
+        /// It finished with an error.
+        Failed = "failed",
+        /// Somebody stopped it.
+        Cancelled = "cancelled",
+        /// Its own deadline expired.
+        TimedOut = "timed_out",
+        /// A parked child was woken and is running again.
+        Revived = "revived",
     }
 }
 
@@ -1235,6 +1336,12 @@ pub struct Steer {
     pub text: String,
     /// Which drain point delivered it.
     pub at: SteerBoundary,
+    /// Who spoke. Absent means the user.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<SteerSource>,
+    /// The peer that sent a `hub` aside.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from: Option<String>,
 }
 
 /// `loop_warning` — the loop detector fired.
@@ -1304,7 +1411,7 @@ pub struct SessionChanged {
 
 /// An update this build does not model, kept whole.
 ///
-/// Two ways to get here: a `sessionUpdate` tag that is not in the 24 (the daemon
+/// Two ways to get here: a `sessionUpdate` tag that is not in the 25 (the daemon
 /// grew a variant), or a known tag whose body failed to decode (a field changed
 /// type). Either way the frame is preserved, not dropped, and the client keeps
 /// running.
@@ -1354,7 +1461,51 @@ impl UnknownUpdate {
     }
 }
 
-/// One semantic event: the 24-variant union `#/$defs/update` declares.
+/// `agent` — a spawned child changed state.
+///
+/// The observability half of the delegation surface: every lifecycle transition
+/// crosses the wire, so a presence strip renders from a stream rather than from
+/// polling. Counts, not paths — the paths belong to the child's own result.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentUpdate {
+    /// The spawn id, `spawn-N`. Stable across a revival.
+    pub id: String,
+    /// The bus name the child answers to.
+    pub peer: String,
+    /// The short name its parent gave it, when it gave one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    /// Where it is in its life.
+    pub status: AgentState,
+    /// Which transition this *is*, when the daemon says so.
+    ///
+    /// Authoritative when present, because [`AgentState`] cannot express it:
+    /// `started` and `revived` are both [`AgentState::Running`]. Absent from an
+    /// older daemon, and the client falls back to diffing the previous status.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event: Option<AgentTransition>,
+    /// Omitted when the child inherited a model that was never named.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// 0 for a child of the main session, 1 for a grandchild.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub depth: Option<u32>,
+    /// The directory its tools operate in.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<String>,
+    /// How many tool calls it has made.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<u32>,
+    /// How many distinct paths its tools reported changing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub files_modified: Option<u32>,
+    /// Present on `failed` and `timed_out`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// One semantic event: the 25-variant union `#/$defs/update` declares.
 ///
 /// The `sessionUpdate` tag discriminates. Dispatch on [`Update::tag`] rather
 /// than re-reading raw JSON — nothing outside `acp::` should name a wire key.
@@ -1408,6 +1559,8 @@ pub enum Update {
     ModelChanged(ModelChanged),
     /// The active transcript was replaced.
     SessionChanged(SessionChanged),
+    /// A spawned child changed state.
+    Agent(AgentUpdate),
     /// Something this build does not model. Never fatal.
     Unknown(UnknownUpdate),
 }
@@ -1417,7 +1570,7 @@ pub enum Update {
 /// `acp::conformance` asserts this equals the schema's declared `oneOf`
 /// titles, which is what makes a daemon-side addition a *test* failure here
 /// rather than a silent shrug at runtime.
-pub const UPDATE_TAGS: [&str; 24] = [
+pub const UPDATE_TAGS: [&str; 25] = [
     "turn_start",
     "turn_resume",
     "turn_end",
@@ -1442,6 +1595,7 @@ pub const UPDATE_TAGS: [&str; 24] = [
     "report",
     "model_changed",
     "session_changed",
+    "agent",
 ];
 
 impl Update {
@@ -1473,6 +1627,7 @@ impl Update {
             Self::Report(_) => "report",
             Self::ModelChanged(_) => "model_changed",
             Self::SessionChanged(_) => "session_changed",
+            Self::Agent(_) => "agent",
             Self::Unknown(unknown) => unknown.tag.as_str(),
         }
     }
@@ -1523,6 +1678,7 @@ impl Update {
             Self::Report(payload) => encode!("report", payload),
             Self::ModelChanged(payload) => encode!("model_changed", payload),
             Self::SessionChanged(payload) => encode!("session_changed", payload),
+            Self::Agent(payload) => encode!("agent", payload),
             Self::Unknown(unknown) => return unknown.to_json(),
         };
         let mut map = match payload {
@@ -1574,6 +1730,7 @@ impl Update {
             "report" => decode!(Self::Report),
             "model_changed" => decode!(Self::ModelChanged),
             "session_changed" => decode!(Self::SessionChanged),
+            "agent" => decode!(Self::Agent),
             other => Self::Unknown(UnknownUpdate::unrecognised(other, value)),
         }
     }
@@ -1724,7 +1881,11 @@ pub struct SessionSnapshot {
     /// Transport the model runs on.
     #[serde(default)]
     pub api_type: Option<ApiType>,
-    /// Workspace name, when the session is in one.
+    /// The directory this session's tools operate in: the launch directory for a
+    /// main session, its own workspace for an isolated agent.
+    ///
+    /// A **real path the user can `cd` into**, which is why the header prints it
+    /// verbatim rather than abbreviating it to a workspace name (DESIGN.md §3).
     #[serde(default)]
     pub workspace: Option<String>,
     /// Whether a turn is running right now.
@@ -1746,6 +1907,13 @@ pub struct SessionSnapshot {
     /// Cumulative measurements.
     #[serde(default)]
     pub usage: Option<SnapshotUsage>,
+    /// The children this session has spawned.
+    ///
+    /// Absent on a daemon that predates the field, which reads as "none known
+    /// yet" rather than "none exist": the presence strip then fills in from the
+    /// next `agent` transition instead of from hydration.
+    #[serde(default)]
+    pub agents: Vec<AgentHandle>,
 }
 
 impl SessionSnapshot {
@@ -1954,6 +2122,312 @@ pub struct ContextInspectResult {
     /// Fields this build does not model.
     #[serde(flatten, default)]
     pub extra: Map<String, Value>,
+}
+
+/// `session/rewind` params. Absent `entryId` asks the daemon for the entry the
+/// newest anchored checkpoint points at.
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RewindParams {
+    /// The transcript entry the head should land on.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub entry_id: Option<String>,
+}
+
+/// `session/rewind` result.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RewindResult {
+    /// The session, with its head moved.
+    pub descriptor: SessionDescriptor,
+    /// The entry the head now sits on — echoed, because a caller that sent none
+    /// asked the daemon to choose.
+    pub entry_id: String,
+    /// How many message entries stopped being ancestors of the head. Absent
+    /// means the daemon did not count, which is not the same as zero.
+    #[serde(default)]
+    pub removed_messages: Option<u64>,
+}
+
+// ---------------------------------------------------------------------------
+// Checkpoints — the rewind surface
+// ---------------------------------------------------------------------------
+
+wire_enum! {
+    /// Why a checkpoint was taken, as `#/$defs/checkpoint`'s `kind` declares it.
+    CheckpointKind {
+        /// At the start of a turn.
+        TurnStart = "turn_start",
+        /// In front of a state-changing tool call.
+        PreTool = "pre_tool",
+        /// At the end of a turn.
+        TurnEnd = "turn_end",
+        /// Immediately before a restore replaced the tree — the undo.
+        PreRestore = "pre_restore",
+        /// Asked for by name.
+        Manual = "manual",
+    }
+}
+
+/// One recorded state of the session's working directory.
+///
+/// `id` is the stable handle: `/cleanup` thins the history by rewriting it and
+/// ids survive that. `entry_id` anchors the checkpoint to the transcript entry it
+/// precedes, which is the one field that makes rewinding conversation and code
+/// together possible at all.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Checkpoint {
+    /// Stable id.
+    pub id: String,
+    /// Why it was taken.
+    pub kind: CheckpointKind,
+    /// Human label for the moment.
+    #[serde(default)]
+    pub label: String,
+    /// ISO-8601 instant.
+    #[serde(default)]
+    pub created_at: String,
+    /// Paths differing from the checkpoint before this one.
+    #[serde(default)]
+    pub changed_files: u64,
+    /// The transcript entry this checkpoint precedes.
+    #[serde(default)]
+    pub entry_id: Option<String>,
+    /// The tool it was taken in front of, for `pre_tool`.
+    #[serde(default)]
+    pub tool: Option<String>,
+    /// That tool call's id.
+    #[serde(default)]
+    pub call_id: Option<String>,
+    /// Paths that were outside the snapshot entirely, so a restore is never
+    /// quietly partial.
+    #[serde(default)]
+    pub excluded: Vec<String>,
+}
+
+impl Checkpoint {
+    /// What the picker's left column says: the label, falling back to the id.
+    #[must_use]
+    pub fn title(&self) -> &str {
+        if self.label.trim().is_empty() {
+            &self.id
+        } else {
+            &self.label
+        }
+    }
+
+    /// Whether this checkpoint names a transcript entry, and can therefore take
+    /// the conversation back with the code.
+    #[must_use]
+    pub fn anchored(&self) -> Option<&str> {
+        self.entry_id.as_deref().filter(|id| !id.is_empty())
+    }
+}
+
+/// One side of a diff: a checkpoint, the live working tree, or the empty tree.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CheckpointEndpoint {
+    /// `checkpoint`, `worktree` or `empty`.
+    pub kind: String,
+    /// Checkpoint id, for `checkpoint`.
+    #[serde(default)]
+    pub id: Option<String>,
+    /// Human label.
+    #[serde(default)]
+    pub label: Option<String>,
+    /// When it was taken.
+    #[serde(default)]
+    pub created_at: Option<String>,
+}
+
+impl CheckpointEndpoint {
+    /// How the endpoint reads in a header row.
+    #[must_use]
+    pub fn describe(&self) -> String {
+        match self.kind.as_str() {
+            "worktree" => "the working tree".to_owned(),
+            "empty" => "the start of this session".to_owned(),
+            _ => self
+                .label
+                .clone()
+                .filter(|label| !label.trim().is_empty())
+                .or_else(|| self.id.clone())
+                .unwrap_or_else(|| "a checkpoint".to_owned()),
+        }
+    }
+}
+
+/// One changed path, with its own patch when patches were asked for.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CheckpointFileChange {
+    /// The path.
+    pub path: String,
+    /// `added`, `modified`, `deleted`, `renamed`, `copied` or `type_changed`.
+    pub status: String,
+    /// Where a rename or copy came from.
+    #[serde(default)]
+    pub old_path: Option<String>,
+    /// Lines added. Absent for a binary file rather than zero.
+    #[serde(default)]
+    pub additions: Option<u64>,
+    /// Lines removed. Absent for a binary file rather than zero.
+    #[serde(default)]
+    pub deletions: Option<u64>,
+    /// Whether the file is binary, and therefore carries no patch.
+    #[serde(default)]
+    pub binary: bool,
+    /// A unified diff for this file alone.
+    #[serde(default)]
+    pub patch: Option<String>,
+    /// The patch was cut at a byte budget; what is here is a prefix.
+    #[serde(default)]
+    pub patch_truncated: bool,
+}
+
+/// `checkpoint/list` result — and `/checkpoints`'s `checkpointsResult`.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CheckpointListResult {
+    /// Newest first.
+    #[serde(default)]
+    pub checkpoints: Vec<Checkpoint>,
+    /// Whether this directory can host a checkpoint repository at all.
+    #[serde(default)]
+    pub available: bool,
+    /// Why not, when it cannot. Rendering the reason is what stops an empty list
+    /// from reading as "nothing has happened yet".
+    #[serde(default)]
+    pub unavailable: Option<String>,
+}
+
+/// `checkpoint/diff` result.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CheckpointDiffResult {
+    /// The `from` side.
+    pub from: CheckpointEndpoint,
+    /// The `to` side.
+    pub to: CheckpointEndpoint,
+    /// Changed paths, first by path when truncated.
+    #[serde(default)]
+    pub files: Vec<CheckpointFileChange>,
+    /// More files changed than the requested limit carried.
+    #[serde(default)]
+    pub truncated: bool,
+    /// Whether checkpoints work here at all.
+    #[serde(default)]
+    pub available: bool,
+    /// Why not, when they do not.
+    #[serde(default)]
+    pub unavailable: Option<String>,
+}
+
+/// `checkpoint/restore` result — the never-clobber rule, reported.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CheckpointRestoreResult {
+    /// The checkpoint the tree was taken back to.
+    pub target: Checkpoint,
+    /// A checkpoint of the state that was just replaced. Restoring it undoes the
+    /// restore, so a client offers it as the undo.
+    pub safety: Checkpoint,
+    /// Paths put back.
+    #[serde(default)]
+    pub restored: Vec<String>,
+    /// Paths that changed since the target *without* being attributed to one of
+    /// Lyra's own tool calls, and were therefore left exactly as they were.
+    #[serde(default)]
+    pub preserved: Vec<String>,
+    /// Whether `force` reverted the preserved set too.
+    #[serde(default)]
+    pub forced: bool,
+    /// Paths outside the snapshot, untouched either way.
+    #[serde(default)]
+    pub excluded: Vec<String>,
+}
+
+/// `checkpoint/restore` params.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RestoreParams {
+    /// Checkpoint id, or `"latest"`.
+    pub checkpoint: String,
+    /// Also revert files changed outside Lyra's own tool calls. Off by default,
+    /// and only ever set from a confirmation the user answered.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub force: bool,
+}
+
+/// One spawned child, as `/agents`, `agent/list` and the snapshot report it.
+///
+/// The hydration counterpart of [`AgentUpdate`]: same child, more detail,
+/// fetched once at attach so a client that joins mid-session renders its
+/// presence strip immediately instead of waiting for the next transition.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentHandle {
+    /// The spawn id.
+    pub id: String,
+    /// The bus name it answers to.
+    pub peer: String,
+    /// The short name its parent gave it.
+    #[serde(default)]
+    pub label: Option<String>,
+    /// Where it is in its life.
+    pub status: AgentState,
+    /// The model it runs on, when one was named.
+    #[serde(default)]
+    pub model: Option<String>,
+    /// 0 for a child of the main session.
+    #[serde(default)]
+    pub depth: Option<u32>,
+    /// The directory its tools operate in.
+    #[serde(default)]
+    pub workspace: Option<String>,
+    /// How many tool calls it has made.
+    #[serde(default)]
+    pub tool_calls: Option<u32>,
+    /// The paths its tools reported changing.
+    #[serde(default)]
+    pub files_modified: Vec<String>,
+    /// Present on `failed` and `timed_out`.
+    #[serde(default)]
+    pub error: Option<String>,
+    /// Fields this build does not model.
+    #[serde(flatten, default)]
+    pub extra: Map<String, Value>,
+}
+
+impl AgentHandle {
+    /// The same fact an `agent` update carries, so hydration and streaming fold
+    /// into one map rather than two.
+    ///
+    /// `filesModified` is a **list** here and a **count** on the update: the
+    /// handle knows the paths and the transition only counts them, so the
+    /// conversion is a length. Nothing invents a number it was not given.
+    #[must_use]
+    pub fn as_update(&self) -> AgentUpdate {
+        AgentUpdate {
+            id: self.id.clone(),
+            peer: self.peer.clone(),
+            label: self.label.clone(),
+            status: self.status.clone(),
+            // A handle is a *state*, not a transition: hydration says what a
+            // child is, never what just happened to it. Inventing a transition
+            // here would put a lifecycle row in scrollback for something that
+            // happened before this client was attached to see it.
+            event: None,
+            model: self.model.clone(),
+            depth: self.depth,
+            workspace: self.workspace.clone(),
+            tool_calls: self.tool_calls,
+            files_modified: u32::try_from(self.files_modified.len()).ok(),
+            error: self.error.clone(),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2430,7 +2904,9 @@ pub struct RemoveProviderResult {
 pub struct PermissionParams {
     /// Which session is asking.
     pub session_id: String,
-    /// What is being asked about, e.g. `git_auto_mode`.
+    /// What is being asked about. Open by contract: the schema names no kinds,
+    /// so a client renders the title, detail, and options it is sent and only
+    /// dispatches on a kind it recognises.
     pub kind: String,
     /// One-line question.
     pub title: String,

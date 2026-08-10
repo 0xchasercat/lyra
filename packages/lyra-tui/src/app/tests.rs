@@ -691,9 +691,15 @@ fn a_failed_prompt_puts_the_queue_back_to_idle() {
 /// The registry three of the tests below start from.
 fn hydrate(app: &mut App, daemon: &mut ScriptedDaemon, events: &Receiver<AcpEvent>) {
     app.hydrate(daemon);
-    assert_eq!(daemon.sent, vec![Call::Commands], "asked once, at bootstrap");
+    // Two calls, both once: the command registry, and the checkpoint list the
+    // `Esc Esc` rung answers `can_rewind` from without a round trip.
+    assert_eq!(
+        daemon.methods(),
+        vec!["session/commands", "checkpoint/list"],
+        "asked once, at bootstrap"
+    );
     app.hydrate(daemon);
-    assert_eq!(daemon.sent.len(), 1, "and only once");
+    assert_eq!(daemon.sent.len(), 2, "and only once");
     daemon.answers.push(Reply {
         call: Call::Commands,
         outcome: Ok(serde_json::json!({ "commands": [
@@ -2601,7 +2607,7 @@ fn first_run_goes_from_nothing_to_a_saved_provider_without_a_switch() {
 
     assert_eq!(
         daemon.methods(),
-        vec!["session/commands", "provider/setup_options"],
+        vec!["session/commands", "checkpoint/list", "provider/setup_options"],
         "the form opens itself when there is nothing to prompt with"
     );
     daemon.answers.push(Reply {
@@ -2668,7 +2674,7 @@ fn a_configured_daemon_is_left_alone_and_so_is_one_that_predates_the_field() {
         .expect("a snapshot decodes");
         app.adopt_snapshot(&snapshot);
         app.hydrate(&mut daemon);
-        assert_eq!(daemon.methods(), vec!["session/commands"]);
+        assert_eq!(daemon.methods(), vec!["session/commands", "checkpoint/list"]);
     }
 }
 
@@ -3400,3 +3406,976 @@ fn every_other_entry_kind_lands_as_the_row_its_live_counterpart_would_have() {
     assert!(committed.contains("resumed · mixed · 2 messages"), "{committed}");
 }
 
+
+// ---------------------------------------------------------------------------
+// Children: the presence strip and the lifecycle rows
+// ---------------------------------------------------------------------------
+
+/// One `agent` update, as a wire frame.
+fn agent(body: &str) -> AcpEvent {
+    update(body)
+}
+
+/// The presence strip, found by shape: it is the row carrying a presence dot.
+fn strip_text(app: &App) -> Option<String> {
+    app.live(app.desired_region_height(12), Instant::now())
+        .rows
+        .iter()
+        .map(Row::plain_text)
+        .find(|text| {
+            let trimmed = text.trim_start();
+            ["◎ ", "◍ ", "○ ", "✓ ", "✗ "]
+                .iter()
+                .any(|glyph| trimmed.starts_with(glyph))
+                && !trimmed.contains("spawned")
+                && !trimmed.contains(" · ")
+        })
+}
+
+#[test]
+fn no_children_means_no_presence_row_and_no_extra_region() {
+    let (mut app, mut daemon, (_tx, rx)) = (app(), ScriptedDaemon::default(), wire());
+    press(&mut app, &mut daemon, &rx, b"");
+    assert_eq!(strip_text(&app), None);
+    assert_eq!(app.desired_region_height(CHROME_ROWS), CHROME_ROWS);
+}
+
+#[test]
+fn a_spawned_child_appears_in_the_strip_and_leaves_one_audit_row() {
+    let (mut app, mut daemon, (tx, rx)) = (app(), ScriptedDaemon::default(), wire());
+    tx.send(agent(
+        r#"{"sessionUpdate":"agent","id":"spawn-1","peer":"activity-module",
+            "status":"running","model":"gpt-5.6-terra"}"#,
+    ))
+    .expect("send");
+    press(&mut app, &mut daemon, &rx, b"");
+
+    // The audit row is held back so a burst of them can collapse; it settles
+    // into scrollback the moment anything that is not a transition arrives.
+    assert!(live_text(&app).contains("◎ spawned activity-module · gpt-5.6-terra"));
+    tx.send(update(
+        r#"{"sessionUpdate":"turn_end","turnId":"t1","status":"completed","durationMs":1,
+            "partialRetained":false}"#,
+    ))
+    .expect("send");
+    press(&mut app, &mut daemon, &rx, b"");
+    let committed = scrollback(&mut app);
+    assert!(
+        committed.contains("◎ spawned activity-module · gpt-5.6-terra"),
+        "{committed}"
+    );
+    let strip = strip_text(&app).expect("a presence row");
+    assert!(strip.contains("◎ activity-module"), "{strip}");
+    // The row is chrome, and the region has to have been grown for it or it
+    // would be drawn off the top.
+    assert_eq!(app.desired_region_height(CHROME_ROWS), CHROME_ROWS + 1);
+}
+
+#[test]
+fn the_strip_names_the_running_children_and_counts_the_queued_ones() {
+    let (mut app, mut daemon, (tx, rx)) = (app(), ScriptedDaemon::default(), wire());
+    for (id, peer, status) in [
+        ("spawn-1", "activity-module", "running"),
+        ("spawn-2", "qa-checker", "awaiting_tool"),
+        ("spawn-3", "docs", "queued"),
+        ("spawn-4", "lint", "queued"),
+    ] {
+        tx.send(agent(&format!(
+            r#"{{"sessionUpdate":"agent","id":"{id}","peer":"{peer}","status":"{status}"}}"#
+        )))
+        .expect("send");
+    }
+    press(&mut app, &mut daemon, &rx, b"");
+    let strip = strip_text(&app).expect("a presence row");
+    assert_eq!(strip.trim(), "◎ activity-module ◍ qa-checker ○ 2 queued");
+}
+
+/// A swarm is a real shape, and the row must account for every child.
+#[test]
+fn twenty_children_collapse_into_one_row_and_one_scrollback_line() {
+    let (mut app, mut daemon, (tx, rx)) = (app(), ScriptedDaemon::default(), wire());
+    for index in 0..20 {
+        tx.send(agent(&format!(
+            r#"{{"sessionUpdate":"agent","id":"spawn-{index}","peer":"worker-{index}",
+                 "status":"running"}}"#
+        )))
+        .expect("send");
+    }
+    press(&mut app, &mut daemon, &rx, b"");
+    // Nothing has settled the run yet, so it is still in the live region.
+    let live = live_text(&app);
+    assert!(live.contains("20 agents"), "{live}");
+    assert!(live.contains("20 spawned"), "{live}");
+    for row in app.live(app.desired_region_height(12), Instant::now()).rows {
+        assert!(row.width() <= 80, "{:?}", row.plain_text());
+    }
+}
+
+#[test]
+fn a_child_that_finishes_ticks_briefly_and_then_leaves_the_strip() {
+    let (mut app, mut daemon, (tx, rx)) = (app(), ScriptedDaemon::default(), wire());
+    tx.send(agent(
+        r#"{"sessionUpdate":"agent","id":"spawn-1","peer":"activity-module","status":"running"}"#,
+    ))
+    .expect("send");
+    press(&mut app, &mut daemon, &rx, b"");
+    let settled_at = Instant::now();
+    tx.send(agent(
+        r#"{"sessionUpdate":"agent","id":"spawn-1","peer":"activity-module",
+            "status":"completed","toolCalls":12,"filesModified":4}"#,
+    ))
+    .expect("send");
+    press_at(&mut app, &mut daemon, &rx, b"", settled_at);
+
+    // The spawn and the finish are one child with two things to say, so they
+    // collapse into one line that counts the child once.
+    let held = live_text(&app);
+    assert!(held.contains("1 agent · 1 spawned · 1 done · activity-module"), "{held}");
+    // The tick is on screen…
+    let drawn = app
+        .live(app.desired_region_height(12), settled_at)
+        .rows
+        .iter()
+        .map(Row::plain_text)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(drawn.contains("✓ activity-module"), "{drawn}");
+    // …and gone once its linger is up, while the row itself stays: a chrome row
+    // that collapsed 0↔1 mid-stream is exactly the jitter DESIGN.md §3 forbids.
+    let later = settled_at + ui::agent::SETTLED_LINGER + Duration::from_millis(1);
+    let after = app
+        .live(app.desired_region_height(12), later)
+        .rows
+        .iter()
+        .map(Row::plain_text)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        !after.contains("✓ activity-module"),
+        "the tick has expired: {after}"
+    );
+    assert_eq!(
+        app.desired_region_height(CHROME_ROWS),
+        CHROME_ROWS + 1,
+        "the row survives until a turn boundary"
+    );
+}
+
+#[test]
+fn a_failed_child_says_why_and_where_to_go() {
+    let (mut app, mut daemon, (tx, rx)) = (app(), ScriptedDaemon::default(), wire());
+    tx.send(agent(
+        r#"{"sessionUpdate":"agent","id":"spawn-2","peer":"qa-checker","status":"timed_out",
+            "error":"deadline expired"}"#,
+    ))
+    .expect("send");
+    press(&mut app, &mut daemon, &rx, b"");
+    let held = live_text(&app);
+    assert!(held.contains("✗ qa-checker"), "{held}");
+    assert!(held.contains("timed out"), "{held}");
+    assert!(held.contains("/agents"), "{held}");
+}
+
+/// The strip must survive a child arriving before anything else has.
+#[test]
+fn an_agent_update_before_the_snapshot_is_kept_rather_than_dropped() {
+    let (mut app, mut daemon, (tx, rx)) = (app(), ScriptedDaemon::default(), wire());
+    tx.send(agent(
+        r#"{"sessionUpdate":"agent","id":"spawn-1","peer":"early","status":"running"}"#,
+    ))
+    .expect("send");
+    press(&mut app, &mut daemon, &rx, b"");
+    let _ = scrollback(&mut app);
+
+    // The snapshot lands afterwards, reporting the same child at a state it has
+    // already moved past. Live wins.
+    let snapshot: wire::SessionSnapshot = serde_json::from_value(serde_json::json!({
+        "descriptor": { "sessionId": "s-1", "name": "n", "path": "/p", "headId": "e-1",
+                        "createdAt": "t" },
+        "entries": [], "provider": "p", "model": "m",
+        "agents": [{ "id": "spawn-1", "peer": "early", "workspace": "/w",
+                     "status": "queued", "startedAt": 0 }]
+    }))
+    .expect("a snapshot decodes");
+    app.adopt_snapshot(&snapshot);
+    let strip = strip_text(&app).expect("a presence row");
+    assert!(strip.contains("◎ early"), "live wins over hydration: {strip}");
+}
+
+#[test]
+fn hydration_fills_the_strip_for_a_client_that_attached_mid_session() {
+    let mut app = app();
+    let snapshot: wire::SessionSnapshot = serde_json::from_value(serde_json::json!({
+        "descriptor": { "sessionId": "s-1", "name": "n", "path": "/p", "headId": "e-1",
+                        "createdAt": "t" },
+        "entries": [], "provider": "p", "model": "m",
+        "agents": [{ "id": "spawn-1", "peer": "activity-module", "workspace": "/w",
+                     "status": "awaiting_tool", "startedAt": 0 },
+                   { "id": "spawn-2", "peer": "already-done", "workspace": "/w",
+                     "status": "completed", "startedAt": 0 }]
+    }))
+    .expect("a snapshot decodes");
+    app.adopt_snapshot(&snapshot);
+    let strip = strip_text(&app).expect("a presence row");
+    assert!(strip.contains("◍ activity-module"), "{strip}");
+    // A child that was already finished when this client attached never earned
+    // a `✓` on screen, so it is history rather than presence.
+    assert!(!strip.contains("already-done"), "{strip}");
+}
+
+/// Both the strip and an overlay grow the live region; only one of them is
+/// drawn at a time, and the region must not be grown for both.
+#[test]
+fn an_overlay_does_not_pay_for_the_presence_row_it_covers() {
+    let (mut app, mut daemon, (tx, rx)) = (app(), ScriptedDaemon::default(), wire());
+    tx.send(agent(
+        r#"{"sessionUpdate":"agent","id":"spawn-1","peer":"worker","status":"running"}"#,
+    ))
+    .expect("send");
+    press(&mut app, &mut daemon, &rx, b"");
+    let with_strip = app.desired_region_height(CHROME_ROWS);
+    press(&mut app, &mut daemon, &rx, b"\x10");
+    let with_overlay = app.desired_region_height(CHROME_ROWS);
+    assert!(with_overlay > with_strip, "the panel grows the region");
+    assert_eq!(strip_text(&app), None, "and replaces the strip entirely");
+}
+
+/// The strip is chrome, and DESIGN.md §3 lets it grow mid-stream but shrink
+/// only at a turn boundary. Both halves, in one session.
+#[test]
+fn the_presence_row_shrinks_only_at_a_turn_boundary() {
+    let (mut app, mut daemon, (tx, rx)) = (app(), ScriptedDaemon::default(), wire());
+    tx.send(agent(
+        r#"{"sessionUpdate":"agent","id":"spawn-1","peer":"worker","status":"running"}"#,
+    ))
+    .expect("send");
+    press(&mut app, &mut daemon, &rx, b"");
+    assert_eq!(app.desired_region_height(CHROME_ROWS), CHROME_ROWS + 1);
+
+    // The child finishes *mid-turn*. The row must not vanish under the composer.
+    tx.send(agent(
+        r#"{"sessionUpdate":"agent","id":"spawn-1","peer":"worker","status":"completed"}"#,
+    ))
+    .expect("send");
+    press(&mut app, &mut daemon, &rx, b"");
+    assert_eq!(
+        app.desired_region_height(CHROME_ROWS),
+        CHROME_ROWS + 1,
+        "a child finishing mid-stream never collapses the row"
+    );
+
+    // The turn boundary is where it is allowed to go.
+    tx.send(update(
+        r#"{"sessionUpdate":"turn_end","turnId":"t1","status":"completed","durationMs":1,
+            "partialRetained":false}"#,
+    ))
+    .expect("send");
+    press(&mut app, &mut daemon, &rx, b"");
+    assert_eq!(
+        app.desired_region_height(CHROME_ROWS),
+        CHROME_ROWS,
+        "and only there"
+    );
+}
+
+/// A turn ending while a child is still working keeps the row: the rule is
+/// "shrink at a boundary", not "shrink at every boundary".
+#[test]
+fn a_turn_boundary_keeps_the_row_while_a_child_is_still_running() {
+    let (mut app, mut daemon, (tx, rx)) = (app(), ScriptedDaemon::default(), wire());
+    tx.send(agent(
+        r#"{"sessionUpdate":"agent","id":"spawn-1","peer":"long-runner","status":"awaiting_tool"}"#,
+    ))
+    .expect("send");
+    tx.send(update(
+        r#"{"sessionUpdate":"turn_end","turnId":"t1","status":"completed","durationMs":1,
+            "partialRetained":false}"#,
+    ))
+    .expect("send");
+    press(&mut app, &mut daemon, &rx, b"");
+    assert_eq!(app.desired_region_height(CHROME_ROWS), CHROME_ROWS + 1);
+    assert!(strip_text(&app).is_some_and(|row| row.contains("long-runner")));
+}
+
+/// The daemon says which transition this *is*; the client does not have to
+/// guess. `started` and `revived` are both `running`, so guessing cannot work.
+#[test]
+fn a_declared_revival_earns_its_own_row_instead_of_a_silent_second_run() {
+    let (mut app, mut daemon, (tx, rx)) = (app(), ScriptedDaemon::default(), wire());
+    for body in [
+        r#"{"sessionUpdate":"agent","id":"spawn-1","peer":"activity-module","status":"queued",
+            "event":"spawned","model":"opus-5"}"#,
+        // `started`: the present tense, and the present tense is the strip's.
+        r#"{"sessionUpdate":"agent","id":"spawn-1","peer":"activity-module","status":"running",
+            "event":"started"}"#,
+        r#"{"sessionUpdate":"agent","id":"spawn-1","peer":"activity-module","status":"completed",
+            "event":"completed","toolCalls":4}"#,
+        // Parked, then woken. Status goes back to `running` exactly as `started`
+        // did, which is the whole reason the field exists.
+        r#"{"sessionUpdate":"agent","id":"spawn-1","peer":"activity-module","status":"running",
+            "event":"revived","model":"opus-5"}"#,
+        r#"{"sessionUpdate":"agent","id":"spawn-1","peer":"activity-module","status":"completed",
+            "event":"completed","toolCalls":9}"#,
+    ] {
+        tx.send(agent(body)).expect("send");
+    }
+    press(&mut app, &mut daemon, &rx, b"");
+    // Anything that is not a transition settles the run into scrollback.
+    tx.send(update(
+        r#"{"sessionUpdate":"turn_end","turnId":"t1","status":"completed","durationMs":1,
+            "partialRetained":false}"#,
+    ))
+    .expect("send");
+    press(&mut app, &mut daemon, &rx, b"");
+    let committed = scrollback(&mut app);
+
+    // Four transitions, one child: the run collapses, and the tallies are
+    // honest about the revival rather than folding it into the spawn.
+    assert!(committed.contains("1 agent ·"), "{committed}");
+    assert!(committed.contains("1 spawned"), "{committed}");
+    assert!(committed.contains("1 revived"), "{committed}");
+    assert!(committed.contains("2 done"), "{committed}");
+    // `started` earned nothing: three kinds counted, not four.
+    assert!(!committed.contains("started"), "{committed}");
+}
+
+/// The same revival, alone, so the row itself is readable.
+#[test]
+fn a_revival_row_says_revived_and_names_the_child() {
+    let (mut app, mut daemon, (tx, rx)) = (app(), ScriptedDaemon::default(), wire());
+    tx.send(agent(
+        r#"{"sessionUpdate":"agent","id":"spawn-1","peer":"activity-module","status":"running",
+            "event":"revived","model":"opus-5"}"#,
+    ))
+    .expect("send");
+    press(&mut app, &mut daemon, &rx, b"");
+    let held = live_text(&app);
+    assert!(held.contains("↻ revived activity-module · opus-5"), "{held}");
+}
+
+/// A declared `cancelled`/`timed_out` is a failure row even though the status
+/// diff would have reached the same answer — the point is that the *declared*
+/// path covers every terminal kind, not just the ones inference happened to.
+#[test]
+fn every_declared_terminal_transition_reaches_a_row() {
+    for (transition, status) in [
+        ("completed", "completed"),
+        ("failed", "failed"),
+        ("cancelled", "cancelled"),
+        ("timed_out", "timed_out"),
+    ] {
+        let (mut app, mut daemon, (tx, rx)) = (app(), ScriptedDaemon::default(), wire());
+        tx.send(agent(&format!(
+            r#"{{"sessionUpdate":"agent","id":"spawn-1","peer":"w","status":"{status}",
+                 "event":"{transition}"}}"#
+        )))
+        .expect("send");
+        press(&mut app, &mut daemon, &rx, b"");
+        let held = live_text(&app);
+        let glyph = if transition == "completed" { '✓' } else { '✗' };
+        assert!(held.contains(glyph), "{transition}: {held}");
+    }
+}
+
+/// The fallback, for a daemon that predates `agent.event`: transitions come
+/// from the status diff, and the same state twice is not a transition.
+#[test]
+fn a_daemon_without_the_event_field_still_gets_rows_and_no_duplicates() {
+    let (mut app, mut daemon, (tx, rx)) = (app(), ScriptedDaemon::default(), wire());
+    for _ in 0..3 {
+        tx.send(agent(
+            r#"{"sessionUpdate":"agent","id":"spawn-1","peer":"worker","status":"running"}"#,
+        ))
+        .expect("send");
+    }
+    press(&mut app, &mut daemon, &rx, b"");
+    let held = live_text(&app);
+    // One sighting, one row — not three, and therefore not collapsed either.
+    assert!(held.contains("◎ spawned worker"), "{held}");
+    assert!(!held.contains("agents ·"), "re-reports are not transitions: {held}");
+}
+
+// ---------------------------------------------------------------------------
+// Hub asides
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_hub_aside_is_rendered_as_another_agent_speaking_not_as_the_user() {
+    let (mut app, mut daemon, (tx, rx)) = (app(), ScriptedDaemon::default(), wire());
+    tx.send(update(
+        r#"{"sessionUpdate":"steer","entryId":"e-9","text":"[hub message from activity-module] the parser tests pass now\n(Reply with hub { op: \"send\", to: \"activity-module\", message: \"...\" }. This is another agent speaking, not the user.)","at":"tool_boundary","source":"hub","from":"activity-module"}"#,
+    ))
+    .expect("send");
+    press(&mut app, &mut daemon, &rx, b"");
+    let committed = scrollback(&mut app);
+    assert!(
+        committed.contains("⇄ activity-module: the parser tests pass now"),
+        "{committed}"
+    );
+    assert!(
+        !committed.contains("> [hub message"),
+        "never a user band: {committed}"
+    );
+    assert!(
+        !committed.contains("Reply with hub"),
+        "the envelope is written for the model, not the user: {committed}"
+    );
+}
+
+#[test]
+fn the_users_own_steering_still_gets_the_user_band() {
+    let (mut app, mut daemon, (tx, rx)) = (app(), ScriptedDaemon::default(), wire());
+    tx.send(update(
+        r#"{"sessionUpdate":"steer","entryId":"e-9","text":"actually use fetch",
+            "at":"tool_boundary","source":"user"}"#,
+    ))
+    .expect("send");
+    // And a daemon that predates the field: absent reads as the user.
+    tx.send(update(
+        r#"{"sessionUpdate":"steer","entryId":"e-10","text":"and add a test",
+            "at":"tool_boundary"}"#,
+    ))
+    .expect("send");
+    press(&mut app, &mut daemon, &rx, b"");
+    let committed = scrollback(&mut app);
+    assert!(committed.contains("> actually use fetch"), "{committed}");
+    assert!(committed.contains("> and add a test"), "{committed}");
+    assert!(!committed.contains('⇄'), "{committed}");
+}
+
+#[test]
+fn a_replayed_hub_aside_is_not_replayed_as_the_users_words() {
+    let mut app = app();
+    let entries = serde_json::json!([
+        entry("e-1", serde_json::json!({ "type": "session", "name": "swarm" })),
+        entry("e-2", serde_json::json!({ "type": "message", "role": "user", "content": [
+            { "type": "text", "text": "[hub message from reviewer] found a leak in auth.ts\n(Reply with hub { op: \"send\", to: \"reviewer\", message: \"...\" }. This is another agent speaking, not the user.)" }
+        ]})),
+        entry("e-3", serde_json::json!({ "type": "message", "role": "user", "content": [
+            { "type": "text", "text": "fix it" }
+        ]})),
+    ]);
+    app.adopt_snapshot(&snapshot_of("swarm", entries));
+    let committed = scrollback(&mut app);
+    assert!(committed.contains("⇄ reviewer: found a leak in auth.ts"), "{committed}");
+    assert!(committed.contains("> fix it"), "{committed}");
+    assert!(!committed.contains("Reply with hub"), "{committed}");
+}
+
+/// A purge resize re-renders the transcript from *semantics* at the new width
+/// (DESIGN.md §1). The wave-3 rows have to be entries for that to work — a block
+/// of loose rows dropped into scrollback would come back at the old wrapping, or
+/// not at all.
+#[test]
+fn lifecycle_rows_and_hub_asides_survive_a_purge_resize_at_the_new_width() {
+    let (mut app, mut daemon, (tx, rx)) = (app(), ScriptedDaemon::default(), wire());
+    tx.send(agent(
+        r#"{"sessionUpdate":"agent","id":"spawn-1","peer":"activity-module","status":"running",
+            "event":"spawned","model":"opus-5"}"#,
+    ))
+    .expect("send");
+    tx.send(update(
+        r#"{"sessionUpdate":"steer","entryId":"e-9","text":"[hub message from reviewer] the parser tests pass now\n(Reply with hub { op: \"send\", to: \"reviewer\", message: \"...\" }. This is another agent speaking, not the user.)","at":"tool_boundary","source":"hub","from":"reviewer"}"#,
+    ))
+    .expect("send");
+    tx.send(agent(
+        r#"{"sessionUpdate":"agent","id":"spawn-1","peer":"activity-module","status":"failed",
+            "event":"failed","error":"the provider stopped answering"}"#,
+    ))
+    .expect("send");
+    // Settle the held-back run: a transition is not an entry until something
+    // that is not a transition arrives.
+    tx.send(update(
+        r#"{"sessionUpdate":"turn_end","turnId":"t1","status":"completed","durationMs":1,
+            "partialRetained":false}"#,
+    ))
+    .expect("send");
+    press(&mut app, &mut daemon, &rx, b"");
+    let _ = scrollback(&mut app);
+
+    for width in [40u16, 60, 100] {
+        app.set_width(width);
+        let rows = app.replay_rows(width, 2000);
+        let replayed = rows
+            .iter()
+            .map(Row::plain_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(replayed.contains("◎ spawned activity-module"), "{width}: {replayed}");
+        assert!(replayed.contains("✗ activity-module"), "{width}: {replayed}");
+        assert!(replayed.contains("⇄ reviewer:"), "{width}: {replayed}");
+        // Still another agent speaking, at every width.
+        assert!(!replayed.contains("> [hub"), "{width}: {replayed}");
+        for row in &rows {
+            assert!(row.width() <= usize::from(width), "{:?}", row.plain_text());
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The rewind rung: Esc Esc, /rewind, and the restore confirmation
+// ---------------------------------------------------------------------------
+
+/// A `checkpoint/list` answer with `count` anchored checkpoints, newest first.
+fn checkpoint_list(count: usize) -> serde_json::Value {
+    let checkpoints: Vec<serde_json::Value> = (0..count)
+        .map(|index| {
+            serde_json::json!({
+                "id": format!("c-{index}"),
+                "kind": if index == 0 { "turn_start" } else { "pre_tool" },
+                "label": format!("before step {index}"),
+                "createdAt": "2026-08-10T09:00:00.000Z",
+                "changedFiles": index + 1,
+                "entryId": format!("e-{index}"),
+                "excluded": [".lyra"],
+            })
+        })
+        .collect();
+    serde_json::json!({ "checkpoints": checkpoints, "available": true })
+}
+
+/// Answer whatever `checkpoint/list` is outstanding.
+fn answer_checkpoints(daemon: &mut ScriptedDaemon, value: serde_json::Value) {
+    let call = daemon
+        .sent
+        .iter()
+        .rev()
+        .find(|call| matches!(call, Call::Checkpoints { .. }))
+        .cloned()
+        .expect("a checkpoint/list went out");
+    daemon.answers.push(Reply {
+        call,
+        outcome: Ok(value),
+    });
+}
+
+#[test]
+fn the_rewind_rung_stays_out_of_the_ladder_until_there_is_something_to_go_back_to() {
+    let (mut app, mut daemon, (_tx, rx)) = (app(), ScriptedDaemon::default(), wire());
+    app.hydrate(&mut daemon);
+    press(&mut app, &mut daemon, &rx, b"");
+    assert!(!app.can_rewind(), "no checkpoints, no rung");
+    // …and its hint is off the hint line, which is the difference between an
+    // unimplemented feature and a lying one.
+    assert!(!live_text(&app).contains("rewind"), "{}", live_text(&app));
+
+    answer_checkpoints(&mut daemon, checkpoint_list(3));
+    press(&mut app, &mut daemon, &rx, b"");
+    assert!(app.can_rewind(), "the daemon reported three");
+}
+
+#[test]
+fn a_directory_that_cannot_hold_checkpoints_never_offers_the_rung() {
+    let (mut app, mut daemon, (_tx, rx)) = (app(), ScriptedDaemon::default(), wire());
+    app.hydrate(&mut daemon);
+    answer_checkpoints(
+        &mut daemon,
+        serde_json::json!({ "checkpoints": [], "available": false,
+                            "unavailable": "no git in PATH" }),
+    );
+    press(&mut app, &mut daemon, &rx, b"");
+    assert!(!app.can_rewind());
+    // And a background refresh that found nothing says nothing: there is
+    // nothing the user did, and nothing they can do.
+    assert_eq!(scrollback(&mut app).trim(), "");
+}
+
+#[test]
+fn esc_esc_opens_a_confirmation_offering_conversation_only_or_code_as_well() {
+    let (mut app, mut daemon, (_tx, rx)) = (app(), ScriptedDaemon::default(), wire());
+    app.hydrate(&mut daemon);
+    answer_checkpoints(&mut daemon, checkpoint_list(3));
+    press(&mut app, &mut daemon, &rx, b"");
+
+    // The ladder's last rung is armed, then confirmed — a deliberate second
+    // press, not a mash.
+    let first = Instant::now();
+    press_at(&mut app, &mut daemon, &rx, b"\x1b", first);
+    assert!(live_text(&app).contains("esc again to rewind"), "{}", live_text(&app));
+    press_at(&mut app, &mut daemon, &rx, b"\x1b", first + DELIBERATE);
+    // The list is re-fetched before anything destructive is offered.
+    answer_checkpoints(&mut daemon, checkpoint_list(3));
+    press(&mut app, &mut daemon, &rx, b"");
+
+    let panel = live_text(&app);
+    assert!(panel.contains("rewind to before step 0?"), "{panel}");
+    assert!(panel.contains("conversation only"), "{panel}");
+    assert!(panel.contains("conversation and code"), "{panel}");
+    assert!(panel.contains("cancel"), "{panel}");
+}
+
+#[test]
+fn conversation_only_moves_the_head_and_touches_no_file() {
+    let (mut app, mut daemon, (_tx, rx)) = (app(), ScriptedDaemon::default(), wire());
+    app.hydrate(&mut daemon);
+    answer_checkpoints(&mut daemon, checkpoint_list(2));
+    press(&mut app, &mut daemon, &rx, b"");
+    press(&mut app, &mut daemon, &rx, b"/rewind\r");
+    answer_checkpoints(&mut daemon, checkpoint_list(2));
+    press(&mut app, &mut daemon, &rx, b"");
+    // Choose the newest checkpoint, then the conversation-only row.
+    press(&mut app, &mut daemon, &rx, b"\r");
+    press(&mut app, &mut daemon, &rx, b"\r");
+
+    assert_eq!(
+        daemon.sent.last(),
+        Some(&Call::Rewind {
+            entry_id: Some("e-0".to_owned())
+        })
+    );
+    assert!(
+        !daemon.sent.iter().any(|call| matches!(call, Call::Restore { .. })),
+        "nothing on disk was touched"
+    );
+}
+
+#[test]
+fn conversation_and_code_rewinds_the_head_first_and_never_forces() {
+    let (mut app, mut daemon, (_tx, rx)) = (app(), ScriptedDaemon::default(), wire());
+    app.hydrate(&mut daemon);
+    answer_checkpoints(&mut daemon, checkpoint_list(2));
+    press(&mut app, &mut daemon, &rx, b"");
+    press(&mut app, &mut daemon, &rx, b"/rewind\r");
+    answer_checkpoints(&mut daemon, checkpoint_list(2));
+    press(&mut app, &mut daemon, &rx, b"");
+    press(&mut app, &mut daemon, &rx, b"\r");
+    // Second row: conversation and code.
+    press(&mut app, &mut daemon, &rx, b"\x1b[B\r");
+
+    let tail: Vec<&Call> = daemon.sent.iter().rev().take(2).collect();
+    assert_eq!(
+        tail,
+        vec![
+            &Call::Restore {
+                checkpoint: "c-0".to_owned(),
+                force: false
+            },
+            &Call::Rewind {
+                entry_id: Some("e-0".to_owned())
+            },
+        ],
+        "the head moves first, and the restore never forces"
+    );
+}
+
+#[test]
+fn a_restore_reports_what_it_did_not_do_and_only_then_offers_to_override_it() {
+    let (mut app, mut daemon, (_tx, rx)) = (app(), ScriptedDaemon::default(), wire());
+    app.hydrate(&mut daemon);
+    answer_checkpoints(&mut daemon, checkpoint_list(1));
+    press(&mut app, &mut daemon, &rx, b"");
+    press(&mut app, &mut daemon, &rx, b"/rewind\r");
+    answer_checkpoints(&mut daemon, checkpoint_list(1));
+    press(&mut app, &mut daemon, &rx, b"");
+    press(&mut app, &mut daemon, &rx, b"\r");
+    press(&mut app, &mut daemon, &rx, b"\x1b[B\r");
+
+    daemon.answers.push(Reply {
+        call: Call::Restore {
+            checkpoint: "c-0".to_owned(),
+            force: false,
+        },
+        outcome: Ok(serde_json::json!({
+            "target": { "id": "c-0", "kind": "turn_start", "label": "before step 0",
+                        "createdAt": "t", "changedFiles": 1, "excluded": [] },
+            "safety": { "id": "c-99", "kind": "pre_restore", "label": "before restore",
+                        "createdAt": "t", "changedFiles": 1, "excluded": [] },
+            "restored": ["src/auth.ts"],
+            "preserved": ["README.md", "build/out.js"],
+            "forced": false,
+            "excluded": [".lyra"]
+        })),
+    });
+    press(&mut app, &mut daemon, &rx, b"");
+
+    let committed = scrollback(&mut app);
+    assert!(committed.contains("restored 1 file"), "{committed}");
+    // The undo is named, or the restore should not have been offered.
+    assert!(committed.contains("/rollback c-99"), "{committed}");
+    // The never-clobber rule, by name rather than by count.
+    assert!(committed.contains("README.md"), "{committed}");
+    assert!(committed.contains("build/out.js"), "{committed}");
+    assert!(committed.contains(".lyra"), "the excluded set is named too: {committed}");
+
+    // And now — and *only* now — the override exists.
+    let panel = live_text(&app);
+    assert!(panel.contains("2 files left untouched"), "{panel}");
+    assert!(panel.contains("[ ] revert them too"), "{panel}");
+
+    // Ticking it, then confirming, is the one path that sends `force`.
+    press(&mut app, &mut daemon, &rx, b"\x1b[B\r");
+    assert!(live_text(&app).contains("[×] revert them too"));
+    press(&mut app, &mut daemon, &rx, b"\x1b[B\r");
+    assert_eq!(
+        daemon.sent.last(),
+        Some(&Call::Restore {
+            checkpoint: "c-0".to_owned(),
+            force: true
+        })
+    );
+}
+
+#[test]
+fn a_checkpoint_that_anchors_no_entry_offers_the_code_and_says_so() {
+    let (mut app, mut daemon, (_tx, rx)) = (app(), ScriptedDaemon::default(), wire());
+    app.hydrate(&mut daemon);
+    answer_checkpoints(
+        &mut daemon,
+        serde_json::json!({ "checkpoints": [
+            { "id": "c-0", "kind": "manual", "label": "by hand", "createdAt": "t",
+              "changedFiles": 2, "excluded": [] }
+        ], "available": true }),
+    );
+    press(&mut app, &mut daemon, &rx, b"");
+    press(&mut app, &mut daemon, &rx, b"/rewind\r");
+    answer_checkpoints(
+        &mut daemon,
+        serde_json::json!({ "checkpoints": [
+            { "id": "c-0", "kind": "manual", "label": "by hand", "createdAt": "t",
+              "changedFiles": 2, "excluded": [] }
+        ], "available": true }),
+    );
+    press(&mut app, &mut daemon, &rx, b"");
+    let picker = live_text(&app);
+    assert!(picker.contains("code only"), "the picker says so too: {picker}");
+    press(&mut app, &mut daemon, &rx, b"\r");
+    let panel = live_text(&app);
+    assert!(panel.contains("code only"), "{panel}");
+    assert!(!panel.contains("conversation"), "there is no entry to go back to: {panel}");
+    press(&mut app, &mut daemon, &rx, b"\r");
+    assert_eq!(
+        daemon.sent.last(),
+        Some(&Call::Restore {
+            checkpoint: "c-0".to_owned(),
+            force: false
+        })
+    );
+}
+
+#[test]
+fn a_rewind_says_how_many_messages_it_undid() {
+    let (mut app, mut daemon, (_tx, rx)) = (app(), ScriptedDaemon::default(), wire());
+    daemon.answers.push(Reply {
+        call: Call::Rewind {
+            entry_id: Some("e-2".to_owned()),
+        },
+        outcome: Ok(serde_json::json!({
+            "descriptor": { "sessionId": "s-1", "name": "n", "path": "/p", "headId": "e-2",
+                            "createdAt": "t" },
+            "entryId": "e-2", "removedMessages": 4
+        })),
+    });
+    press(&mut app, &mut daemon, &rx, b"");
+    assert!(scrollback(&mut app).contains("rewound · 4 messages undone"));
+}
+
+#[test]
+fn the_checkpoint_list_is_asked_for_again_at_every_turn_end() {
+    let (mut app, mut daemon, (tx, rx)) = (app(), ScriptedDaemon::default(), wire());
+    app.hydrate(&mut daemon);
+    daemon.sent.clear();
+    tx.send(update(
+        r#"{"sessionUpdate":"turn_end","turnId":"t1","status":"completed","durationMs":1,
+            "partialRetained":false}"#,
+    ))
+    .expect("send");
+    press(&mut app, &mut daemon, &rx, b"");
+    assert!(daemon
+        .sent
+        .iter()
+        .any(|call| matches!(call, Call::Checkpoints { why: Rewind::Refresh, .. })));
+}
+
+// ---------------------------------------------------------------------------
+// /checkpoints — a first-class resultKind, not a report
+// ---------------------------------------------------------------------------
+
+#[test]
+fn checkpoints_render_as_a_table_from_the_declared_result_kind() {
+    let (mut app, mut daemon, (_tx, rx)) = (app(), ScriptedDaemon::default(), wire());
+    let mut answer = checkpoint_list(3);
+    answer["resultKind"] = serde_json::json!("checkpoints");
+    daemon.answers.push(Reply {
+        call: Call::Command("/checkpoints".to_owned()),
+        outcome: Ok(serde_json::json!({
+            "command": "checkpoints", "resultKind": "checkpoints",
+            "output": answer,
+        })),
+    });
+    press(&mut app, &mut daemon, &rx, b"");
+    let committed = scrollback(&mut app);
+
+    // A table with a header, one row per checkpoint — not prose, not JSON.
+    assert!(committed.contains("id"), "{committed}");
+    assert!(committed.contains("label"), "{committed}");
+    assert!(committed.contains("changed files"), "{committed}");
+    for index in 0..3 {
+        assert!(committed.contains(&format!("c-{index}")), "{committed}");
+        assert!(
+            committed.contains(&format!("before step {index}")),
+            "{committed}"
+        );
+    }
+    assert!(!committed.contains("\":"), "no JSON reached the terminal: {committed}");
+}
+
+/// `available: false` is a different fact from an empty list, and the one the
+/// user can act on. "Never render nothing" means saying which it is.
+#[test]
+fn checkpoints_in_a_directory_that_cannot_hold_them_says_why() {
+    let (mut app, mut daemon, (_tx, rx)) = (app(), ScriptedDaemon::default(), wire());
+    daemon.answers.push(Reply {
+        call: Call::Command("/checkpoints".to_owned()),
+        outcome: Ok(serde_json::json!({
+            "command": "checkpoints", "resultKind": "checkpoints",
+            "output": { "checkpoints": [], "available": false,
+                        "unavailable": "no git in PATH" },
+        })),
+    });
+    press(&mut app, &mut daemon, &rx, b"");
+    assert!(scrollback(&mut app).contains("checkpoints unavailable · no git in PATH"));
+}
+
+/// The registry's declaration is enough: an answer that omits `resultKind`
+/// still reaches the table, because `session/commands` already named the shape.
+#[test]
+fn a_declared_result_kind_picks_the_renderer_when_the_answer_omits_it() {
+    let (mut app, mut daemon, (_tx, rx)) = (app(), ScriptedDaemon::default(), wire());
+    app.adopt_commands(&serde_json::json!({ "commands": [
+        { "name": "checkpoints", "description": "The rewind list.",
+          "resultKind": "checkpoints" }
+    ]}));
+    daemon.answers.push(Reply {
+        call: Call::Command("/checkpoints".to_owned()),
+        outcome: Ok(serde_json::json!({ "output": checkpoint_list(1) })),
+    });
+    press(&mut app, &mut daemon, &rx, b"");
+    let committed = scrollback(&mut app);
+    assert!(committed.contains("changed files"), "{committed}");
+    assert!(committed.contains("before step 0"), "{committed}");
+}
+
+// ---------------------------------------------------------------------------
+// /review
+// ---------------------------------------------------------------------------
+
+/// A `/review` answer with one text file and one binary.
+fn review_answer() -> serde_json::Value {
+    serde_json::json!({
+        "command": "review",
+        "resultKind": "review",
+        "output": {
+            "diff": {
+                "from": { "kind": "checkpoint", "id": "c-0", "label": "turn start" },
+                "to": { "kind": "worktree" },
+                "files": [
+                    { "path": "src/auth.ts", "status": "modified", "additions": 2,
+                      "deletions": 1, "binary": false,
+                      "patch": "--- a/src/auth.ts\n+++ b/src/auth.ts\n@@ -1,2 +1,3 @@\n context\n-old line\n+new line\n+added line\n" },
+                    { "path": "logo.png", "status": "added", "binary": true }
+                ],
+                "truncated": false,
+                "available": true
+            },
+            "agents": [
+                { "name": "activity-module", "path": "/tmp/w", "origin": "/repo",
+                  "state": "active", "mode": "worktree", "createdAt": "t", "updatedAt": "t",
+                  "integration": { "hint": ["git fetch /tmp/w activity-module"] } }
+            ]
+        }
+    })
+}
+
+#[test]
+fn review_renders_a_file_row_each_and_expands_the_last_one_with_tab() {
+    let (mut app, mut daemon, (_tx, rx)) = (app(), ScriptedDaemon::default(), wire());
+    daemon.answers.push(Reply {
+        call: Call::Command("/review".to_owned()),
+        outcome: Ok(review_answer()),
+    });
+    press(&mut app, &mut daemon, &rx, b"");
+    let committed = scrollback(&mut app);
+
+    // The summary line is composed from the numbers, not read off a prose field.
+    assert!(committed.contains("review · 2 files changed since turn start"), "{committed}");
+    // One collapsed row per path, in the transcript grammar.
+    assert!(committed.contains("▸ modified src/auth.ts"), "{committed}");
+    assert!(committed.contains("▸ added logo.png"), "{committed}");
+    assert!(committed.contains("+2"), "{committed}");
+    // The agent workspaces, with the exact command that integrates each one.
+    assert!(committed.contains("activity-module"), "{committed}");
+    assert!(committed.contains("git fetch /tmp/w activity-module"), "{committed}");
+    // No JSON reached the terminal.
+    assert!(!committed.contains("\":"), "{committed}");
+
+    // And `Tab` expands the last one, exactly as it expands the last tool call.
+    press(&mut app, &mut daemon, &rx, b"\t");
+    let expanded = scrollback(&mut app);
+    assert!(!expanded.trim().is_empty(), "Tab expanded nothing");
+}
+
+#[test]
+fn review_expands_a_patch_through_the_one_diff_renderer() {
+    let (mut app, mut daemon, (_tx, rx)) = (app(), ScriptedDaemon::default(), wire());
+    // One text file only, so `Tab` lands on the patch rather than on the binary.
+    let mut answer = review_answer();
+    answer["output"]["diff"]["files"] = serde_json::json!([
+        answer["output"]["diff"]["files"][0].clone()
+    ]);
+    daemon.answers.push(Reply {
+        call: Call::Command("/review".to_owned()),
+        outcome: Ok(answer),
+    });
+    press(&mut app, &mut daemon, &rx, b"");
+    let _ = scrollback(&mut app);
+    press(&mut app, &mut daemon, &rx, b"\t");
+    let expanded = scrollback(&mut app);
+    assert!(expanded.contains("new line"), "{expanded}");
+    assert!(expanded.contains("old line"), "{expanded}");
+}
+
+#[test]
+fn a_review_in_a_directory_without_checkpoints_says_why_instead_of_nothing() {
+    let (mut app, mut daemon, (_tx, rx)) = (app(), ScriptedDaemon::default(), wire());
+    daemon.answers.push(Reply {
+        call: Call::Command("/review".to_owned()),
+        outcome: Ok(serde_json::json!({
+            "command": "review", "resultKind": "review",
+            "output": { "diff": { "from": { "kind": "empty" }, "to": { "kind": "worktree" },
+                                  "files": [], "truncated": false, "available": false,
+                                  "unavailable": "no git in PATH" },
+                        "agents": [] }
+        })),
+    });
+    press(&mut app, &mut daemon, &rx, b"");
+    assert!(scrollback(&mut app).contains("review unavailable · no git in PATH"));
+}
+
+/// A restore's answer must never open a panel over a surface the user opened
+/// after asking for it.
+#[test]
+fn a_late_restore_answer_never_pops_a_panel_over_the_palette() {
+    let (mut app, mut daemon, (_tx, rx)) = (app(), ScriptedDaemon::default(), wire());
+    press(&mut app, &mut daemon, &rx, b"\x10");
+    daemon.answers.push(Reply {
+        call: Call::Restore {
+            checkpoint: "c-0".to_owned(),
+            force: false,
+        },
+        outcome: Ok(serde_json::json!({
+            "target": { "id": "c-0", "kind": "turn_start", "label": "before step 0",
+                        "createdAt": "t", "changedFiles": 1, "excluded": [] },
+            "safety": { "id": "c-99", "kind": "pre_restore", "label": "before restore",
+                        "createdAt": "t", "changedFiles": 1, "excluded": [] },
+            "restored": ["src/auth.ts"], "preserved": ["README.md"],
+            "forced": false, "excluded": []
+        })),
+    });
+    press(&mut app, &mut daemon, &rx, b"");
+    // The palette is still what is on screen…
+    assert!(live_text(&app).contains("commands"), "{}", live_text(&app));
+    // …and the override is named as the command it is, rather than as a modal.
+    let committed = scrollback(&mut app);
+    assert!(committed.contains("README.md"), "{committed}");
+    assert!(committed.contains("/rollback c-0 --force"), "{committed}");
+}

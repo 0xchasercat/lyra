@@ -30,6 +30,7 @@
 //!
 //! Colour comes from [`crate::theme`]; nothing here hard-codes an [`Rgb`].
 
+pub mod agent;
 pub mod composer;
 pub mod diff;
 pub mod footer;

@@ -293,16 +293,29 @@ fn ending<'a>(object: &'a Map<String, Value>, blocks: &'a [Value]) -> Option<&'a
 }
 
 /// A user turn. Prose becomes a band; a `[report]` line is an audit row this
-/// runtime wrote itself, not something the user typed; `tool_result` blocks
-/// render nothing, because they were already folded into their tool rows.
+/// runtime wrote itself, not something the user typed; a `[hub message from …]`
+/// line is another *agent* speaking and gets the aside row the live path gives
+/// it; `tool_result` blocks render nothing, because they were already folded
+/// into their tool rows.
+///
+/// The hub case is why this function reads the text rather than the role. A hub
+/// aside is persisted as a user-role message — that is the whole point of the
+/// design, so compaction and `/context` attribute it correctly — and a replay
+/// that trusted the role alone would put another agent's words in the user's
+/// band, which is exactly the misattribution the live path was fixed to avoid.
+/// A transcript written before hub asides existed simply never matches, so the
+/// absence costs nothing.
 fn user_rows(transcript: &mut Transcript, blocks: &[Value]) -> Vec<Row> {
     let text = text_of(blocks);
     if text.trim().is_empty() {
         return Vec::new();
     }
-    match text.strip_prefix("[report] ") {
-        Some(report) => transcript.audit(&one_line(report)),
-        None => transcript.user(text.trim_end()),
+    if let Some(report) = text.strip_prefix("[report] ") {
+        return transcript.audit(&one_line(report));
+    }
+    match crate::ui::agent::unwrap_aside(&text) {
+        (Some(from), body) => transcript.hub_aside(&from, &body),
+        (None, _) => transcript.user(text.trim_end()),
     }
 }
 

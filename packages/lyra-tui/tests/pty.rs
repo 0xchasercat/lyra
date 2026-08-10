@@ -62,13 +62,17 @@ fn the_real_binary_echoes_typing_and_turns_enter_into_a_prompt() {
             "entries": [],
             "provider": "fixture",
             "model": "fixture-model",
-            "workspace": "pty"
+            "workspace": "/tmp/lyra-pty-fixture",
+            "agents": []
         }),
     );
 
     // 3. The header proves the transcript reached scrollback through the real
     //    compositor and the real tty.
     harness.expect_screen("pty-fixture");
+    // …and its last field is the working directory, printed **verbatim**: a
+    // real path the user can `cd` into, not a workspace name (DESIGN.md §3).
+    harness.expect_screen("/tmp/lyra-pty-fixture");
     // The composer frame is the live region. Its border is the signature.
     harness.expect_screen("╭");
 
@@ -97,13 +101,31 @@ fn the_real_binary_echoes_typing_and_turns_enter_into_a_prompt() {
     );
     harness.expect_screen("the loop reads input first");
 
-    // 7. `/` opens the command popup on a real terminal. The scripted daemon
+    // 7. A spawned child reaches the presence strip: one dot, its peer name,
+    //    and a count for the ones still waiting. This is the only proof that the
+    //    strip survives the real compositor's live-region diffing — it is a
+    //    chrome row that appears mid-turn, which is exactly the case a
+    //    fixed-height region would have clipped off the top.
+    for update in [
+        r#"{"sessionUpdate":"agent","id":"spawn-1","peer":"activity-module",
+            "status":"running","model":"fixture-model"}"#,
+        r#"{"sessionUpdate":"agent","id":"spawn-2","peer":"qa-checker","status":"queued"}"#,
+    ] {
+        harness.notify(update);
+    }
+    // Asserted piecewise because the strip is styled: the dot and the name are
+    // separate spans with an SGR between them, which is exactly what a
+    // contiguous-substring assertion would miss.
+    harness.expect_screen("activity-module");
+    harness.expect_screen("○ 1 queued");
+
+    // 8. `/` opens the command popup on a real terminal. The scripted daemon
     //    never answers `session/commands`, so this is also the proof that the
     //    built-in list stands on its own: the popup must open either way.
     harness.type_bytes(b"/mod");
     harness.expect_screen("/model");
 
-    // 8. Closing the pipe is a clean exit, not a hang.
+    // 9. Closing the pipe is a clean exit, not a hang.
     harness.finish();
 }
 

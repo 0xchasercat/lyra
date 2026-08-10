@@ -517,6 +517,12 @@ pub struct SessionStore {
     reports: Vec<String>,
     errors: Vec<wire::ProviderError>,
     unknown: Vec<wire::UnknownUpdate>,
+    /// Live children, newest transition wins, in the order they were first seen.
+    agents: Vec<wire::AgentUpdate>,
+    /// Children the live stream has reported. Hydration fills only what is *not*
+    /// in here — the same "live wins" rule parts obey, for the same reason: a
+    /// snapshot fetched at attach can land after a transition that supersedes it.
+    live_agents: HashSet<String>,
     pending_steer: u64,
     descriptor: Option<wire::SessionDescriptor>,
     provider: Option<String>,
@@ -642,6 +648,28 @@ impl SessionStore {
     #[must_use]
     pub fn unknown_updates(&self) -> &[wire::UnknownUpdate] {
         &self.unknown
+    }
+
+    /// The children this session has spawned, each at its latest reported state,
+    /// in the order they were first seen.
+    ///
+    /// This is what the presence strip (`ui::agent`) draws and what the
+    /// lifecycle audit rows are diffed against. Spawn order is deliberate: a
+    /// strip whose dots reshuffled as children changed state would be unreadable
+    /// at exactly the moment it matters.
+    #[must_use]
+    pub fn agents(&self) -> &[wire::AgentUpdate] {
+        &self.agents
+    }
+
+    /// One child by spawn id.
+    ///
+    /// The caller that matters is the transcript's: it reads the state a child
+    /// was in *before* an update is applied, because "what changed" is what
+    /// earns an audit row and the update itself only carries "what it is now".
+    #[must_use]
+    pub fn agent(&self, id: &str) -> Option<&wire::AgentUpdate> {
+        self.agents.iter().find(|known| known.id == id)
     }
 
     /// The session the daemon says is active.
@@ -801,6 +829,12 @@ impl SessionStore {
                 self.api_type.clone_from(&changed.api_type);
             }
             wire::Update::SessionChanged(changed) => self.on_session_changed(changed),
+            // Upserted by spawn id, so a child appears once and its row moves
+            // through the lifecycle rather than accumulating one entry per step.
+            wire::Update::Agent(agent) => {
+                self.live_agents.insert(agent.id.clone());
+                self.upsert_agent(agent);
+            }
             wire::Update::Unknown(unknown) => self.unknown.push(unknown.clone()),
         }
     }
@@ -820,6 +854,15 @@ impl SessionStore {
     /// with a shape this crate controls.
     pub fn apply_snapshot_meta(&mut self, snapshot: &wire::SessionSnapshot) {
         self.descriptor = Some(snapshot.descriptor.clone());
+        // A client attaching mid-session gets its presence strip from hydration
+        // rather than waiting for the next transition — but a transition that
+        // has already arrived is newer than the snapshot that was in flight
+        // beside it, and wins.
+        for handle in &snapshot.agents {
+            if !self.live_agents.contains(&handle.id) {
+                self.upsert_agent(&handle.as_update());
+            }
+        }
         if !snapshot.provider.is_empty() {
             self.provider = Some(snapshot.provider.clone());
         }
@@ -909,6 +952,12 @@ impl SessionStore {
         self.pending_steer = 0;
         self.hydrated = false;
         self.next_seq = 0;
+        // The children belong to the transcript that was replaced. Dropping them
+        // rather than carrying them over is what makes the presence strip agree
+        // with the session on screen: the snapshot that follows re-hydrates
+        // whatever is genuinely still running.
+        self.agents.clear();
+        self.live_agents.clear();
     }
 
     // -- variant handlers --------------------------------------------------
@@ -1244,6 +1293,14 @@ impl SessionStore {
         }
         self.live_parts
             .insert((message_id.clone(), part_id.clone()));
+    }
+
+    /// Insert a child, or move the one already known to its new state.
+    fn upsert_agent(&mut self, agent: &wire::AgentUpdate) {
+        match self.agents.iter_mut().find(|known| known.id == agent.id) {
+            Some(known) => known.clone_from(agent),
+            None => self.agents.push(agent.clone()),
+        }
     }
 
     fn take_seq(&mut self) -> u64 {
@@ -1696,14 +1753,14 @@ mod tests {
         let mut store = SessionStore::new();
         apply(
             &mut store,
-            json!({"sessionUpdate":"report","message":"[git stage] 3 files"}),
+            json!({"sessionUpdate":"report","message":"[git preview] assembled 2026-08-05-1246 from 3 workspace(s)"}),
         );
         apply(
             &mut store,
             json!({"sessionUpdate":"error",
                    "error":{"classification":"auth","message":"token expired"}}),
         );
-        assert_eq!(store.reports(), ["[git stage] 3 files"]);
+        assert_eq!(store.reports(), ["[git preview] assembled 2026-08-05-1246 from 3 workspace(s)"]);
         assert_eq!(store.errors()[0].classification, wire::Classification::Auth);
     }
 

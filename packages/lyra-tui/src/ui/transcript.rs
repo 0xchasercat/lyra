@@ -33,6 +33,7 @@
 use std::collections::VecDeque;
 
 use crate::theme::Theme;
+use crate::ui::agent::{self, AgentEvent};
 use crate::ui::diff::{self, DiffOptions, FileDiff};
 use crate::ui::markdown::{self, MarkdownStream};
 use crate::ui::reliability::{self, Retry, TurnEnd};
@@ -61,6 +62,18 @@ pub enum Entry {
     },
     /// A collapsed run of reads and searches.
     ToolRun(Vec<ToolView>),
+    /// One child-agent lifecycle transition.
+    Agent(AgentEvent),
+    /// A collapsed run of them, so a swarm costs one row rather than twelve.
+    AgentRun(Vec<AgentEvent>),
+    /// A message from another agent on the bus, folded into this turn. Rendered
+    /// as what it is — never as a `>` user band.
+    HubAside {
+        /// The peer that sent it.
+        from: String,
+        /// What it said, with the daemon's envelope already peeled off.
+        text: String,
+    },
     /// A retry, at the attempt it had reached.
     Retry(Retry),
     /// A compaction boundary.
@@ -104,6 +117,10 @@ pub struct Transcript {
     stream: Option<MarkdownStream>,
     /// Survey calls held back so the run can collapse before committing.
     pending_run: Vec<ToolView>,
+    /// Child-agent transitions held back for the same reason. A separate buffer
+    /// because the two kinds do not collapse together: each flushes the other,
+    /// so at most one is ever non-empty and nothing is reordered.
+    pending_agents: Vec<AgentEvent>,
 }
 
 impl Transcript {
@@ -117,6 +134,7 @@ impl Transcript {
             entry_cap: DEFAULT_ENTRY_CAP,
             stream: None,
             pending_run: Vec::new(),
+            pending_agents: Vec::new(),
         }
     }
 
@@ -221,8 +239,9 @@ impl Transcript {
     /// collapse; everything else commits immediately.
     pub fn tool(&mut self, view: ToolView) -> Vec<Row> {
         if view.is_survey() {
+            let rows = self.flush_agents();
             self.pending_run.push(view);
-            return Vec::new();
+            return rows;
         }
         let mut rows = self.flush_run();
         rows.extend(self.close_stream());
@@ -309,6 +328,26 @@ impl Transcript {
             self.remember(entry);
         }
         rows
+    }
+
+    /// One child-agent lifecycle transition.
+    ///
+    /// Held back like a survey run: a fan-out of a dozen children arrives as a
+    /// dozen transitions in one burst, and a dozen rows about *starting* work is
+    /// scrollback spent on bookkeeping. The run settles into one collapsed line
+    /// the moment anything that is not a transition arrives.
+    pub fn agent(&mut self, event: AgentEvent) -> Vec<Row> {
+        let rows = self.flush_tools();
+        self.pending_agents.push(event);
+        rows
+    }
+
+    /// A hub aside — another agent speaking into this turn.
+    pub fn hub_aside(&mut self, from: &str, text: &str) -> Vec<Row> {
+        self.push(Entry::HubAside {
+            from: from.to_owned(),
+            text: text.to_owned(),
+        })
     }
 
     /// A dim audit line, remembered so a purge replays it with everything else.
@@ -402,10 +441,10 @@ impl Transcript {
         rows
     }
 
-    /// Rows for the survey run currently being held back.
+    /// Rows for whichever run is currently being held back.
     fn run_rows(&self) -> Vec<Row> {
         let refs: Vec<&ToolView> = self.pending_run.iter().collect();
-        match refs.len() {
+        let mut rows = match refs.len() {
             0 => Vec::new(),
             1 => {
                 let mut rows = vec![tool_row::collapsed(refs[0], &self.theme, self.width)];
@@ -415,10 +454,26 @@ impl Transcript {
             _ => tool_row::collapse_run(&refs, &self.theme, self.width)
                 .map(|row| vec![row])
                 .unwrap_or_default(),
+        };
+        if !self.pending_agents.is_empty() {
+            rows.extend(render_entry(
+                &agent_entry(self.pending_agents.clone()),
+                &self.theme,
+                self.width,
+            ));
         }
+        rows
     }
 
+    /// Settle both held-back runs. Called by every path that commits something
+    /// which is neither a survey call nor an agent transition.
     fn flush_run(&mut self) -> Vec<Row> {
+        let mut rows = self.flush_tools();
+        rows.extend(self.flush_agents());
+        rows
+    }
+
+    fn flush_tools(&mut self) -> Vec<Row> {
         if self.pending_run.is_empty() {
             return Vec::new();
         }
@@ -435,6 +490,24 @@ impl Transcript {
         self.remember(entry);
         rows
     }
+
+    fn flush_agents(&mut self) -> Vec<Row> {
+        if self.pending_agents.is_empty() {
+            return Vec::new();
+        }
+        let entry = agent_entry(std::mem::take(&mut self.pending_agents));
+        let rows = render_entry(&entry, &self.theme, self.width);
+        self.remember(entry);
+        rows
+    }
+}
+
+/// One transition is its own row; more than one collapses.
+fn agent_entry(mut events: Vec<AgentEvent>) -> Entry {
+    if events.len() == 1 {
+        return Entry::Agent(events.pop().expect("length checked"));
+    }
+    Entry::AgentRun(events)
 }
 
 fn expansion_rows(view: &ToolView, theme: &Theme, width: u16) -> Vec<Row> {
@@ -472,6 +545,16 @@ pub fn render_entry(entry: &Entry, theme: &Theme, width: u16) -> Vec<Row> {
                         .collect()
                 })
         }
+        Entry::Agent(event) => vec![agent::event_row(event, theme, width)],
+        Entry::AgentRun(events) => agent::collapse(events, theme, width)
+            .map(|row| vec![row])
+            .unwrap_or_else(|| {
+                events
+                    .iter()
+                    .map(|event| agent::event_row(event, theme, width))
+                    .collect()
+            }),
+        Entry::HubAside { from, text } => agent::hub_aside(from, text, theme, width),
         Entry::Retry(retry) => reliability::retry_rows(retry, theme),
         Entry::Compaction { delta, first_kept } => {
             vec![reliability::compaction_boundary(*delta, *first_kept, theme, width)]

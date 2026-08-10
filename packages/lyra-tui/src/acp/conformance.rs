@@ -29,12 +29,17 @@
 use serde_json::{json, Map, Value};
 
 use super::types::{
-    AddModelParams, AddModelResult, AddProviderParams, AddProviderResult, ApiType, CancelParams,
+    AddModelParams, AddModelResult, AddProviderParams, AddProviderResult, AgentState,
+    AgentTransition, ApiType,
+    CancelParams, CheckpointDiffResult, CheckpointKind, CheckpointListResult,
+    CheckpointRestoreResult,
     Classification, ConfigurableApiType, DeltaField, DetectProviderParams, DetectProviderResult,
     GetProviderParams, ModelSelection, ModelsResult, PauseKind, PromptParams, ProviderAuthSource,
     ProviderInfo, ProviderPersist, ProviderSetupOptions, ProvidersResult, RemoveProviderParams,
-    RemoveProviderResult, Secret, SelectModelParams, SelectProviderParams, SessionSnapshot,
-    SessionSummary, SteerDelivery, SteerParams, SteerResult, StopReason, ToolStatus, TurnStatus,
+    RemoveProviderResult, RestoreParams, RewindParams, RewindResult, Secret, SelectModelParams,
+    SelectProviderParams, SessionSnapshot,
+    SessionSummary, SteerDelivery, SteerParams, SteerResult, SteerSource, StopReason, ToolStatus,
+    TurnStatus,
     Update, UpdateNotification, VerifyProviderParams, VerifyProviderResult, WebsocketMode,
     UPDATE_TAGS,
 };
@@ -366,7 +371,8 @@ fn maximal_samples() -> Vec<(&'static str, Value)> {
         (
             "steer",
             json!({"sessionUpdate":"steer","entryId":"e-42",
-                   "text":"use the session helper instead","at":"tool_boundary"}),
+                   "text":"the parser tests pass now","at":"tool_boundary",
+                   "source":"hub","from":"reviewer"}),
         ),
         (
             "loop_warning",
@@ -389,7 +395,7 @@ fn maximal_samples() -> Vec<(&'static str, Value)> {
         ),
         (
             "report",
-            json!({"sessionUpdate":"report","message":"[git stage] 3 files"}),
+            json!({"sessionUpdate":"report","message":"[git preview] assembled 2026-08-05-1246 from 3 workspace(s)"}),
         ),
         (
             "model_changed",
@@ -402,6 +408,14 @@ fn maximal_samples() -> Vec<(&'static str, Value)> {
                    "descriptor":{"sessionId":"s-2","name":"purple-falcon",
                                  "path":"/tmp/purple-falcon.jsonl","headId":"e-51",
                                  "createdAt":"2026-08-09T10:00:00.000Z"}}),
+        ),
+        (
+            "agent",
+            json!({"sessionUpdate":"agent","id":"spawn-2","peer":"reviewer",
+                   "label":"reviewer","status":"awaiting_tool","event":"started",
+                   "model":"opus-5","depth":0,
+                   "workspace":"/home/dev/project","toolCalls":7,"filesModified":3,
+                   "error":"the provider stopped answering"}),
         ),
     ]
 }
@@ -461,6 +475,14 @@ fn minimal_samples() -> Vec<(&'static str, Value)> {
         (
             "model_changed",
             json!({"sessionUpdate":"model_changed","provider":"openai","model":"gpt-5"}),
+        ),
+        (
+            "steer",
+            json!({"sessionUpdate":"steer","entryId":"e-1","text":"stop","at":"turn_boundary"}),
+        ),
+        (
+            "agent",
+            json!({"sessionUpdate":"agent","id":"spawn-1","peer":"spawn-1","status":"queued"}),
         ),
     ]
 }
@@ -1422,6 +1444,259 @@ mod tests {
         );
     }
 
+    /// Every method this client can put on the wire is one the schema declares.
+    ///
+    /// The gap this closes is the one `session/rewind` fell into: a client can
+    /// name a method that does not exist and find out at runtime, one `-32601`
+    /// per gesture, with the failure surfacing as "the key did nothing". The
+    /// three that are *not* in `#/$defs/requests` are named here individually,
+    /// because each is a deliberate exception rather than an oversight.
+    #[test]
+    fn every_method_this_client_can_send_is_declared_by_the_schema() {
+        use crate::acp::types::method;
+        let schema = Schema::load();
+        let requests = schema.resolve("#/$defs/requests");
+        // The notification the daemon sends *us*, the JSON-RPC control frame,
+        // and the one request that travels daemon→client.
+        let exceptions = [
+            method::SESSION_UPDATE,
+            method::CANCEL_REQUEST,
+            method::SESSION_REQUEST_PERMISSION,
+        ];
+        for name in [
+            method::INITIALIZE,
+            method::SESSION_NEW,
+            method::SESSION_LOAD,
+            method::SESSION_LIST,
+            method::SESSION_SNAPSHOT,
+            method::SESSION_PROMPT,
+            method::SESSION_STEER,
+            method::SESSION_CANCEL,
+            method::SESSION_FORK,
+            method::SESSION_REWIND,
+            method::SESSION_COMMAND,
+            method::SESSION_COMMANDS,
+            method::SESSION_COMPLETE,
+            method::SESSION_MODELS,
+            method::SESSION_SELECT_MODEL,
+            method::SESSION_PROVIDERS,
+            method::SESSION_SELECT_PROVIDER,
+            method::PROVIDER_SETUP_OPTIONS,
+            method::PROVIDER_DETECT,
+            method::PROVIDER_VERIFY,
+            method::PROVIDER_ADD,
+            method::PROVIDER_GET,
+            method::PROVIDER_REMOVE,
+            method::MODEL_ADD,
+            method::CHECKPOINT_LIST,
+            method::CHECKPOINT_DIFF,
+            method::CHECKPOINT_RESTORE,
+            method::CONTEXT_INSPECT,
+        ] {
+            assert!(
+                requests.get(name).is_some(),
+                "{name} is a method this client sends and the schema does not declare"
+            );
+        }
+        for name in exceptions {
+            assert!(
+                requests.get(name).is_none(),
+                "{name} is declared as a client→daemon request now; move it out of the exceptions"
+            );
+        }
+    }
+
+    /// The rewind surface, both directions.
+    ///
+    /// Four methods and two command shapes, and the reason they are one test is
+    /// that they are one gesture: `Esc Esc` reads `checkpoint/list`, sends
+    /// `session/rewind` and `checkpoint/restore`, and renders what
+    /// `checkpointRestoreResult` says was *not* done. A drift in any of them
+    /// turns the one destructive surface in this client into a guess.
+    #[test]
+    fn the_rewind_documents_validate_both_ways() {
+        let schema = Schema::load();
+
+        // -- what this client sends ---------------------------------------
+        for (pointer, params) in [
+            (
+                "#/$defs/requests/checkpoint~1list/params",
+                json!({ "limit": 100 }),
+            ),
+            (
+                "#/$defs/requests/checkpoint~1restore/params",
+                serde_json::to_value(RestoreParams {
+                    checkpoint: "c-9".to_owned(),
+                    force: true,
+                })
+                .expect("restore params encode"),
+            ),
+            (
+                "#/$defs/requests/checkpoint~1restore/params",
+                serde_json::to_value(RestoreParams {
+                    checkpoint: "latest".to_owned(),
+                    force: false,
+                })
+                .expect("restore params encode"),
+            ),
+            (
+                "#/$defs/requests/session~1rewind/params",
+                serde_json::to_value(RewindParams {
+                    entry_id: Some("e-42".to_owned()),
+                })
+                .expect("rewind params encode"),
+            ),
+            (
+                "#/$defs/requests/session~1rewind/params",
+                serde_json::to_value(RewindParams::default()).expect("rewind params encode"),
+            ),
+        ] {
+            let errors = schema.validate(&params, pointer);
+            assert!(errors.is_empty(), "{pointer}: {}", errors.join("; "));
+        }
+        // A restore that is not forcing says nothing about forcing: the daemon's
+        // default is not to, and the flag is the one thing behind a confirmation.
+        let quiet = serde_json::to_string(&RestoreParams {
+            checkpoint: "c-1".to_owned(),
+            force: false,
+        })
+        .expect("encodes");
+        assert!(!quiet.contains("force"), "{quiet}");
+
+        // -- what this client decodes -------------------------------------
+        let checkpoint = json!({"id":"c-9","kind":"pre_tool","label":"before edit src/auth.ts",
+                                "createdAt":"2026-08-10T09:00:00.000Z","changedFiles":3,
+                                "entryId":"e-42","tool":"edit","callId":"call-1",
+                                "excluded":[".lyra","node_modules"]});
+        let listed = json!({"checkpoints":[checkpoint.clone()],"available":true});
+        assert!(schema
+            .validate(&listed, "#/$defs/requests/checkpoint~1list/result")
+            .is_empty());
+        // The same document is `/checkpoints`'s declared output, which is the
+        // whole argument for the kind: one shape, two ways to ask for it.
+        assert!(schema.validate(&listed, "#/$defs/checkpointsResult").is_empty());
+        let decoded: CheckpointListResult = serde_json::from_value(listed).expect("decodes");
+        assert_eq!(decoded.checkpoints[0].anchored(), Some("e-42"));
+        assert_eq!(decoded.checkpoints[0].kind, CheckpointKind::PreTool);
+        assert_eq!(decoded.checkpoints[0].title(), "before edit src/auth.ts");
+
+        // Unavailable is a different answer from empty, and the client renders
+        // the reason rather than an empty list that reads as "nothing yet".
+        let nowhere = json!({"checkpoints":[],"available":false,
+                             "unavailable":"no git in PATH"});
+        assert!(schema
+            .validate(&nowhere, "#/$defs/requests/checkpoint~1list/result")
+            .is_empty());
+        let decoded: CheckpointListResult = serde_json::from_value(nowhere).expect("decodes");
+        assert!(!decoded.available && decoded.unavailable.is_some());
+
+        let diff = json!({
+            "from":{"kind":"checkpoint","id":"c-9","label":"turn start",
+                    "createdAt":"2026-08-10T09:00:00.000Z"},
+            "to":{"kind":"worktree"},
+            "files":[{"path":"src/auth.ts","status":"modified","additions":12,"deletions":4,
+                      "binary":false,"patch":"--- a/src/auth.ts\n+++ b/src/auth.ts\n@@ -1 +1 @@\n-old\n+new\n",
+                      "patchTruncated":false},
+                     {"path":"logo.png","status":"added","binary":true},
+                     {"path":"src/new.ts","status":"renamed","oldPath":"src/old.ts",
+                      "additions":0,"deletions":0}],
+            "truncated":false,"available":true});
+        assert!(schema
+            .validate(&diff, "#/$defs/requests/checkpoint~1diff/result")
+            .is_empty());
+        let decoded: CheckpointDiffResult = serde_json::from_value(diff.clone()).expect("decodes");
+        assert_eq!(decoded.to.describe(), "the working tree");
+        assert!(decoded.files[1].binary && decoded.files[1].patch.is_none());
+        assert_eq!(decoded.files[2].old_path.as_deref(), Some("src/old.ts"));
+        // A binary file's counts are *absent*, never zero — the distinction the
+        // renderer needs to say "binary" instead of "+0 −0".
+        assert_eq!(decoded.files[1].additions, None);
+
+        // `/review` carries that same diff, so one renderer serves both.
+        let review = json!({"diff": diff, "agents": [
+            {"name":"activity-module","path":"/tmp/w","origin":"/repo","state":"active",
+             "mode":"worktree","createdAt":"t","updatedAt":"t",
+             "integration":{"hint":["git fetch /tmp/w"]}}]});
+        assert!(schema.validate(&review, "#/$defs/reviewResult").is_empty());
+
+        let restored = json!({
+            "target": checkpoint.clone(),
+            "safety": {"id":"c-10","kind":"pre_restore","label":"before restore",
+                       "createdAt":"2026-08-10T09:05:00.000Z","changedFiles":3,"excluded":[]},
+            "restored":["src/auth.ts"],"preserved":["README.md"],"forced":false,
+            "excluded":[".lyra"]});
+        assert!(schema
+            .validate(&restored, "#/$defs/requests/checkpoint~1restore/result")
+            .is_empty());
+        let decoded: CheckpointRestoreResult = serde_json::from_value(restored).expect("decodes");
+        assert_eq!(decoded.preserved, vec!["README.md".to_owned()]);
+        assert!(!decoded.forced);
+        // The undo, named. A restore a client cannot offer to undo is a restore
+        // it should not have offered to make.
+        assert_eq!(decoded.safety.id, "c-10");
+
+        let rewound = json!({"descriptor":{"sessionId":"s-1","name":"purple-falcon",
+                                           "path":"/tmp/a.jsonl","headId":"e-42",
+                                           "createdAt":"2026-08-09T10:00:00.000Z"},
+                             "entryId":"e-42","removedMessages":4});
+        assert!(schema
+            .validate(&rewound, "#/$defs/requests/session~1rewind/result")
+            .is_empty());
+        let decoded: RewindResult = serde_json::from_value(rewound).expect("decodes");
+        assert_eq!(decoded.removed_messages, Some(4));
+        assert_eq!(decoded.descriptor.head_id.as_deref(), Some("e-42"));
+        // Absent is "not counted", which the client renders as silence rather
+        // than as "nothing moved".
+        let uncounted: RewindResult = serde_json::from_value(
+            json!({"descriptor":{"sessionId":"s-1","name":"n","path":"/p","headId":"e-1",
+                                 "createdAt":"t"},"entryId":"e-1"}),
+        )
+        .expect("decodes");
+        assert_eq!(uncounted.removed_messages, None);
+    }
+
+    /// A snapshot's `agents`: the presence strip, hydrated.
+    #[test]
+    fn a_snapshot_carries_the_children_a_presence_strip_is_drawn_from() {
+        let schema = Schema::load();
+        let snapshot = json!({
+            "descriptor":{"sessionId":"s-1","name":"swarm","path":"/tmp/a.jsonl",
+                          "headId":"e-3","createdAt":"2026-08-09T10:00:00.000Z"},
+            "entries":[], "provider":"anthropic", "model":"opus-5",
+            "workspace":"/home/dev/project",
+            "usage":{"session":{"inputTokens":0,"outputTokens":0}},
+            "agents":[{"id":"spawn-1","peer":"activity-module","workspace":"/home/dev/project",
+                       "status":"awaiting_tool","startedAt":1_700_000_000_000_i64,
+                       "label":"activity","model":"gpt-5.6-terra","toolCalls":7,
+                       "filesModified":["src/a.ts","src/b.ts"]},
+                      {"id":"spawn-2","peer":"qa-checker","workspace":"/home/dev/project",
+                       "status":"timed_out","startedAt":1_700_000_000_000_i64,
+                       "error":"deadline expired"}]
+        });
+        let errors = schema.validate(&snapshot, "#/$defs/requests/session~1snapshot/result");
+        assert!(errors.is_empty(), "{}", errors.join("; "));
+        let decoded: SessionSnapshot = serde_json::from_value(snapshot).expect("decodes");
+        assert_eq!(decoded.agents.len(), 2);
+        // The handle knows paths and a transition knows a count; folding one
+        // into the other is a length, never an invented number.
+        let update = decoded.agents[0].as_update();
+        assert_eq!(update.files_modified, Some(2));
+        assert_eq!(update.peer, "activity-module");
+        assert_eq!(decoded.agents[1].status, AgentState::TimedOut);
+        // And the header's last field is a real path, printed as it arrived.
+        assert_eq!(decoded.workspace.as_deref(), Some("/home/dev/project"));
+
+        // A daemon that predates the field says nothing rather than "none".
+        let older: SessionSnapshot = serde_json::from_value(json!({
+            "descriptor":{"sessionId":"s-1","name":"n","path":"/p","headId":"e-1",
+                          "createdAt":"t"},
+            "entries":[], "provider":"p", "model":"m",
+            "usage":{"session":{"inputTokens":0,"outputTokens":0}}
+        }))
+        .expect("decodes");
+        assert!(older.agents.is_empty());
+    }
+
     /// Every shape the daemon can name has a renderer that is not a JSON dump.
     #[test]
     fn every_declared_command_result_kind_has_a_renderer() {
@@ -1476,6 +1751,9 @@ mod tests {
             ("configurableApiType", |value| {
                 !decodes_to::<ConfigurableApiType>(value).is_unknown()
             }),
+            ("agentState", |value| {
+                !decodes_to::<AgentState>(value).is_unknown()
+            }),
         ];
         for (name, modelled) in cases {
             let declared = schema.resolve(&format!("#/$defs/{name}"))["enum"]
@@ -1489,6 +1767,89 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The enums the schema declares **inline**, on a variant of the update
+    /// union rather than under `$defs`.
+    ///
+    /// [`every_declared_enum_value_maps_onto_a_modelled_variant`] resolves
+    /// `#/$defs/<name>` and therefore cannot see these, which is exactly how
+    /// `steer.source` and `agent.event` — both wave-3 fields, both closed string
+    /// enums, both load-bearing for who or what a row is about — got a modelled
+    /// type with no tripwire on it.
+    #[test]
+    fn every_inline_enum_on_the_update_union_maps_onto_a_modelled_variant() {
+        let schema = Schema::load();
+        /// A variant title, one of its properties, and the predicate saying
+        /// whether `acp::types` models a value of it.
+        type InlineCase = (&'static str, &'static str, fn(&str) -> bool);
+        let cases: Vec<InlineCase> = vec![
+            ("steer", "source", |value| {
+                !decodes_to::<SteerSource>(value).is_unknown()
+            }),
+            ("agent", "event", |value| {
+                !decodes_to::<AgentTransition>(value).is_unknown()
+            }),
+        ];
+        for (title, property, modelled) in cases {
+            let branch = schema.resolve("#/$defs/update")["oneOf"]
+                .as_array()
+                .expect("the update union is a oneOf")
+                .iter()
+                .find(|branch| branch["title"].as_str() == Some(title))
+                .unwrap_or_else(|| panic!("no variant titled {title}"))
+                .clone();
+            let declared = branch["properties"][property]["enum"]
+                .as_array()
+                .unwrap_or_else(|| {
+                    panic!("{title}.{property} is no longer an inline enum — move it to a $def")
+                })
+                .clone();
+            assert!(!declared.is_empty(), "{title}.{property} declares nothing");
+            for value in declared.iter().filter_map(Value::as_str) {
+                assert!(
+                    modelled(value),
+                    "{title}.{property} declares {value} but acp::types does not model it"
+                );
+            }
+        }
+    }
+
+    /// A revival is a transition the *state* cannot express.
+    ///
+    /// `started` and `revived` both leave a child `running`, so a client reading
+    /// only `status` sees one thing where the daemon said two. This is the
+    /// tripwire on the field that fixes it: the sample validates, decodes, and
+    /// round-trips, and a daemon that predates the field still decodes to
+    /// `None` rather than to a fabricated transition.
+    #[test]
+    fn an_agent_update_carries_the_transition_the_status_cannot_express() {
+        let schema = Schema::load();
+        for transition in ["spawned", "started", "completed", "failed", "cancelled",
+                           "timed_out", "revived"] {
+            let sample = json!({"sessionUpdate":"agent","id":"spawn-1","peer":"activity-module",
+                                "status":"running","event":transition});
+            let errors = schema.validate(&sample, "#/$defs/update");
+            assert!(errors.is_empty(), "{transition}: {}", errors.join("; "));
+            let decoded = Update::from_json(sample.clone());
+            let Update::Agent(agent) = &decoded else {
+                panic!("{transition} decoded to {decoded:?} rather than an agent update");
+            };
+            assert!(
+                agent.event.as_ref().is_some_and(|event| !event.is_unknown()),
+                "{transition} is not modelled"
+            );
+            assert_eq!(decoded.to_json(), sample, "{transition} lost something");
+        }
+
+        // And the daemon that predates the field: absent stays absent, so
+        // nothing downstream can mistake a silence for a declared `started`.
+        let older = json!({"sessionUpdate":"agent","id":"spawn-1","peer":"p","status":"running"});
+        let Update::Agent(agent) = Update::from_json(older.clone()) else {
+            panic!("an agent update without `event` must still decode");
+        };
+        assert_eq!(agent.event, None);
+        assert_eq!(Update::from_json(older.clone()).to_json(), older);
     }
 
     fn decodes_to<T: serde::de::DeserializeOwned>(value: &str) -> T {

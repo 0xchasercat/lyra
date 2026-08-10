@@ -39,6 +39,8 @@ use serde_json::{Map, Value};
 use unicode_width::UnicodeWidthStr;
 
 use crate::theme::Theme;
+use crate::ui::diff::FileDiff;
+use crate::ui::tool_row::{self, ToolStatus, ToolView};
 use crate::ui::{markdown, Row, Span};
 
 /// Left margin every result row shares with the transcript grammar.
@@ -49,7 +51,7 @@ const INDENT: &str = "  ";
 /// Kept in step with `#/$defs/commandResultKind` by a conformance test: a kind
 /// the daemon can send and this list does not name would render as a key/value
 /// tree, which is legible but is not the table it deserves.
-pub const KINDS: [&str; 9] = [
+pub const KINDS: [&str; 11] = [
     "models",
     "sessions",
     "workspaces",
@@ -58,6 +60,8 @@ pub const KINDS: [&str; 9] = [
     "context",
     "skills",
     "mcp",
+    "checkpoints",
+    "review",
     "report",
 ];
 
@@ -120,12 +124,30 @@ pub fn render(
             &["workspaces"],
             &["name", "state", "mode", "origin", "task", "degradedReason", "path"],
         ),
+        // The `agentHandle` vocabulary, in the order a reader needs it: who it
+        // is on the bus, what state it is in — `queued`/`awaiting_tool`/
+        // `timed_out`/`cancelled` are distinct answers now, and telling them
+        // apart is the whole reason `/agents` exists — then what it has done.
+        // `filesModified`, `writeScope` and `scopeViolations` are arrays and get
+        // no column at all: a table cell is a scalar (see [`columns`]), and the
+        // paths belong to the child's own result.
         Some("agents") => table(
             theme,
             width,
             payload,
             &["agents"],
-            &["id", "label", "status", "workspace"],
+            &[
+                "id",
+                "peer",
+                "label",
+                "status",
+                "model",
+                "toolCalls",
+                "currentTool",
+                "elapsedMs",
+                "error",
+                "workspace",
+            ],
         ),
         Some("skills") => table(
             theme,
@@ -143,6 +165,8 @@ pub fn render(
         ),
         Some("health") => Some(pairs(theme, width, payload)),
         Some("context") => Some(context(theme, width, payload)),
+        Some("checkpoints") => Some(checkpoints(theme, width, payload)),
+        Some("review") => Some(review(theme, width, payload)),
         _ => None,
     }
     .unwrap_or_else(|| open(theme, width, payload));
@@ -278,13 +302,22 @@ fn columns(objects: &[&Map<String, Value>], preferred: &[&str]) -> Vec<String> {
         .collect();
     for object in objects {
         for key in object.keys() {
-            if key != "resultKind" && usable(key) && !columns.contains(key) {
+            if !NEVER_A_COLUMN.contains(&key.as_str()) && usable(key) && !columns.contains(key) {
                 columns.push(key.clone());
             }
         }
     }
     columns
 }
+
+/// Scalar fields that are nonetheless not table cells.
+///
+/// `resultKind` is the envelope's, not a row's. `partialOutput` is the tail of
+/// what a child has *said* — prose, often several lines of it — and a column is
+/// one line by construction, so putting it in one would truncate the answer to
+/// its first few words while making every other column unreadable. A caller who
+/// wants it has `/agents <id>` and the child's own result.
+const NEVER_A_COLUMN: [&str; 2] = ["resultKind", "partialOutput"];
 
 /// Pad every cell but the last, and stop at the width.
 fn lay_out(cells: &[String], widths: &[usize], budget: usize) -> String {
@@ -417,6 +450,244 @@ fn breakdown_rows(theme: &Theme, entries: &[(String, i64)]) -> Vec<Row> {
             }
         })
         .collect()
+}
+
+// ---------------------------------------------------------------------------
+// The rewind surface
+// ---------------------------------------------------------------------------
+
+/// `checkpointsResult`: the recorded states of the working directory.
+///
+/// `available: false` is the load-bearing case. An empty list in a directory
+/// that *cannot* host a checkpoint repository at all reads as "nothing has
+/// happened yet", which is a different and wrong thing, so the reason is
+/// rendered instead of the table.
+fn checkpoints(theme: &Theme, width: u16, payload: &Value) -> Vec<Row> {
+    if payload.get("available").and_then(Value::as_bool) == Some(false) {
+        let reason = string_at(payload, "unavailable")
+            .unwrap_or_else(|| "this directory cannot hold checkpoints".to_owned());
+        return vec![Row::styled(
+            clip(
+                &format!("{INDENT}checkpoints unavailable · {reason}"),
+                width as usize,
+            ),
+            theme.warning(),
+        )];
+    }
+    table(
+        theme,
+        width,
+        payload,
+        &["checkpoints"],
+        &["id", "kind", "label", "changedFiles", "createdAt", "entryId", "tool"],
+    )
+    .unwrap_or_else(|| open(theme, width, payload))
+}
+
+/// One changed path of a `/review`, as the transcript's collapsed tool row.
+///
+/// A review row **is** a tool row: `▸ modified src/auth.ts +12 −4` is DESIGN.md
+/// §3's collapsed grammar exactly, and the patch under it is the same
+/// [`crate::ui::diff`] render an `edit` result gets. Building a [`ToolView`] is
+/// therefore not a trick — it is the one presentation model this TUI has for
+/// "something happened to a file", and reusing it is what makes `Tab` expand a
+/// review row the way it expands everything else.
+#[must_use]
+pub fn review_files(payload: &Value) -> Vec<ToolView> {
+    let Some(files) = payload
+        .get("diff")
+        .and_then(|diff| diff.get("files"))
+        .and_then(Value::as_array)
+    else {
+        return Vec::new();
+    };
+    files
+        .iter()
+        .filter_map(|file| {
+            let path = string_at(file, "path")?;
+            let status = string_at(file, "status").unwrap_or_else(|| "changed".to_owned());
+            // A binary file has no patch and no counts by contract; saying so
+            // beats a row that claims a zero-line change.
+            let binary = file.get("binary").and_then(Value::as_bool) == Some(true);
+            let diff = file
+                .get("patch")
+                .and_then(Value::as_str)
+                .filter(|patch| !patch.trim().is_empty())
+                .map(|patch| FileDiff::from_unified(path.clone(), patch));
+            let truncated = file.get("patchTruncated").and_then(Value::as_bool) == Some(true);
+            let mut output = Vec::new();
+            if let Some(old) = string_at(file, "oldPath") {
+                output.push(format!("from {old}"));
+            }
+            if binary {
+                output.push("binary".to_owned());
+            }
+            // The collapsed row's `+A −B` is derived from the patch it is about
+            // to show, so it agrees with what is on screen. When there is no
+            // patch — a binary file — or only a prefix of one, the daemon's own
+            // measurement is the honest number and it is carried here instead of
+            // being silently replaced by a count of the prefix.
+            if diff.is_none() || truncated {
+                let counts = ["additions", "deletions"]
+                    .iter()
+                    .zip(['+', '−'])
+                    .filter_map(|(key, sign)| {
+                        let count = file.get(*key)?.as_u64()?;
+                        Some(format!("{sign}{count}"))
+                    })
+                    .collect::<Vec<_>>();
+                if !counts.is_empty() {
+                    output.push(counts.join(" "));
+                }
+            }
+            if truncated {
+                output.push("patch truncated".to_owned());
+            }
+            Some(ToolView {
+                id: path.clone(),
+                name: status.replace('_', " "),
+                target: Some(path.clone()),
+                // Nothing here failed: a review reports what a finished turn
+                // did, so every row is a settled fact.
+                status: ToolStatus::Succeeded,
+                diff,
+                output: (!output.is_empty()).then(|| output.join(" · ")),
+                exit_code: None,
+                files_modified: vec![path],
+                interrupted: false,
+            })
+        })
+        .collect()
+}
+
+/// The line above a `/review`'s file rows, and the one below it.
+///
+/// Composed here from the raw numbers rather than read off a prose field: the
+/// daemon ships `files.len()`, `truncated` and the two endpoints, and DESIGN.md
+/// §2 says the sentence is the client's to write.
+#[must_use]
+pub fn review_summary(theme: &Theme, width: u16, payload: &Value) -> Vec<Row> {
+    let diff = payload.get("diff");
+    let available = diff
+        .and_then(|diff| diff.get("available"))
+        .and_then(Value::as_bool)
+        != Some(false);
+    if !available {
+        let reason = diff
+            .and_then(|diff| string_at(diff, "unavailable"))
+            .unwrap_or_else(|| "this directory cannot hold checkpoints".to_owned());
+        return vec![Row::styled(
+            clip(&format!("{INDENT}review unavailable · {reason}"), width as usize),
+            theme.warning(),
+        )];
+    }
+    let files = diff
+        .and_then(|diff| diff.get("files"))
+        .and_then(Value::as_array)
+        .map_or(0, Vec::len);
+    let since = diff
+        .and_then(|diff| diff.get("from"))
+        .map_or_else(|| "the last checkpoint".to_owned(), endpoint_label);
+    let mut text = if files == 0 {
+        format!("review · nothing has changed since {since}")
+    } else {
+        format!(
+            "review · {files} {} changed since {since}",
+            if files == 1 { "file" } else { "files" }
+        )
+    };
+    if diff
+        .and_then(|diff| diff.get("truncated"))
+        .and_then(Value::as_bool)
+        == Some(true)
+    {
+        text.push_str(" · more files changed than this listing carries");
+    }
+    vec![Row::styled(
+        clip(&format!("{INDENT}{text}"), width as usize),
+        theme.faint(),
+    )]
+}
+
+/// The agent workspaces a `/review` found still holding work.
+///
+/// Their integration hints come from the git pipeline and are carried verbatim:
+/// they are commands the user can run, and a client that paraphrased a command
+/// would be inventing one.
+#[must_use]
+pub fn review_agents(theme: &Theme, width: u16, payload: &Value) -> Vec<Row> {
+    let Some(agents) = payload.get("agents").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    if agents.is_empty() {
+        return Vec::new();
+    }
+    let mut rows = vec![Row::styled(
+        format!(
+            "{INDENT}{} agent {} holding work",
+            agents.len(),
+            if agents.len() == 1 {
+                "workspace"
+            } else {
+                "workspaces"
+            }
+        ),
+        theme.faint(),
+    )];
+    for agent in agents {
+        let name = string_at(agent, "name").unwrap_or_default();
+        let state = string_at(agent, "state").unwrap_or_default();
+        rows.push(Row {
+            spans: vec![
+                Span::new(format!("{INDENT}  ◆ "), theme.agent()),
+                Span::new(
+                    clip(
+                        format!("{name} · {state}").trim_end_matches(" · "),
+                        (width as usize).saturating_sub(INDENT.len() + 4),
+                    ),
+                    theme.muted(),
+                ),
+            ],
+        });
+        let hints = agent
+            .get("integration")
+            .and_then(|integration| integration.get("hint"))
+            .and_then(Value::as_array);
+        for hint in hints.into_iter().flatten().filter_map(Value::as_str) {
+            rows.push(Row::styled(
+                clip(&format!("{INDENT}    {hint}"), width as usize),
+                theme.faint(),
+            ));
+        }
+    }
+    rows
+}
+
+/// `reviewResult`, whole, for a caller with nowhere to put an expandable row.
+///
+/// [`crate::app::App`] takes the other path — it commits the file rows as
+/// transcript entries so `Tab` expands the last one — and both paths draw the
+/// same row through [`tool_row::collapsed`], so there is one grammar and not
+/// two.
+fn review(theme: &Theme, width: u16, payload: &Value) -> Vec<Row> {
+    let mut rows = review_summary(theme, width, payload);
+    for view in review_files(payload) {
+        rows.push(tool_row::collapsed(&view, theme, width));
+        rows.extend(tool_row::children(&view, theme, width));
+    }
+    rows.extend(review_agents(theme, width, payload));
+    rows
+}
+
+/// How a diff endpoint reads in the summary line.
+fn endpoint_label(endpoint: &Value) -> String {
+    match endpoint.get("kind").and_then(Value::as_str) {
+        Some("worktree") => "the working tree".to_owned(),
+        Some("empty") => "the start of this session".to_owned(),
+        _ => string_at(endpoint, "label")
+            .or_else(|| string_at(endpoint, "id"))
+            .unwrap_or_else(|| "the last checkpoint".to_owned()),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -738,6 +1009,129 @@ mod tests {
             );
             assert_eq!(aliased, text, "{kind}Result must not be a different renderer");
         }
+    }
+
+    /// `/agents` was reshaped in wave 2: the columns are the `agentHandle`
+    /// vocabulary now, and the state words are the ones that tell a child three
+    /// tool calls in from one whose provider never answered.
+    #[test]
+    fn agents_renders_the_reshaped_vocabulary_and_never_a_wall_of_prose() {
+        let text = drawn(
+            &json!({ "resultKind": "agents", "output": { "agents": [
+                { "id": "spawn-1", "peer": "activity-module", "label": "activity",
+                  "workspace": "/tmp/w", "status": "awaiting_tool", "startedAt": 0,
+                  "model": "gpt-5.6-terra", "toolCalls": 7, "currentTool": "edit",
+                  "filesModified": ["src/a.ts", "src/b.ts"],
+                  "writeScope": ["src/**"],
+                  "partialOutput": "I have read the file and\nam about to change it",
+                  "isolated": false, "depth": 0, "resultAvailable": false },
+                { "id": "spawn-2", "peer": "qa-checker", "workspace": "/tmp/w",
+                  "status": "timed_out", "startedAt": 0, "error": "deadline expired" }
+            ]}}),
+            None,
+        );
+        assert_no_json(&text);
+        assert!(text.contains("peer"), "{text}");
+        assert!(text.contains("activity-module"), "{text}");
+        // The state words are the protocol's own, verbatim: they are what the
+        // docs say and what a reader will search for, and a cell is data rather
+        // than prose (only the header row is re-worded).
+        assert!(text.contains("awaiting_tool"), "the state vocabulary: {text}");
+        assert!(text.contains("timed_out"), "a deadline, not a decision: {text}");
+        assert!(text.contains("tool calls"), "{text}");
+        // The failure reason is a column, not something the reader has to go
+        // looking for — at a width that has room for it.
+        let wide = render(&Theme::lyra(), 180, "/agents", Some("agents"), &json!({
+            "resultKind": "agents", "output": { "agents": [
+                { "id": "spawn-2", "peer": "qa-checker", "workspace": "/tmp/w",
+                  "status": "timed_out", "startedAt": 0, "error": "deadline expired" }
+            ]}}))
+            .iter()
+            .map(Row::plain_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(wide.contains("deadline expired"), "{wide}");
+        // The paths belong to the child's result, and a cell is a scalar.
+        assert!(!text.contains("src/a.ts"), "{text}");
+        // And the tail of what a child has *said* is prose, not a column.
+        assert!(!text.contains("am about to change it"), "{text}");
+    }
+
+    #[test]
+    fn checkpoints_renders_as_a_table_and_says_when_there_can_be_none() {
+        let text = drawn(
+            &json!({ "resultKind": "checkpoints", "output": { "available": true,
+                "checkpoints": [
+                    { "id": "c-1", "kind": "pre_tool", "label": "before edit src/auth.ts",
+                      "createdAt": "2026-08-10T09:00:00.000Z", "changedFiles": 3,
+                      "entryId": "e-42", "tool": "edit", "excluded": [".lyra"] }
+                ]}}),
+            None,
+        );
+        assert_no_json(&text);
+        assert!(text.contains("before edit src/auth.ts"), "{text}");
+        assert!(text.contains("pre_tool"), "{text}");
+        assert!(text.contains("e-42"), "the transcript anchor: {text}");
+
+        // Unavailable is a different answer from empty, and the reason is what
+        // stops an empty list from reading as "nothing has happened yet".
+        let nowhere = drawn(
+            &json!({ "resultKind": "checkpoints",
+                     "output": { "checkpoints": [], "available": false,
+                                 "unavailable": "no git in PATH" } }),
+            None,
+        );
+        assert!(nowhere.contains("checkpoints unavailable · no git in PATH"), "{nowhere}");
+    }
+
+    #[test]
+    fn review_is_a_summary_line_a_row_per_file_and_the_workspaces_still_holding_work() {
+        let value = json!({ "resultKind": "review", "output": {
+            "diff": {
+                "from": { "kind": "checkpoint", "id": "c-0", "label": "turn start" },
+                "to": { "kind": "worktree" },
+                "files": [
+                    { "path": "src/auth.ts", "status": "modified", "additions": 12,
+                      "deletions": 4, "binary": false,
+                      "patch": "--- a/src/auth.ts\n+++ b/src/auth.ts\n@@ -1 +1 @@\n-old\n+new\n" },
+                    { "path": "logo.png", "status": "added", "binary": true },
+                    { "path": "src/new.ts", "status": "renamed", "oldPath": "src/old.ts" }
+                ],
+                "truncated": true, "available": true },
+            "agents": [ { "name": "activity-module", "path": "/tmp/w", "state": "active",
+                          "integration": { "hint": ["git fetch /tmp/w activity-module"] } } ]
+        }});
+        let text = drawn(&value, None);
+        assert_no_json(&text);
+        assert!(text.contains("review · 3 files changed since turn start"), "{text}");
+        assert!(text.contains("more files changed than this listing carries"), "{text}");
+        assert!(text.contains("▸ modified src/auth.ts"), "{text}");
+        assert!(text.contains("▸ added logo.png"), "{text}");
+        assert!(text.contains("binary"), "a binary file says so: {text}");
+        assert!(text.contains("from src/old.ts"), "a rename names where it came from: {text}");
+        assert!(text.contains("git fetch /tmp/w activity-module"), "{text}");
+
+        // The file views are the transcript's collapsed grammar, and none of
+        // them is a survey call — a review's rows must not be held back waiting
+        // for a run that will never form.
+        let views = review_files(&value["output"]);
+        assert_eq!(views.len(), 3);
+        assert!(views.iter().all(|view| !view.is_survey()), "held back forever");
+        assert!(views[0].diff.is_some(), "the patch is parsed, not printed");
+        assert!(views[1].diff.is_none(), "a binary file carries none");
+    }
+
+    #[test]
+    fn a_review_with_nothing_in_it_says_so_rather_than_rendering_nothing() {
+        let text = drawn(
+            &json!({ "resultKind": "review", "output": {
+                "diff": { "from": { "kind": "checkpoint", "label": "turn start" },
+                          "to": { "kind": "worktree" }, "files": [],
+                          "truncated": false, "available": true },
+                "agents": [] }}),
+            None,
+        );
+        assert!(text.contains("nothing has changed since turn start"), "{text}");
     }
 
     #[test]

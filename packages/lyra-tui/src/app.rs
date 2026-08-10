@@ -33,7 +33,8 @@
 //!   with the daemon's `session/commands`, so one declaration is reachable by
 //!   key, by palette and by `/name` (DESIGN.md §4's "no drift").
 //! - **`?` cheatsheet** — generated from the keymap, never hand-written.
-//! - **Pickers** — `/model`, `/provider`, `/sessions` and `/theme` open a select
+//! - **Pickers** — `/model`, `/provider`, `/sessions`, `/theme` and `/rewind`
+//!   open a select
 //!   overlay instead of going to the daemon's router, because a list you can
 //!   arrow through beats a list you have to retype an argument from. `/model` is
 //!   the **switching** surface and spans every configured provider: its rows are
@@ -55,13 +56,19 @@
 //!   switches. See the `setup` submodule.
 //! - **`/model add`** — the same form machinery, two fields, for an endpoint
 //!   that cannot list its own models.
+//! - **The rewind surface** — the `Esc Esc` rung, `/rewind`'s checkpoint picker,
+//!   and the confirmation both of them open. Rewinding *what was said* and
+//!   reverting *what was written* are two calls (`session/rewind` and
+//!   `checkpoint/restore`) because they are two decisions, and the confirmation
+//!   asks which. The never-clobber rule is the reason the flow has two steps:
+//!   a restore reports the files it declined to touch, and only *then* does a
+//!   `--force` row exist — this client never offers to override a rule that has
+//!   not yet said no. [`EscWorld::can_rewind`] is answered from a cached
+//!   `checkpoint/list` (refreshed at attach and at every turn end) so the `Esc`
+//!   hint never waits on a round trip and never lies for one.
 //!
 //! # What is deliberately still stubbed
 //!
-//! - **Rewind.** The protocol has `session/fork` but no rewind, so
-//!   [`EscWorld::can_rewind`] answers `false`, the ladder's last rung is
-//!   unreachable and its hint never appears. The rung stays in the ladder
-//!   because the ladder is the documented order, not because it fires.
 //! - **`!` bash mode.** The composer's mode is real — the border flips and the
 //!   band echoes `! cmd` — but the protocol has no exec surface, so the command
 //!   goes out as an ordinary `session/prompt` and the agent's own `bash` tool
@@ -131,6 +138,23 @@ const POPUP_ROWS: usize = 6;
 
 /// Content rows an overlay may claim.
 const OVERLAY_ROWS: usize = 12;
+
+/// How many checkpoints one `checkpoint/list` asks for.
+///
+/// The daemon caps the method at 500 and the parameter bounds the *scan* as well
+/// as the answer, so this is a real cost and not just a display limit. A hundred
+/// is several turns' worth of pre-tool checkpoints — far more than a picker can
+/// show — and the picker's own filter is what finds one further back. A session
+/// with thousands of them therefore costs a bounded listing, never an unbounded
+/// one, and `/checkpoints` is the surface for the full history.
+const CHECKPOINT_PAGE: u32 = 100;
+
+/// How many preserved paths a restore names before it counts the rest.
+///
+/// Named, not counted, is the point: "3 files were left alone" is not
+/// actionable and `src/auth.ts, README.md, build/out.js` is. The cap exists
+/// because a `--force` over two hundred paths still has to fit on a screen.
+const PRESERVED_NAMED: usize = 8;
 
 /// Live-region rows the chrome always costs: activity, composer (three), hints,
 /// footer. What an overlay asks for is this plus its own height.
@@ -239,6 +263,51 @@ pub enum Call {
     /// `session/load` answers with a descriptor and nothing else, so the
     /// conversation a resume is *for* arrives here. See [`App::adopt_snapshot`].
     Snapshot,
+    /// `checkpoint/list` — what the rewind surface is built from.
+    ///
+    /// Asked once at attach and again at every turn end, which is the cadence
+    /// that keeps [`EscWorld::can_rewind`] honest: the `Esc Esc` rung and its
+    /// hint must answer without a round trip, so the answer has to already be
+    /// here. `why` is how the reply finds the surface that asked — a background
+    /// refresh must not open a picker under the user.
+    Checkpoints {
+        /// How many to ask for, newest first.
+        limit: u32,
+        /// What the answer is for.
+        why: Rewind,
+    },
+    /// `checkpoint/restore` — take the working directory back. **Writes.**
+    ///
+    /// `force` is only ever `true` when a confirmation the user answered said
+    /// so, and that confirmation only ever appears once a restore has *reported*
+    /// preserved files: nothing here asks about files that may not exist.
+    Restore {
+        /// Checkpoint id.
+        checkpoint: String,
+        /// Also revert what changed outside Lyra's own tool calls.
+        force: bool,
+    },
+    /// `session/rewind` — move the head back to a transcript entry.
+    Rewind {
+        /// Where to land. Absent asks the daemon for the newest anchored entry.
+        entry_id: Option<String>,
+    },
+}
+
+/// Why a `checkpoint/list` went out.
+///
+/// Three surfaces want the same answer and two of them are modal, so the reply
+/// has to name the one that asked — the same argument [`Purpose`] makes for
+/// `provider/get`. A background refresh that opened a picker would be a panel
+/// appearing under a user who did nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Rewind {
+    /// Keeping [`EscWorld::can_rewind`] answerable. Renders nothing.
+    Refresh,
+    /// `/rewind` — open the picker when it lands.
+    Picker,
+    /// `Esc Esc` — open the confirmation for the newest anchored checkpoint.
+    Confirm,
 }
 
 /// Which surface a `provider/get` was asked for.
@@ -282,6 +351,9 @@ impl Call {
             Self::Sessions => wire::method::SESSION_LIST,
             Self::LoadSession(_) => wire::method::SESSION_LOAD,
             Self::Snapshot => wire::method::SESSION_SNAPSHOT,
+            Self::Checkpoints { .. } => wire::method::CHECKPOINT_LIST,
+            Self::Restore { .. } => wire::method::CHECKPOINT_RESTORE,
+            Self::Rewind { .. } => wire::method::SESSION_REWIND,
         }
     }
 }
@@ -332,10 +404,10 @@ pub const SLASH_COMMANDS: [&str; 24] = [
     "kill",
     "workspaces",
     "cleanup",
-    "gitmode",
+    "checkpoints",
     "review",
-    "apply",
     "rollback",
+    "apply",
     "skills",
     "mcp",
     "install",
@@ -347,10 +419,18 @@ pub const SLASH_COMMANDS: [&str; 24] = [
 
 /// Commands this **client** answers, which no daemon declares.
 ///
-/// `/theme` is the whole list, and it is here rather than in the daemon because
-/// the theme is a property of this terminal, not of the session.
-const CLIENT_COMMANDS: [(&str, &str); 1] =
-    [("theme", "Pick a colour theme, previewed as you move.")];
+/// Two, and both are here for the same reason: they are properties of this
+/// terminal rather than of the session. `/theme` is a colour choice, and
+/// `/rewind` is the *picker* over `checkpoint/list` — the daemon has the three
+/// checkpoint methods and no opinion about which of them a keystroke means, so
+/// the surface that turns a list into a decision belongs on this side.
+const CLIENT_COMMANDS: [(&str, &str); 2] = [
+    ("theme", "Pick a colour theme, previewed as you move."),
+    (
+        "rewind",
+        "Go back to a checkpoint: the conversation, and optionally the code with it.",
+    ),
+];
 
 /// Commands whose bare form (no arguments) opens a picker here instead of going
 /// to the daemon's router.
@@ -360,7 +440,7 @@ const CLIENT_COMMANDS: [(&str, &str); 1] =
 /// both directions — bare it opens the *same* picker `/sessions` does, and with
 /// an argument it is a `session/load` this client issues rather than a report it
 /// asks the router for.
-const PICKER_COMMANDS: [&str; 5] = ["model", "provider", "sessions", "theme", "resume"];
+const PICKER_COMMANDS: [&str; 6] = ["model", "provider", "sessions", "theme", "resume", "rewind"];
 
 /// One slash command, as `session/commands` declares it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -478,6 +558,43 @@ impl Confirm {
     }
 }
 
+/// The rewind confirmation's state, from the moment its panel opens until
+/// `checkpoint/restore` has answered.
+///
+/// It outlives its panel by one round trip, for the same reason [`Confirm`]
+/// does: the interesting half of a restore is the *refusal*, and "N files were
+/// left alone" is only actionable if the client still remembers which
+/// checkpoint that was about.
+#[derive(Debug, Clone)]
+struct RewindConfirm {
+    /// The checkpoint the working directory would go back to.
+    checkpoint: wire::Checkpoint,
+    /// Files a first, non-forcing restore declined to touch because Lyra never
+    /// wrote them. **Empty until a restore has actually reported some** — which
+    /// is precisely why the `--force` row cannot appear before then: this client
+    /// does not offer to override a rule that has not yet said no.
+    preserved: Vec<String>,
+    /// Whether the override row is ticked. Off by default; reverting a human's
+    /// own edit is not something a default should do.
+    force: bool,
+}
+
+impl RewindConfirm {
+    fn new(checkpoint: wire::Checkpoint) -> Self {
+        Self {
+            checkpoint,
+            preserved: Vec::new(),
+            force: false,
+        }
+    }
+
+    /// Whether the conversation can move with the code. A checkpoint that
+    /// anchors no transcript entry can only take the files back.
+    fn anchored(&self) -> Option<&str> {
+        self.checkpoint.anchored()
+    }
+}
+
 /// What accepting a row of an overlay means.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum OverlayKind {
@@ -494,6 +611,10 @@ enum OverlayKind {
     /// The delete confirmation. Its state is [`App::confirm`], because it has to
     /// survive the panel.
     ProviderDelete,
+    /// The checkpoint picker: `/rewind`.
+    RewindPick,
+    /// The rewind confirmation. Its state is [`App::rewind`].
+    RewindConfirm,
     /// `session/load`.
     Sessions,
     /// The theme registry, applied live. Dismissing puts `restore` back, which
@@ -606,6 +727,24 @@ pub struct App {
     /// The delete confirmation's state, from the moment its panel opens until
     /// `provider/remove` has answered.
     confirm: Option<Confirm>,
+    /// The rewind confirmation's state, likewise.
+    rewind: Option<RewindConfirm>,
+    /// The checkpoints this client knows about, newest first.
+    ///
+    /// Refreshed at attach and at every turn end, because [`EscWorld::can_rewind`]
+    /// has to answer *without* a round trip — the `Esc` hint asks it every frame,
+    /// and a hint that lied for one round trip is worse than no hint.
+    checkpoints: Vec<wire::Checkpoint>,
+    /// Terminal children and when they settled, so a `✓` lingers in the presence
+    /// strip before the child leaves it.
+    settled: Vec<(String, Instant)>,
+    /// Whether the presence strip is on screen.
+    ///
+    /// **Grows on demand, shrinks only at a turn boundary.** A child appearing
+    /// is information and gets its row immediately; a chrome row collapsing
+    /// 0↔1 mid-stream is the jitter DESIGN.md §3 forbids, so the disappearance
+    /// waits for the boundary.
+    agents_shown: bool,
     /// Set by a snapshot that reported no provider, cleared once the wizard has
     /// been opened for it. See [`App::adopt_snapshot`].
     needs_provider: bool,
@@ -649,6 +788,10 @@ impl App {
             mention_sent: None,
             setup: None,
             confirm: None,
+            rewind: None,
+            checkpoints: Vec::new(),
+            settled: Vec::new(),
+            agents_shown: false,
             needs_provider: false,
             rendered_history: None,
             exit: false,
@@ -668,6 +811,12 @@ impl App {
             return;
         }
         daemon.send(Call::Commands);
+        // What the rewind rung answers from. Asked here rather than lazily
+        // because `can_rewind` is consulted every frame by the `Esc` hint.
+        daemon.send(Call::Checkpoints {
+            limit: CHECKPOINT_PAGE,
+            why: Rewind::Refresh,
+        });
         // First run. The daemon booted with nothing configured, so a composer
         // would only be a place to type something that will be refused: the
         // wizard opens instead, and the session proceeds normally once it
@@ -708,6 +857,15 @@ impl App {
     /// The store re-syncs either way: what is gated is scrollback, never state.
     pub fn adopt_snapshot(&mut self, snapshot: &wire::SessionSnapshot) {
         self.store.apply_snapshot_meta(snapshot);
+        // A client attaching mid-session gets its presence strip from hydration
+        // rather than waiting for the next transition — but only for children
+        // that are still moving: one that had already finished never earned a
+        // `✓` on this screen, so it is history, not presence.
+        self.agents_shown = self
+            .store
+            .agents()
+            .iter()
+            .any(|agent| !ui::agent::is_settled(&agent.status));
         // Absent reads as configured, so a daemon that predates the field is
         // not dragged into a wizard it cannot answer.
         self.needs_provider = !snapshot.is_provider_configured();
@@ -808,6 +966,9 @@ impl App {
                 .notice
                 .as_ref()
                 .is_some_and(|(_, at)| at.elapsed() < NOTICE_LINGER)
+            // A `✓` in the presence strip has to be able to expire on its own,
+            // which means one more repaint after the last thing that happened.
+            || self.agents_lingering(Instant::now())
     }
 
     /// Whether a turn is running, client-side. The local view leads the daemon's
@@ -1164,6 +1325,224 @@ impl App {
         }
     }
 
+    // -- rewind ------------------------------------------------------------
+
+    /// `/rewind`: the checkpoint picker.
+    ///
+    /// Opens empty and fills when `checkpoint/list` answers, exactly as the
+    /// model and session pickers do. The list is re-fetched rather than served
+    /// from [`App::checkpoints`] because a picker is a decision surface: the
+    /// cache exists to keep the `Esc` hint honest between frames, not to be what
+    /// a user picks from.
+    fn open_rewind_picker(&mut self, daemon: &mut dyn Daemon) {
+        self.overlay = Some(Open {
+            kind: OverlayKind::RewindPick,
+            panel: Panel::select("rewind", Select::new(Ranking::Local)),
+        });
+        self.fill(OverlayKind::RewindPick, checkpoint_choices(&self.checkpoints));
+        daemon.send(Call::Checkpoints {
+            limit: CHECKPOINT_PAGE,
+            why: Rewind::Picker,
+        });
+    }
+
+    /// `Esc Esc`, and choosing a row of the picker: the confirmation.
+    ///
+    /// Two questions, in the order they are answerable: *how far back* is
+    /// already settled by the time this opens, and *how much* — the conversation
+    /// alone, or the working directory with it — is what it asks.
+    fn open_rewind_confirm(&mut self, checkpoint: wire::Checkpoint) {
+        self.rewind = Some(RewindConfirm::new(checkpoint));
+        self.overlay = Some(Open {
+            kind: OverlayKind::RewindConfirm,
+            panel: Panel::select("rewind", Select::local(Vec::new())),
+        });
+        self.refresh_rewind();
+    }
+
+    /// Redraw the confirmation from [`App::rewind`], keeping the highlight where
+    /// it was — ticking a box must not move the caret off the box.
+    fn refresh_rewind(&mut self) {
+        let Some(state) = self.rewind.clone() else {
+            return;
+        };
+        let Some(open) = &mut self.overlay else { return };
+        if open.kind != OverlayKind::RewindConfirm {
+            return;
+        }
+        open.panel.title = rewind_title(&state);
+        let Some(select) = open.panel.as_select_mut() else {
+            return;
+        };
+        let at = select.selected();
+        select.set_items(rewind_choices(&state));
+        for _ in 0..at {
+            select.next();
+        }
+    }
+
+    /// `Esc Esc` reached the rewind rung.
+    ///
+    /// The list is re-fetched rather than acted on from cache: a checkpoint id
+    /// is about to be handed to the one method that writes, and a deliberate
+    /// two-press gesture can afford the round trip that makes it current.
+    fn begin_rewind(&mut self, daemon: &mut dyn Daemon) {
+        daemon.send(Call::Checkpoints {
+            limit: CHECKPOINT_PAGE,
+            why: Rewind::Confirm,
+        });
+    }
+
+    /// Fold in `checkpoint/list`, for whichever surface asked.
+    fn adopt_checkpoints(&mut self, why: Rewind, outcome: Result<&Value, &String>) {
+        let listed = match outcome {
+            Ok(value) => serde_json::from_value::<wire::CheckpointListResult>(value.clone())
+                .map_err(|error| error.to_string()),
+            Err(detail) => Err((*detail).clone()),
+        };
+        let listed = match listed {
+            Ok(listed) => listed,
+            Err(detail) => {
+                // A background refresh that failed is not the user's problem:
+                // `can_rewind` simply keeps saying no, and the rung stays out of
+                // the hint line. A surface that was *asked for* has to say why.
+                if why != Rewind::Refresh {
+                    self.error(format!("{}: {detail}", wire::method::CHECKPOINT_LIST));
+                }
+                return;
+            }
+        };
+        // Unavailable means there is nothing to rewind to and never will be in
+        // this directory. Keeping the list empty is what keeps `can_rewind`
+        // false, so the rung and its hint disappear rather than misfiring.
+        if !listed.available {
+            self.checkpoints.clear();
+            if why != Rewind::Refresh {
+                let reason = listed
+                    .unavailable
+                    .unwrap_or_else(|| "this directory cannot hold checkpoints".to_owned());
+                self.close_overlay();
+                self.error(format!("no checkpoints here · {reason}"));
+            }
+            return;
+        }
+        self.checkpoints = listed.checkpoints;
+        match why {
+            Rewind::Refresh => {}
+            Rewind::Picker => {
+                self.fill(OverlayKind::RewindPick, checkpoint_choices(&self.checkpoints));
+            }
+            Rewind::Confirm => match self.newest_rewind_target() {
+                Some(checkpoint) => self.open_rewind_confirm(checkpoint),
+                None => self.error("nothing to rewind to yet"),
+            },
+        }
+    }
+
+    /// The checkpoint `Esc Esc` means: the newest one anchored to a transcript
+    /// entry, falling back to the newest of any kind.
+    ///
+    /// Anchored first because the gesture is about the *conversation* — an
+    /// unanchored checkpoint can only take the files back, which is a narrower
+    /// thing than the user asked for and is offered as such.
+    fn newest_rewind_target(&self) -> Option<wire::Checkpoint> {
+        self.checkpoints
+            .iter()
+            .find(|checkpoint| checkpoint.anchored().is_some())
+            .or_else(|| self.checkpoints.first())
+            .cloned()
+    }
+
+    /// Fold in `checkpoint/restore` — the never-clobber rule, reported.
+    ///
+    /// The refusal is the interesting half. Files that changed outside Lyra's
+    /// own tool calls come back untouched and **by name**, because "3 files were
+    /// preserved" is not something anyone can act on, and the `--force` that
+    /// would revert them is offered *here* — after the rule has actually said
+    /// no — rather than as a checkbox on a question nobody had yet.
+    fn adopt_restored(&mut self, forced: bool, outcome: Result<&Value, &String>) {
+        let decoded = match outcome {
+            Ok(value) => serde_json::from_value::<wire::CheckpointRestoreResult>(value.clone())
+                .map_err(|error| error.to_string()),
+            Err(detail) => Err((*detail).clone()),
+        };
+        let restored = match decoded {
+            Ok(restored) => restored,
+            Err(detail) => {
+                self.rewind = None;
+                self.error(format!("{}: {detail}", wire::method::CHECKPOINT_RESTORE));
+                return;
+            }
+        };
+        for line in restore_lines(&restored) {
+            let style = self.theme.warning();
+            self.commits.push(Row::styled(format!("  {line}"), style));
+        }
+        if restored.preserved.is_empty() || forced {
+            self.rewind = None;
+            return;
+        }
+        // The rule said no to something. Re-open the confirmation with the row
+        // that overrides it — which is the first moment this client knows there
+        // is anything to override.
+        //
+        // Unless the user has moved on. A restore is fire-and-forget and its
+        // answer can land after a palette or a picker has been opened; a panel
+        // that appeared over one of those would be a modal nobody asked for, so
+        // the override is named as a command instead. The preserved files are
+        // already in scrollback either way — the never-clobber rule is reported
+        // whether or not there is a surface to report it on.
+        if self.overlay.is_some() {
+            self.rewind = None;
+            self.audit(format!(
+                "revert those too with /rollback {} --force",
+                restored.target.id
+            ));
+            return;
+        }
+        let state = self
+            .rewind
+            .take()
+            .unwrap_or_else(|| RewindConfirm::new(restored.target.clone()));
+        self.rewind = Some(RewindConfirm {
+            preserved: restored.preserved.clone(),
+            force: false,
+            ..state
+        });
+        self.overlay = Some(Open {
+            kind: OverlayKind::RewindConfirm,
+            panel: Panel::select("preserved", Select::local(Vec::new())),
+        });
+        self.refresh_rewind();
+    }
+
+    /// Fold in `session/rewind`.
+    ///
+    /// The transcript on screen is not touched here: the daemon answers a rewind
+    /// with `session_changed`, and [`App::adopt_snapshot`] leaves the one dim
+    /// marker a moved head deserves. This only says what was undone.
+    fn adopt_rewound(&mut self, outcome: Result<&Value, &String>) {
+        match outcome {
+            Ok(value) => match serde_json::from_value::<wire::RewindResult>(value.clone()) {
+                Ok(rewound) => {
+                    let line = match rewound.removed_messages {
+                        // Absent is "not counted", which is not zero — so it
+                        // says nothing rather than claiming nothing moved.
+                        None => "rewound".to_owned(),
+                        Some(0) => "rewound · already there".to_owned(),
+                        Some(count) => format!(
+                            "rewound · {count} {} undone",
+                            if count == 1 { "message" } else { "messages" }
+                        ),
+                    };
+                    self.audit(line);
+                }
+                Err(error) => self.error(format!("{}: {error}", wire::method::SESSION_REWIND)),
+            },
+            Err(detail) => self.error(format!("{}: {detail}", wire::method::SESSION_REWIND)),
+        }
+    }
+
     /// The theme picker, which needs no daemon at all.
     fn open_theme_picker(&mut self) {
         let items: Vec<Choice> = Theme::BUNDLED
@@ -1212,9 +1591,10 @@ impl App {
         match open.kind {
             OverlayKind::Theme { restore } => self.set_theme(*restore),
             OverlayKind::ProviderForm => self.setup = None,
-            // Dismissing the confirmation is the "no" answer, so nothing is
-            // left waiting for a removal that will never be asked for.
+            // Dismissing a confirmation is the "no" answer, so nothing is left
+            // waiting for a call that will never be made.
             OverlayKind::ProviderDelete => self.confirm = None,
+            OverlayKind::RewindConfirm => self.rewind = None,
             _ => {}
         }
     }
@@ -1294,6 +1674,75 @@ impl App {
                 // `cancel`, and anything a future row adds: the take above has
                 // already closed the panel, so declining is doing nothing.
                 _ => self.confirm = None,
+            },
+            OverlayKind::RewindPick => {
+                if let Some(checkpoint) = self
+                    .checkpoints
+                    .iter()
+                    .find(|checkpoint| checkpoint.id == choice.value)
+                    .cloned()
+                {
+                    self.open_rewind_confirm(checkpoint);
+                }
+            }
+            OverlayKind::RewindConfirm => match choice.value.as_str() {
+                // Conversation only: the head moves, the working directory is
+                // left exactly as it is. Two calls exist because they are two
+                // decisions, and this is the one that changes nothing on disk.
+                rewind_row::CONVERSATION => {
+                    let entry = self
+                        .rewind
+                        .as_ref()
+                        .and_then(|state| state.anchored())
+                        .map(str::to_owned);
+                    self.rewind = None;
+                    daemon.send(Call::Rewind { entry_id: entry });
+                }
+                // Both, in that order: the conversation first, because a restore
+                // that half-succeeds must not leave the transcript ahead of the
+                // tree it is describing.
+                rewind_row::BOTH | rewind_row::CODE => {
+                    let Some(state) = self.rewind.clone() else { return };
+                    if choice.value == rewind_row::BOTH {
+                        daemon.send(Call::Rewind {
+                            entry_id: state.anchored().map(str::to_owned),
+                        });
+                    }
+                    daemon.send(Call::Restore {
+                        checkpoint: state.checkpoint.id.clone(),
+                        force: false,
+                    });
+                }
+                // The override, which only exists once a restore has reported
+                // files it refused to touch.
+                rewind_row::FORCE => {
+                    if let Some(state) = &self.rewind
+                        && state.force
+                    {
+                        daemon.send(Call::Restore {
+                            checkpoint: state.checkpoint.id.clone(),
+                            force: true,
+                        });
+                        self.rewind = None;
+                    } else {
+                        // Unticked: say so rather than doing nothing silently.
+                        self.rewind = None;
+                        self.notify("nothing reverted · tick the box to override", now);
+                    }
+                }
+                // A checkbox is not a decision: the panel goes back up with the
+                // highlight where it was.
+                rewind_row::TOGGLE => {
+                    if let Some(state) = &mut self.rewind {
+                        state.force = !state.force;
+                    }
+                    self.overlay = Some(Open {
+                        kind: OverlayKind::RewindConfirm,
+                        panel,
+                    });
+                    self.refresh_rewind();
+                }
+                _ => self.rewind = None,
             },
             OverlayKind::Sessions => daemon.send(Call::LoadSession(choice.value)),
             // A form's `Enter` is `Action::FormSubmit`, never this path.
@@ -1464,6 +1913,26 @@ impl App {
             daemon.send(Call::LoadSession((*target).to_owned()));
             return;
         }
+        // `/rewind` has no router to go to at all: the daemon owns the three
+        // checkpoint methods and has no opinion about which of them a gesture
+        // means, so both forms are answered here. With an id it is the same
+        // confirmation `Esc Esc` opens, aimed at a checkpoint the user named.
+        if name == "rewind"
+            && let [target] = rest.as_slice()
+        {
+            match self
+                .checkpoints
+                .iter()
+                .find(|checkpoint| checkpoint.id == *target)
+                .cloned()
+            {
+                Some(checkpoint) => self.open_rewind_confirm(checkpoint),
+                None => self.error(format!(
+                    "no checkpoint is called {target} · /rewind to see them"
+                )),
+            }
+            return;
+        }
         if bare && PICKER_COMMANDS.contains(&name.as_str()) {
             match name.as_str() {
                 "model" => self.open_picker(OverlayKind::Model, "model", daemon),
@@ -1480,6 +1949,7 @@ impl App {
                     self.open_picker(OverlayKind::Sessions, "session", daemon);
                 }
                 "theme" => self.open_theme_picker(),
+                "rewind" => self.open_rewind_picker(daemon),
                 _ => unreachable!("PICKER_COMMANDS and this match are one list"),
             }
             return;
@@ -1701,6 +2171,16 @@ impl App {
 
     #[allow(clippy::too_many_lines)]
     fn update(&mut self, update: &Update, daemon: &mut dyn Daemon, now: Instant) {
+        // What a child *was*, read before the update overwrites it: the update
+        // carries the new state and an audit row is earned by the change.
+        let was = match update {
+            Update::Agent(agent) => Some(
+                self.store
+                    .agent(&agent.id)
+                    .map(|known| known.status.clone()),
+            ),
+            _ => None,
+        };
         self.store.apply(update);
         // Every frame the daemon sends is proof the turn is moving, whatever it
         // carries — a thinking delta, a tool-call lifecycle event, a reasoning
@@ -1721,6 +2201,11 @@ impl App {
             // Thinking, signatures and streamed tool arguments are the store's;
             // they never reach scrollback as prose.
             Update::Delta(_) => {}
+            // Two surfaces, and the split is deliberate. The presence strip
+            // (drawn from the store, every frame) is the present tense; only the
+            // three transitions that are *history* reach scrollback, collapsed,
+            // so a swarm costs a line rather than a page.
+            Update::Agent(agent) => self.agent_transition(agent, was.flatten().as_ref(), now),
             Update::ToolCallStart(start) => {
                 self.running_tool = Some(tool_label(&start.tool, start.args_summary.as_deref()));
             }
@@ -1771,8 +2256,25 @@ impl App {
                 );
                 self.commits.extend(rows);
             }
+            // Who spoke decides how it is drawn. A hub aside is another agent's
+            // message folded into this turn at a tool boundary; rendering it in
+            // the `>` user band would put words in the user's mouth, so it gets
+            // its own dim `⇄ peer: …` row and the daemon's envelope — the
+            // preamble and reply instruction written *for the model* — is peeled
+            // off, because the row already says both things it says.
             Update::Steer(steer) => {
-                let rows = self.transcript.user(&steer.text);
+                let rows = match steer.source {
+                    Some(wire::SteerSource::Hub) => {
+                        let (from, text) = ui::agent::unwrap_aside(&steer.text);
+                        let from = steer
+                            .from
+                            .clone()
+                            .or(from)
+                            .unwrap_or_else(|| "an agent".to_owned());
+                        self.transcript.hub_aside(&from, &text)
+                    }
+                    _ => self.transcript.user(&steer.text),
+                };
                 self.commits.extend(rows);
             }
             Update::Error(error) => self.error(error.error.to_string()),
@@ -1833,6 +2335,93 @@ impl App {
         }
     }
 
+    // -- children ----------------------------------------------------------
+
+    /// Fold one `agent` update into the two surfaces that show children.
+    ///
+    /// The strip needs nothing but the store, which already has it. This decides
+    /// the other half: whether the transition is *history*. Appearing, finishing
+    /// and failing are; `running` and `awaiting_tool` are the present tense, and
+    /// the present tense lives in the live region — a row per state change would
+    /// mean six children producing thirty rows about nothing having happened.
+    fn agent_transition(
+        &mut self,
+        agent: &wire::AgentUpdate,
+        was: Option<&wire::AgentState>,
+        now: Instant,
+    ) {
+        use ui::agent::AgentEvent;
+        // A child on screen is a child the strip has room for. Growing the
+        // region here is the "appears on demand" half of the anti-jitter rule;
+        // shrinking waits for a turn boundary.
+        self.agents_shown = true;
+        let settled = ui::agent::is_settled(&agent.status);
+        if settled && !self.settled.iter().any(|(id, _)| *id == agent.id) {
+            self.settled.push((agent.id.clone(), now));
+            // Bounded without a clock: a session that spawns thousands of
+            // children must not pay for all of them to draw one row, and an
+            // entry old enough to be evicted is one whose `✓` expired long ago.
+            if self.settled.len() > SETTLED_MEMORY {
+                self.settled.remove(0);
+            }
+        }
+
+        // A declared transition wins over an inferred one, always: `started` and
+        // `revived` are both `running`, so a status diff *cannot* recover the
+        // difference between them, and a revival read as "no transition" prints
+        // nothing and then a second `✓` row with no account of why the child ran
+        // twice. Absent — an older daemon — and the diff is all there is.
+        let kind = match &agent.event {
+            Some(declared) => declared_row(declared),
+            None => inferred_row(&agent.status, was),
+        };
+        let Some(kind) = kind else { return };
+        let rows = self.transcript.agent(AgentEvent {
+            kind,
+            name: agent_name(agent),
+            detail: agent_detail(kind, agent),
+        });
+        self.commits.extend(rows);
+    }
+
+    /// The children the strip should draw right now.
+    ///
+    /// A finished child keeps its `✓` for [`ui::agent::SETTLED_LINGER`] and then
+    /// leaves — the row itself does not, which is what keeps the strip from
+    /// flickering out from under a turn that is still running.
+    fn presence(&self, now: Instant) -> Vec<ui::agent::Presence> {
+        self.store
+            .agents()
+            .iter()
+            .filter(|agent| {
+                if !ui::agent::is_settled(&agent.status) {
+                    return true;
+                }
+                // A child that was already finished when this client attached
+                // has no settle instant, and no `✓` it earned on screen: it is
+                // history, not presence, so it never enters the strip at all.
+                self.settled
+                    .iter()
+                    .find(|(id, _)| *id == agent.id)
+                    .is_some_and(|(_, at)| {
+                        now.saturating_duration_since(*at) < ui::agent::SETTLED_LINGER
+                    })
+            })
+            .map(|agent| ui::agent::Presence {
+                name: agent_name(agent),
+                state: agent.status.clone(),
+            })
+            .collect()
+    }
+
+    /// Whether a settled child is still counting out its linger, so the loop
+    /// keeps repainting until the strip has actually let go of it.
+    fn agents_lingering(&self, now: Instant) -> bool {
+        self.settled
+            .iter()
+            .any(|(_, at)| now.saturating_duration_since(*at) < ui::agent::SETTLED_LINGER)
+    }
+
     fn turn_ended(&mut self, end: &wire::TurnEnd, daemon: &mut dyn Daemon) {
         let rows = self.transcript.turn_end(end.status.as_str());
         self.commits.extend(rows);
@@ -1840,6 +2429,19 @@ impl App {
         self.in_flight = None;
         self.last_activity = None;
         self.running_tool = None;
+        // The turn boundary is the only place the presence strip is allowed to
+        // shrink (DESIGN.md §3: chrome must not collapse 0↔1 mid-stream).
+        self.agents_shown = self
+            .store
+            .agents()
+            .iter()
+            .any(|agent| !ui::agent::is_settled(&agent.status));
+        // A turn is what puts checkpoints on disk, so this is when the rewind
+        // rung's answer goes stale.
+        daemon.send(Call::Checkpoints {
+            limit: CHECKPOINT_PAGE,
+            why: Rewind::Refresh,
+        });
         // DESIGN.md §0.2: the queue auto-submits at turn end — one entry, so two
         // separate `Enter`s stay two separate turns.
         if end.status == wire::TurnStatus::Cancelled {
@@ -1861,6 +2463,13 @@ impl App {
         match (&reply.call, &reply.outcome) {
             (Call::Command(line), Ok(value)) => {
                 let declared = self.result_kind(line);
+                // `/review` is the one command whose answer belongs *in* the
+                // transcript rather than beside it: its rows are file rows, and
+                // a file row is a thing `Tab` expands. Everything else is a
+                // report and goes straight to scrollback.
+                if self.render_review(value, declared.as_deref()) {
+                    return;
+                }
                 let rows = ui::results::render(
                     &self.theme,
                     self.width,
@@ -1870,6 +2479,11 @@ impl App {
                 );
                 self.commits.extend(rows);
             }
+            (Call::Checkpoints { why, .. }, outcome) => {
+                self.adopt_checkpoints(*why, outcome.as_ref());
+            }
+            (Call::Restore { force, .. }, outcome) => self.adopt_restored(*force, outcome.as_ref()),
+            (Call::Rewind { .. }, outcome) => self.adopt_rewound(outcome.as_ref()),
             (Call::Commands, Ok(value)) => self.adopt_commands(value),
             // An optional capability. A daemon that does not declare its
             // commands leaves the built-in list standing, and an error row for
@@ -1936,6 +2550,36 @@ impl App {
             (call, Err(detail)) => self.error(format!("{}: {detail}", call.method())),
             (Call::Steer(_) | Call::Cancel { .. } | Call::Prompt(_), Ok(_)) => {}
         }
+    }
+
+    /// Render a `/review` answer **through the transcript**, so `Tab` expands
+    /// its last file the way it expands the last tool call.
+    ///
+    /// Returns whether it handled the payload. A review's file rows are DESIGN.md
+    /// §3's collapsed grammar — `▸ modified src/auth.ts +12 −4` with the patch
+    /// underneath — and that grammar is a transcript entry, not a block of rows
+    /// dropped into scrollback: an entry survives a purge resize at the new
+    /// width, and only an entry can be expanded after the fact.
+    fn render_review(&mut self, value: &Value, declared: Option<&str>) -> bool {
+        let kind = value
+            .get("resultKind")
+            .and_then(Value::as_str)
+            .or(declared)
+            .map(|kind| kind.trim_end_matches("Result"));
+        if kind != Some("review") || value.get("error").is_some() {
+            return false;
+        }
+        let Some(payload) = value.get("output") else {
+            return false;
+        };
+        let mut rows = ui::results::review_summary(&self.theme, self.width, payload);
+        for view in ui::results::review_files(payload) {
+            rows.extend(self.transcript.tool(view));
+        }
+        rows.extend(ui::results::review_agents(&self.theme, self.width, payload));
+        rows.push(Row::blank());
+        self.commits.extend(rows);
+        true
     }
 
     /// The renderer the command registry declared for a command's answer.
@@ -2112,6 +2756,16 @@ impl App {
             let queued: Vec<Submission> = self.queue.entries().cloned().collect();
             rows.extend(ui::queue::render(&self.theme, &queued, width));
 
+            // The presence strip: one chrome row, directly above the queue and
+            // the composer, drawn only while `agents_shown` says the region has
+            // been grown for it. Between "there are children" and "there is a
+            // row" sits the anti-jitter latch — see [`App::agents_shown`].
+            if self.agents_shown
+                && let Some(strip) = ui::agent::strip(&self.theme, &self.presence(now), width)
+            {
+                rows.push(strip);
+            }
+
             // The completion popup sits directly above the composer, which is
             // where the text it would insert is.
             let completion = self.composer.completion();
@@ -2178,6 +2832,11 @@ impl App {
     /// screen.
     #[must_use]
     pub fn desired_region_height(&self, base: u16) -> u16 {
+        // An overlay replaces the streaming tail *and* the presence strip, so it
+        // does not pay for a row it is covering. Anything else does: the strip
+        // is chrome, and chrome the region was not grown for would be drawn off
+        // the top of it.
+        let strip = u16::from(self.agents_shown && self.overlay.is_none());
         let panel = if let Some(open) = &self.overlay {
             open.panel.height(OVERLAY_ROWS)
         } else if self.composer.completion().is_open() {
@@ -2186,7 +2845,7 @@ impl App {
         } else {
             0
         };
-        base.max(CHROME_ROWS.saturating_add(panel))
+        base.max(CHROME_ROWS.saturating_add(panel).saturating_add(strip))
             .min(MAX_REGION_HEIGHT)
     }
 
@@ -2307,6 +2966,18 @@ impl App {
             self.composer.set_text(&entry.text);
         }
     }
+
+    /// Whether the `Esc Esc` rung exists right now.
+    ///
+    /// A checkpoint list this client has already been given is the whole test.
+    /// It is deliberately *not* "the daemon routes `session/rewind`": a daemon
+    /// that routes it in a directory with no checkpoint history has nothing to
+    /// take the user back to, and offering the gesture there would be the
+    /// lying-hint case in a new costume.
+    #[must_use]
+    pub fn can_rewind(&self) -> bool {
+        !self.checkpoints.is_empty()
+    }
 }
 
 /// Milliseconds since the Unix epoch, for the retry countdown's anchor.
@@ -2325,6 +2996,121 @@ fn tool_label(tool: &str, summary: Option<&str>) -> String {
         Some(summary) if !summary.is_empty() => format!("▸ {tool} {summary}"),
         _ => format!("▸ {tool}"),
     }
+}
+
+/// How many settled children the strip remembers the settle instant of.
+///
+/// Only the ones inside [`ui::agent::SETTLED_LINGER`] are ever read, and the
+/// linger is measured in seconds, so anything past a couple of dozen is already
+/// expired. This is the memory bound, not a display limit.
+const SETTLED_MEMORY: usize = 32;
+
+/// What to call a child on screen.
+///
+/// The **peer** name, not the label: a message is addressed to the peer, `/kill`
+/// takes the peer, and a strip that showed a friendlier name would be showing
+/// one the user cannot then use.
+fn agent_name(agent: &wire::AgentUpdate) -> String {
+    if agent.peer.trim().is_empty() {
+        agent.id.clone()
+    } else {
+        agent.peer.clone()
+    }
+}
+
+/// Which row a *declared* transition earns, if any.
+///
+/// `started` is the one that earns none: a child moving from `queued` to
+/// `running` is the present tense, and the present tense is the strip's — the
+/// same split the tool grammar makes between the activity strip and the
+/// collapsed `▸` row.
+fn declared_row(declared: &wire::AgentTransition) -> Option<ui::agent::EventKind> {
+    use ui::agent::EventKind;
+    match declared {
+        wire::AgentTransition::Spawned => Some(EventKind::Spawned),
+        wire::AgentTransition::Revived => Some(EventKind::Revived),
+        wire::AgentTransition::Completed => Some(EventKind::Finished),
+        wire::AgentTransition::Failed
+        | wire::AgentTransition::Cancelled
+        | wire::AgentTransition::TimedOut => Some(EventKind::Failed),
+        // `started`, and a transition a newer daemon invents: the strip already
+        // says a child is running, so neither earns an immutable row.
+        wire::AgentTransition::Started | wire::AgentTransition::Other(_) => None,
+    }
+}
+
+/// The same answer for a daemon that predates `agent.event`, recovered from the
+/// state the child was in before this update.
+///
+/// Strictly weaker, and knowably so: a revival is invisible here, because
+/// `completed → running` is indistinguishable from a re-report of a child that
+/// never stopped. That is the entire reason the declared field exists.
+fn inferred_row(
+    status: &wire::AgentState,
+    was: Option<&wire::AgentState>,
+) -> Option<ui::agent::EventKind> {
+    use ui::agent::EventKind;
+    match (status, was) {
+        // Not the same state twice: a daemon that re-reports a child it has
+        // already reported must not print a second row about it.
+        (status, Some(previous)) if status == previous => None,
+        (wire::AgentState::Completed, _) => Some(EventKind::Finished),
+        (
+            wire::AgentState::Failed | wire::AgentState::TimedOut | wire::AgentState::Cancelled,
+            _,
+        ) => Some(EventKind::Failed),
+        // First sighting, whatever state it arrived in.
+        (_, None) => Some(EventKind::Spawned),
+        // Every other transition is the strip's, not the transcript's.
+        _ => None,
+    }
+}
+
+/// The right-hand half of a lifecycle row.
+///
+/// Every part is a measurement the daemon supplied; a field it could not measure
+/// is absent rather than zero, so it contributes nothing rather than a `0 files`
+/// that reads as a finding.
+fn agent_detail(kind: ui::agent::EventKind, agent: &wire::AgentUpdate) -> String {
+    use ui::agent::EventKind;
+    let mut parts: Vec<String> = Vec::new();
+    match kind {
+        // A revival says the same things a spawn does: it is the same child
+        // starting the same kind of work again, and the model is the fact a
+        // reader wants beside either.
+        EventKind::Spawned | EventKind::Revived => {
+            if let Some(model) = agent.model.as_deref().filter(|model| !model.is_empty()) {
+                parts.push(model.to_owned());
+            }
+            if agent.depth.is_some_and(|depth| depth > 0) {
+                parts.push("grandchild".to_owned());
+            }
+        }
+        EventKind::Finished => {
+            if let Some(files) = agent.files_modified.filter(|files| *files > 0) {
+                parts.push(format!("{files} {}", if files == 1 { "file" } else { "files" }));
+            }
+            if let Some(calls) = agent.tool_calls.filter(|calls| *calls > 0) {
+                parts.push(format!(
+                    "{calls} tool {}",
+                    if calls == 1 { "call" } else { "calls" }
+                ));
+            }
+        }
+        EventKind::Failed => {
+            parts.push(match agent.status {
+                wire::AgentState::TimedOut => "timed out".to_owned(),
+                wire::AgentState::Cancelled => "cancelled".to_owned(),
+                _ => "failed".to_owned(),
+            });
+            if let Some(error) = agent.error.as_deref().filter(|error| !error.is_empty()) {
+                parts.push(error.to_owned());
+            }
+            // The one row a user has to *do* something about carries where to go.
+            parts.push("/agents".to_owned());
+        }
+    }
+    parts.join(" · ")
 }
 
 /// A loop warning, in one line of prose.
@@ -2446,6 +3232,190 @@ mod menu {
     pub const EDIT: &str = "provider:edit";
     /// Open the delete confirmation.
     pub const DELETE: &str = "provider:delete";
+}
+
+/// The values of the rewind confirmation's rows.
+mod rewind_row {
+    /// `session/rewind` alone: the head moves, the files do not.
+    pub const CONVERSATION: &str = "rewind:conversation";
+    /// `session/rewind` then `checkpoint/restore`.
+    pub const BOTH: &str = "rewind:both";
+    /// `checkpoint/restore` alone, for a checkpoint that anchors no entry.
+    pub const CODE: &str = "rewind:code";
+    /// Re-run the restore with `force`, once preserved files exist.
+    pub const FORCE: &str = "rewind:force";
+    /// Flip `force` and stay open.
+    pub const TOGGLE: &str = "rewind:toggle";
+    /// Close, having done nothing.
+    pub const CANCEL: &str = "rewind:cancel";
+}
+
+/// The panel title, which is the only thing saying which of the two questions
+/// the confirmation is asking.
+fn rewind_title(state: &RewindConfirm) -> String {
+    if state.preserved.is_empty() {
+        format!("rewind to {}?", state.checkpoint.title())
+    } else {
+        format!(
+            "{} {} left untouched",
+            state.preserved.len(),
+            if state.preserved.len() == 1 {
+                "file"
+            } else {
+                "files"
+            }
+        )
+    }
+}
+
+/// `checkpoint/list` as picker rows.
+///
+/// The label names the moment and the detail carries the three facts that tell
+/// one checkpoint from another: when, how much moved, and whether the
+/// conversation can come back with it. A checkpoint that anchors no transcript
+/// entry says so, because choosing it is a narrower operation.
+fn checkpoint_choices(checkpoints: &[wire::Checkpoint]) -> Vec<Choice> {
+    checkpoints
+        .iter()
+        .map(|checkpoint| {
+            let mut detail: Vec<String> = Vec::new();
+            if !checkpoint.created_at.is_empty() {
+                detail.push(checkpoint.created_at.clone());
+            }
+            detail.push(checkpoint.kind.to_string().replace('_', " "));
+            detail.push(format!(
+                "{} {}",
+                checkpoint.changed_files,
+                if checkpoint.changed_files == 1 {
+                    "file"
+                } else {
+                    "files"
+                }
+            ));
+            if checkpoint.anchored().is_none() {
+                detail.push("code only".to_owned());
+            }
+            Choice::valued(checkpoint.id.clone(), checkpoint.title().to_owned())
+                .with_detail(detail.join(" · "))
+        })
+        .collect()
+}
+
+/// The rewind confirmation's rows, in whichever of its two states it is in.
+///
+/// **Before a restore** the question is how much to take back. **After one** the
+/// question is whether to override the never-clobber rule, and that row exists
+/// only because the rule has already reported refusing something — this client
+/// never offers a `--force` for files it has no evidence exist.
+fn rewind_choices(state: &RewindConfirm) -> Vec<Choice> {
+    let changed = format!(
+        "{} {} changed",
+        state.checkpoint.changed_files,
+        if state.checkpoint.changed_files == 1 {
+            "file"
+        } else {
+            "files"
+        }
+    );
+    if state.preserved.is_empty() {
+        let mut choices = Vec::new();
+        if state.anchored().is_some() {
+            choices.push(
+                Choice::valued(rewind_row::CONVERSATION, "conversation only")
+                    .with_detail("the transcript head moves; nothing on disk is touched"),
+            );
+            choices.push(
+                Choice::valued(rewind_row::BOTH, "conversation and code")
+                    .with_detail(format!("{changed} · files you changed yourself are kept")),
+            );
+        } else {
+            choices.push(
+                Choice::valued(rewind_row::CODE, "code only")
+                    .with_detail(format!(
+                        "{changed} · this checkpoint anchors no transcript entry"
+                    )),
+            );
+        }
+        choices.push(Choice::valued(rewind_row::CANCEL, "cancel").with_detail("change nothing"));
+        return choices;
+    }
+
+    let named: Vec<&str> = state
+        .preserved
+        .iter()
+        .map(String::as_str)
+        .take(PRESERVED_NAMED)
+        .collect();
+    let mut names = named.join(", ");
+    if state.preserved.len() > named.len() {
+        names.push_str(&format!(" +{} more", state.preserved.len() - named.len()));
+    }
+    vec![
+        Choice::valued(rewind_row::CANCEL, "keep them")
+            .with_detail(format!("Lyra never wrote these · {names}")),
+        Choice::valued(
+            rewind_row::TOGGLE,
+            format!(
+                "[{}] revert them too",
+                if state.force { '×' } else { ' ' }
+            ),
+        )
+        .with_detail("this discards edits Lyra did not make"),
+        Choice::valued(rewind_row::FORCE, "restore again")
+            .with_detail(if state.force {
+                "with --force"
+            } else {
+                "without --force · nothing more will change"
+            }),
+    ]
+}
+
+/// What a restore commits to scrollback.
+///
+/// Counts first, then the safety checkpoint that undoes it, then the preserved
+/// files **by name** — that last one is the never-clobber rule made legible, and
+/// a count alone would not be.
+fn restore_lines(restored: &wire::CheckpointRestoreResult) -> Vec<String> {
+    let mut lines = vec![format!(
+        "restored {} {} to {} · undo with /rollback {}",
+        restored.restored.len(),
+        if restored.restored.len() == 1 {
+            "file"
+        } else {
+            "files"
+        },
+        restored.target.title(),
+        restored.safety.id
+    )];
+    if !restored.preserved.is_empty() {
+        let named: Vec<&str> = restored
+            .preserved
+            .iter()
+            .map(String::as_str)
+            .take(PRESERVED_NAMED)
+            .collect();
+        let mut line = format!(
+            "kept {} {} Lyra did not write: {}",
+            restored.preserved.len(),
+            if restored.preserved.len() == 1 {
+                "file"
+            } else {
+                "files"
+            },
+            named.join(", ")
+        );
+        if restored.preserved.len() > named.len() {
+            line.push_str(&format!(" +{} more", restored.preserved.len() - named.len()));
+        }
+        lines.push(line);
+    }
+    if !restored.excluded.is_empty() {
+        lines.push(format!(
+            "outside the snapshot, untouched: {}",
+            restored.excluded.join(", ")
+        ));
+    }
+    lines
 }
 
 /// The values of the delete confirmation's rows.
@@ -2694,7 +3664,7 @@ impl EscWorld for EscPeek<'_> {
     }
     fn cancel_turn(&mut self) {}
     fn can_rewind(&self) -> bool {
-        false
+        self.0.can_rewind()
     }
     fn rewind(&mut self) {}
 }
@@ -2736,13 +3706,16 @@ impl EscWorld for EscView<'_> {
     fn cancel_turn(&mut self) {
         self.app.cancel_turn(self.daemon);
     }
-    /// The protocol has `session/fork`, not a rewind. Answering `false` keeps
-    /// the rung unreachable *and* keeps its hint off the hint line, which is the
-    /// difference between an unimplemented feature and a lying one.
+    /// Whether there is anything to go back *to*. Answered from the cached
+    /// checkpoint list, without a round trip, because the `Esc` hint asks this
+    /// every frame — and a hint that had to wait for the daemon would be a hint
+    /// that lied for a round trip.
     fn can_rewind(&self) -> bool {
-        false
+        self.app.can_rewind()
     }
-    fn rewind(&mut self) {}
+    fn rewind(&mut self) {
+        self.app.begin_rewind(self.daemon);
+    }
 }
 
 // ---------------------------------------------------------------------------
