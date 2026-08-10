@@ -94,13 +94,64 @@ export type SessionUpdate =
   | { sessionUpdate: "context_repair"; repairs: Array<{ code: string; detail: string; entryId?: string; tokenEstimate?: number }> }
   | { sessionUpdate: "context"; tokenEstimate: number; sourceEntryCount: number; contextWindow?: number }
   | { sessionUpdate: "usage"; turn: TurnUsage; session: SessionUsage }
-  | { sessionUpdate: "steer"; entryId: string; text: string; at: SteerBoundary }
+  | { sessionUpdate: "steer"; entryId: string; text: string; at: SteerBoundary; source?: "user" | "hub"; from?: string }
   | { sessionUpdate: "loop_warning"; warning: Record<string, unknown>; hardStopRequested: boolean }
   | { sessionUpdate: "transport_fallback"; from: ApiTypeWire; to: ApiTypeWire; reason: string; resetsPartialOutput: boolean }
   | { sessionUpdate: "error"; error: WireError }
   | { sessionUpdate: "report"; message: string }
   | { sessionUpdate: "model_changed"; provider: string; model: string; apiType?: ApiTypeWire }
-  | { sessionUpdate: "session_changed"; descriptor: Record<string, unknown>; reason: "new" | "load" | "fork" | "rewind" };
+  | { sessionUpdate: "session_changed"; descriptor: Record<string, unknown>; reason: "new" | "load" | "fork" | "rewind" }
+  /**
+   * A spawned child changed state.
+   *
+   * The delegation surface's observability contract: every lifecycle transition crosses the
+   * wire, so a client renders who is running from a stream rather than by polling. Counts
+   * rather than paths — the paths are the child's result, and belong to the model that
+   * collects it.
+   */
+  | {
+    sessionUpdate: "agent";
+    id: string;
+    peer: string;
+    label?: string;
+    event?: AgentTransitionWire;
+    status: AgentStateWire;
+    model?: string;
+    depth?: number;
+    workspace?: string;
+    toolCalls?: number;
+    filesModified?: number;
+    error?: string;
+  };
+
+/**
+ * Which transition this update *is*, as distinct from the state it left the child in.
+ *
+ * The state alone cannot express it. `started` and `revived` both leave a child `running`,
+ * so a client reading only `status` sees a child that finished, then finished again, with
+ * nothing to say why it ran a second time — and revival is the one resume primitive there
+ * is (§9). The bus channel `agents` has carried the transition since it existed; this is
+ * the same fact, on the wire a client actually reads.
+ */
+export type AgentTransitionWire =
+  | "spawned"
+  | "started"
+  | "completed"
+  | "failed"
+  | "cancelled"
+  | "timed_out"
+  | "revived";
+
+/** A spawned child's lifecycle, exactly as `#/$defs/agentState` declares it. */
+export type AgentStateWire =
+  | "queued"
+  | "starting"
+  | "running"
+  | "awaiting_tool"
+  | "completed"
+  | "failed"
+  | "timed_out"
+  | "cancelled";
 
 /**
  * Token counts for the single provider call that just finished.
@@ -453,7 +504,14 @@ export class SessionUpdateEncoder {
         }];
       }
       case "steered":
-        return [{ sessionUpdate: "steer", entryId: event.entryId, text: event.text, at: event.at }];
+        return [{
+          sessionUpdate: "steer",
+          entryId: event.entryId,
+          text: event.text,
+          at: event.at,
+          ...(event.source === undefined ? {} : { source: event.source }),
+          ...(event.from === undefined ? {} : { from: event.from }),
+        }];
       case "loop_warning":
         return [{
           sessionUpdate: "loop_warning",

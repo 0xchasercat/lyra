@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import type { AgentEvent } from "@lyra/core";
+import { SPAWN_LIFECYCLE_TYPES, type AgentEvent } from "@lyra/core";
 import {
   ACP_COMMAND_RESULT_KINDS,
   ACP_COMPLETION_LIMIT_MAX,
@@ -118,6 +118,32 @@ describe("ACP protocol schema", () => {
     };
     walk(loadProtocolSchema(), false);
     expect([...unsupported].sort()).toEqual(["params", "result"]);
+  });
+
+  /**
+   * The one drift this schema cannot catch on its own.
+   *
+   * `agent.event` is modelled on the Rust side by a forward-compatible decoder: a tag it
+   * does not know decodes to `Other(_)` and renders no row, which is right for an old client
+   * meeting a new daemon and silent for a typo. So the spellings the daemon actually emits
+   * are pinned against the enum the schema declares, here, where a mismatch is a red test
+   * rather than a transcript row that quietly stopped appearing.
+   */
+  test("every lifecycle transition the spawn manager emits is declared on the wire", () => {
+    const schema = loadProtocolSchema() as { $defs: { update: { oneOf: Array<{ title?: string; properties?: Record<string, { enum?: string[] }> }> } } };
+    const variant = schema.$defs.update.oneOf.find((candidate) => candidate.title === "agent");
+    expect(variant).toBeDefined();
+    const declared = variant!.properties?.event?.enum;
+    expect(declared).toBeDefined();
+    expect([...declared!].sort()).toEqual([...SPAWN_LIFECYCLE_TYPES].sort());
+    // And each one really does validate as an `agent` update, rather than merely appearing
+    // in an enum nothing checks.
+    for (const event of SPAWN_LIFECYCLE_TYPES) {
+      expect(validator.validate({ sessionUpdate: "agent", id: "spawn-1", peer: "scout", event, status: "running" }, "#/$defs/update")).toEqual([]);
+    }
+    // An invented transition is named and refused, not passed through as an unknown tag.
+    expect(validator.validate({ sessionUpdate: "agent", id: "spawn-1", peer: "scout", event: "resurrected", status: "running" }, "#/$defs/update").join("; "))
+      .toContain("$.event must be one of");
   });
 
   test("an undeclared field is a validation failure, not a silent pass", () => {
@@ -509,11 +535,11 @@ describe("frames on the wire", () => {
 
   test("the enumerable command shapes are closed, so a drifted field fails instead of reaching a renderer", () => {
     validator.assert({ sessions: [{ sessionId: "s-1", name: "main", path: "/tmp/main.jsonl", active: true }] }, "#/$defs/sessionsResult", "sessions");
-    validator.assert({ agents: [{ id: "a-1", workspace: "/tmp/w", status: "running", startedAt: 1_700_000_000_000 }] }, "#/$defs/agentsResult", "agents");
+    validator.assert({ agents: [{ id: "spawn-1", peer: "reviewer", workspace: "/tmp/w", status: "awaiting_tool", startedAt: 1_700_000_000_000, currentTool: "bash", toolCalls: 3, filesModified: ["src/a.ts"], writeScope: ["src/**"], resultAvailable: false }] }, "#/$defs/agentsResult", "agents");
     validator.assert({ skills: [{ name: "review", description: "d", origin: "bundled", path: "/tmp/s.md" }] }, "#/$defs/skillsResult", "skills");
     validator.assert({ tools: [{ server: "draco", name: "search", description: "d" }] }, "#/$defs/mcpResult", "mcp");
-    validator.assert({ report: "Git mode is now auto.", detail: { mode: "auto" } }, "#/$defs/reportResult", "report");
-    expect(validator.validate({ agents: [{ id: "a", workspace: "/w", status: "sleeping", startedAt: 0 }] }, "#/$defs/agentsResult").join("; "))
+    validator.assert({ report: "Rolled back to checkpoint ckpt-12.", detail: { checkpoint: "ckpt-12" } }, "#/$defs/reportResult", "report");
+    expect(validator.validate({ agents: [{ id: "a", peer: "a", workspace: "/w", status: "sleeping", startedAt: 0 }] }, "#/$defs/agentsResult").join("; "))
       .toContain("status");
     expect(validator.validate({ skills: [{ name: "n", description: "d", origin: "bundled", path: "/p", size: 12 }] }, "#/$defs/skillsResult").join("; "))
       .toContain("size is not declared");
@@ -669,15 +695,18 @@ describe("frames on the wire", () => {
     expect(validator.validate({ provider: "g", model: "m" }, "#/$defs/requests/provider~1remove/params").join("; ")).toContain("model is not declared");
   });
 
+  // The call is declared; no kind is issued today. The one that used to be — the Git
+  // auto-mode consent ceremony — went with the modes it gated (LYRA.md §12), so the
+  // `kind` below is an illustration of the shape rather than a behaviour that exists.
   test("the permission request is a declared bidirectional call", () => {
     validator.assert({
       sessionId: SESSION,
-      kind: "git_auto_mode",
-      title: "Enable automatic Git commits?",
-      detail: "Auto mode lets Lyra stage and commit its own work.",
+      kind: "example",
+      title: "Continue?",
+      detail: "A daemon that needs a human decision names it, explains it, and offers the choices.",
       options: [
-        { optionId: "allow_always", label: "Enable auto mode", kind: "allow_always" },
-        { optionId: "reject", label: "Keep manual control", kind: "reject" },
+        { optionId: "allow_once", label: "Continue", kind: "allow_once" },
+        { optionId: "reject", label: "Stop", kind: "reject" },
       ],
     }, "#/$defs/clientRequests/session~1request_permission/params", "permission params");
     validator.assert({ optionId: "reject" }, "#/$defs/clientRequests/session~1request_permission/result", "permission result");

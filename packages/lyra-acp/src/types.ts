@@ -2,14 +2,15 @@
 // fails the build if the two ever disagree.
 export const ACP_METHODS = [
   "session/new", "session/load", "session/list", "session/snapshot", "session/prompt", "session/steer",
-  "session/cancel", "session/fork", "session/command", "session/commands", "session/complete",
+  "session/cancel", "session/fork", "session/rewind", "session/command", "session/commands", "session/complete",
   "session/models", "session/select_model", "session/providers", "session/select_provider",
   "provider/setup_options", "provider/detect", "provider/verify", "provider/add",
   "provider/get", "provider/remove",
   "model/add",
   "workspace/list", "workspace/create", "workspace/drop",
   "agent/list", "agent/spawn", "agent/cancel", "agent/message",
-  "git/preview", "git/apply", "git/rollback", "git/snapshot",
+  "git/preview", "git/apply",
+  "checkpoint/list", "checkpoint/diff", "checkpoint/restore",
   "context/inspect", "settings/get", "settings/set",
 ] as const;
 
@@ -20,7 +21,8 @@ export const ACP_METHODS = [
  * command uses. A conformance test keeps this list and the schema's enum identical.
  */
 export const ACP_COMMAND_RESULT_KINDS = [
-  "models", "sessions", "workspaces", "agents", "health", "context", "skills", "mcp", "report",
+  "models", "sessions", "workspaces", "agents", "health", "context", "skills", "mcp",
+  "checkpoints", "review", "report",
 ] as const;
 export type AcpCommandResultKind = typeof ACP_COMMAND_RESULT_KINDS[number];
 
@@ -203,6 +205,64 @@ export const ACP_TURN_METHODS = [
 export type AcpTurnMethod = typeof ACP_TURN_METHODS[number];
 /** §3.4's total-turn deadline: the default for [`ACP_TURN_METHODS`]. */
 export const ACP_DEFAULT_TURN_TIMEOUT_MS = 1_800_000;
+
+/**
+ * The rewind surface, as a client sees it.
+ *
+ * Checkpoints are taken by the daemon before every state-changing tool call and at both
+ * turn boundaries; `entryId` anchors one to the transcript entry it precedes, which is what
+ * lets a client offer "rewind to before this message" and move code and conversation
+ * together. `id` is stable across the thinning that `/cleanup` performs, so a client may
+ * hold one between calls.
+ */
+export interface AcpCheckpoint {
+  id: string;
+  kind: "turn_start" | "pre_tool" | "turn_end" | "pre_restore" | "manual";
+  label: string;
+  createdAt: string;
+  /** How many paths differ from the checkpoint before this one. */
+  changedFiles: number;
+  entryId?: string;
+  tool?: string;
+  callId?: string;
+  /** Paths outside the snapshot entirely, e.g. node_modules. */
+  excluded: string[];
+}
+export interface AcpCheckpointListResult {
+  checkpoints: AcpCheckpoint[];
+  available: boolean;
+  /** Why checkpointing is off, when it is. A client renders this instead of an empty list. */
+  unavailable?: string;
+}
+export interface AcpCheckpointFileChange {
+  path: string;
+  status: "added" | "modified" | "deleted" | "renamed" | "copied" | "type_changed";
+  oldPath?: string;
+  additions?: number;
+  deletions?: number;
+  binary?: true;
+  /** Unified diff for this one path, present only when `patches` was requested. */
+  patch?: string;
+  patchTruncated?: true;
+}
+export interface AcpCheckpointDiffResult {
+  from: { kind: "checkpoint" | "worktree" | "empty"; id?: string; label?: string; createdAt?: string };
+  to: { kind: "checkpoint" | "worktree" | "empty"; id?: string; label?: string; createdAt?: string };
+  files: AcpCheckpointFileChange[];
+  truncated: boolean;
+  available: boolean;
+  unavailable?: string;
+}
+export interface AcpCheckpointRestoreResult {
+  target: AcpCheckpoint;
+  /** The checkpoint of the replaced state. Restoring it undoes the restore. */
+  safety: AcpCheckpoint;
+  restored: string[];
+  /** Changed outside Lyra's own tool calls, and therefore left exactly as they were. */
+  preserved: string[];
+  forced: boolean;
+  excluded: string[];
+}
 
 /** Daemon-to-client requests. Bidirectional ACP: these are the only points a turn blocks on a human. */
 export const ACP_CLIENT_METHODS = ["session/request_permission"] as const;
