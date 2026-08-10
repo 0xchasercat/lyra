@@ -116,6 +116,46 @@ describe("TranscriptStore", () => {
     reopened.close();
   });
 
+  test("round-trips turn usage and keeps unmeasured counts absent rather than zero", () => {
+    const path = temporaryPath();
+    const store = TranscriptStore.create(baseOptions(path));
+    const measured = store.append({ type: "usage", inputTokens: 1_200, outputTokens: 340, cacheReadTokens: 900, cacheWriteTokens: 128, costMicroUsd: 4_100 });
+    const partial = store.append({ type: "usage", inputTokens: 50, outputTokens: 7 });
+    store.close();
+
+    const lines = readFileSync(path, "utf8").trimEnd().split("\n");
+    expect(JSON.parse(lines[2]!)).not.toHaveProperty("cacheReadTokens");
+    expect(JSON.parse(lines[2]!)).not.toHaveProperty("costMicroUsd");
+
+    const reopened = TranscriptStore.open(path);
+    expect(reopened.entries().filter((entry) => entry.type === "usage")).toEqual([measured, partial]);
+    expect(reopened.head.id).toBe(partial.id);
+    reopened.close();
+
+    writeFileSync(path, `${readFileSync(path, "utf8").trimEnd().split("\n")[0]!}\n{"type":"usage","id":"bad","parentId":"root","timestamp":"2026-08-05T00:00:01.000Z","inputTokens":-1,"outputTokens":0}\n`);
+    expect(() => TranscriptStore.open(path)).toThrow("usage token counts must be non-negative");
+  });
+
+  test("loads a transcript written before usage entries existed", () => {
+    const path = temporaryPath();
+    // A byte-for-byte pre-change transcript: no usage entry anywhere, and the head is the
+    // assistant reply it always was. Adding an entry type must not strand these.
+    writeFileSync(path, [
+      '{"type":"session","id":"root","parentId":null,"timestamp":"2026-08-05T00:00:00.000Z","sessionId":"session-test","name":"legacy","origin":"test","workspace":"/worktree","provider":"fixture","model":"fixture-model"}',
+      '{"type":"message","id":"ask","parentId":"root","timestamp":"2026-08-05T00:00:01.000Z","role":"user","content":[{"type":"text","text":"ask"}],"status":"complete"}',
+      '{"type":"message","id":"reply","parentId":"ask","timestamp":"2026-08-05T00:00:02.000Z","role":"assistant","content":[{"type":"text","text":"reply"}],"status":"complete"}',
+      "",
+    ].join("\n"));
+    const store = TranscriptStore.open(path);
+    expect(store.lineage().map((entry) => entry.id)).toEqual(["root", "ask", "reply"]);
+    const appended = store.append({ type: "usage", inputTokens: 10, outputTokens: 2 });
+    expect(appended.parentId).toBe("reply");
+    store.close();
+    const reopened = TranscriptStore.open(path);
+    expect(reopened.entries().map((entry) => entry.type)).toEqual(["session", "message", "message", "usage"]);
+    reopened.close();
+  });
+
   test("truncates only an invalid unterminated tail and preserves every prior entry", () => {
     const path = temporaryPath();
     const store = TranscriptStore.create(baseOptions(path));

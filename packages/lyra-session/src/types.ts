@@ -69,6 +69,26 @@ export interface ProviderSwitchEntry extends SessionEntryBase {
   losses: string[];
 }
 
+/**
+ * What one completed turn cost, as the provider reported it, summed over every call the
+ * turn made. It is written where the turn ended so that a transcript alone answers "how
+ * many tokens did this session spend" — the running totals live in memory and on the ACP
+ * wire, and neither survives the process.
+ *
+ * Every field is a raw count, never an estimate. Cache counts are present only for
+ * providers that report them and `costMicroUsd` only for models with known pricing; an
+ * absent field means "not measured", which is the one thing a derived zero cannot say.
+ * The entry carries no derived totals, so replaying a transcript can only agree with it.
+ */
+export interface TurnUsageEntry extends SessionEntryBase {
+  type: "usage";
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens?: number;
+  cacheWriteTokens?: number;
+  costMicroUsd?: number;
+}
+
 export type TranscriptEntry =
   | SessionStartEntry
   | MessageEntry
@@ -76,7 +96,8 @@ export type TranscriptEntry =
   | CompactionBoundaryEntry
   | ContextRepairEntry
   | CheckpointEntry
-  | ProviderSwitchEntry;
+  | ProviderSwitchEntry
+  | TurnUsageEntry;
 
 export type NewTranscriptEntry = TranscriptEntry extends infer Entry
   ? Entry extends TranscriptEntry

@@ -432,6 +432,18 @@ function validateEntry(value: unknown, path: string, line: number): asserts valu
       }
       if (!isStringArray(value.losses)) fail("provider switch losses must contain strings");
       return;
+    case "usage":
+      if (!isNonNegativeFinite(value.inputTokens) || !isNonNegativeFinite(value.outputTokens)) {
+        fail("usage token counts must be non-negative finite numbers");
+      }
+      // Optional by design: a field that was never measured is absent rather than zero,
+      // so a present field is always a number the provider actually reported.
+      for (const field of ["cacheReadTokens", "cacheWriteTokens", "costMicroUsd"] as const) {
+        if (value[field] !== undefined && !isNonNegativeFinite(value[field])) {
+          fail(`usage ${field} must be a non-negative finite number when present`);
+        }
+      }
+      return;
     default:
       fail(`unknown entry type ${JSON.stringify(value.type)}`);
   }
