@@ -1,6 +1,6 @@
 import { resolve as resolvePath } from "node:path";
 import { authPluginRoot, cachedModels, createProviderTransport, loadProviderConfig, ProviderFault, ReliableProvider, resolveProvider, resolveModelRole } from "@lyra/provider";
-import type { AuthConfig, AuthSource, ProviderDefinition, ProviderFileConfig, ProviderTransport, ResolveProviderOptions } from "@lyra/provider";
+import type { AuthConfig, AuthSource, ModelInfo, ProviderDefinition, ProviderFileConfig, ProviderTransport, ResolveProviderOptions } from "@lyra/provider";
 
 export interface EnvironmentProviderOptions {
   configPath?: string;
@@ -16,6 +16,15 @@ export interface EnvironmentProviderOptions {
   turnTimeoutMs?: number;
   /** Home directory auth plugins are read from. Defaults to the real one; tests point it away. */
   home?: string;
+  /**
+   * Where a boot-time degradation is said out loud.
+   *
+   * A configuration can name a provider that is not there — `[roles].default` left pointing at
+   * one that was removed, a `--model` whose provider was never added — and that is a *stale*
+   * configuration, not a broken one. [`createEnvironmentProvider`] boots on a fallback rather
+   * than throwing (see there), and this is the one line that says so.
+   */
+  onNotice?: (message: string) => void;
 }
 
 /** `~/.lyra/plugins`, or a test's stand-in for it, in the shape `resolveProvider` accepts. */
@@ -65,9 +74,96 @@ export function createUnconfiguredEnvironment(config: ProviderFileConfig, reason
   return { provider: new ReliableProvider(transport, { maxAttempts: 1 }), providerName: "", model: "", config, unconfigured: reason };
 }
 
+/**
+ * Boot an environment from configuration on disk, degrading rather than crashing when that
+ * configuration has gone stale.
+ *
+ * The observed failure: a provider was removed and `[roles].default` kept naming it, so the
+ * next launch threw `Provider "alex" is not configured` out of `createConfiguredProvider` —
+ * uncaught, as a raw stack trace, from a process that had already spawned the TUI. Nothing
+ * about that is a decision the user has to make before Lyra can run: another provider *is*
+ * configured, and running on it beats not running at all.
+ *
+ * So a reference whose provider is missing while other providers exist is not an error here.
+ * The deterministic fallback ([`chooseFallbackReference`]) is booted instead and `onNotice`
+ * carries one actionable line about it. Every other way a reference can be wrong — a role that
+ * does not exist, a malformed `provider/model`, a provider that is configured but unusable —
+ * still throws, because those name something to fix rather than something merely out of date.
+ *
+ * When nothing at all is configured the caller's unconfigured path applies; when the only
+ * providers left have no model to name, this returns an unconfigured environment carrying the
+ * same sentence, so the daemon comes up and `/provider` and `/model` are reachable.
+ */
 export async function createEnvironmentProvider(options: EnvironmentProviderOptions = {}): Promise<EnvironmentProvider> {
   const config = await loadProviderConfig(options.configPaths ?? options.configPath);
-  return createConfiguredProvider(config, options);
+  const missing = missingProviderFor(config, options.model);
+  if (missing === undefined) return createConfiguredProvider(config, options);
+  const candidates = Object.entries(config.providers).map(([name, definition]) => ({ name, models: definition.models ?? [] }));
+  const fallback = await chooseFallbackReference(candidates, options.home === undefined ? {} : { home: options.home });
+  const source = options.model === undefined
+    ? `[roles].default names provider ${missing}, which is not configured`
+    : `--model ${options.model} names provider ${missing}, which is not configured`;
+  if (fallback === undefined) {
+    const reason = `${source}, and no other configured provider declares a model to fall back to (${Object.keys(config.providers).sort().join(", ")}). Pick one with /model, register a model with "/model add <provider> <id>", or fix [roles].default in Lyra TOML.`;
+    options.onNotice?.(reason);
+    return createUnconfiguredEnvironment(config, reason);
+  }
+  options.onNotice?.(`${source} — running on ${fallback}; use /model to choose another, or fix [roles].default in Lyra TOML.`);
+  return createConfiguredProvider(config, { ...options, model: fallback });
+}
+
+/**
+ * The provider a reference names and the configuration does not have — the one shape of
+ * staleness that is safe to boot around. `undefined` for every reference that resolves to a
+ * configured provider, and for every configuration that has no provider at all (that is the
+ * unconfigured path, which the caller already handles).
+ *
+ * The bare-id rule is the same one [`createConfiguredProvider`] applies, because a bare id is
+ * resolved against `[roles].default`'s provider: `--model gpt-5.6` against a default that
+ * names a removed provider is the same staleness by another route.
+ */
+function missingProviderFor(config: ProviderFileConfig, model: string | undefined): string | undefined {
+  if (Object.keys(config.providers).length === 0) return undefined;
+  if (model === undefined && config.roles.default === undefined) return undefined;
+  // A role that does not exist is a typo, not staleness: it still throws, from the one place
+  // that lists the roles that do exist.
+  const reference = resolveModelRole(model ?? "@default", config.roles);
+  const separator = reference.indexOf("/");
+  const name = separator > 0
+    ? reference.slice(0, separator)
+    : config.roles.default?.split("/")[0] ?? Object.keys(config.providers)[0]!;
+  return config.providers[name] === undefined ? name : undefined;
+}
+
+/** A provider a fallback may land on: its name, and the models it declares. */
+export interface FallbackCandidate { name: string; models: readonly string[] }
+
+/**
+ * Which `provider/model` a stale configuration lands on, decided the same way every time.
+ *
+ * Deterministic on purpose: alphabetical order, and the first candidate that has a model at
+ * all. Declared models are preferred over discovered ones across the whole set — a provider
+ * someone wrote `models = [...]` for is a provider they meant to use, and a cache is only
+ * evidence that some endpoint answered once. A candidate with neither is skipped rather than
+ * turned into a `provider/` reference nothing can serve.
+ */
+export async function chooseFallbackReference(
+  candidates: readonly FallbackCandidate[],
+  options: { home?: string } = {},
+): Promise<string | undefined> {
+  const sorted = [...candidates].sort((left, right) => left.name < right.name ? -1 : left.name > right.name ? 1 : 0);
+  for (const candidate of sorted) {
+    const declared = candidate.models[0];
+    if (declared !== undefined && declared.length > 0) return `${candidate.name}/${declared}`;
+  }
+  for (const candidate of sorted) {
+    let cached: readonly ModelInfo[] | undefined;
+    try { cached = await cachedModels(candidate.name, options.home === undefined ? undefined : resolvePath(options.home, ".lyra", "providers")); }
+    catch { continue; /* an unreadable cache is no candidate, not a failed fallback */ }
+    const first = cached?.[0]?.id;
+    if (first !== undefined && first.length > 0) return `${candidate.name}/${first}`;
+  }
+  return undefined;
 }
 
 export function createConfiguredProvider(config: ProviderFileConfig, options: Omit<EnvironmentProviderOptions, "configPath" | "configPaths"> = {}): EnvironmentProvider {

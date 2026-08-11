@@ -1771,7 +1771,7 @@
       }
     },
     "removeProviderResult": {
-      "description": "What was deleted. The declaration always; the stored credential only when `removeCredential` asked for it, and `credentialRemoved` says whether there turned out to be one. Roles are deliberately NOT rewritten — a role is a user's choice about what @default means, and silently repointing it would be a bigger surprise than a dangling one — so any that still name the removed provider come back in `danglingRoles` for the client to surface.",
+      "description": "What was deleted. The declaration always; the stored credential only when `removeCredential` asked for it, and `credentialRemoved` says whether there turned out to be one. `default` is the one role that is repaired: it is the reference the next boot resolves before anything else, so a removal that would leave it dangling repoints it at a remaining provider and reports the new reference in `defaultRepointedTo` (or, when the last provider just left, clears the roles that named it and lists them in `rolesCleared`). `fast` and `merge` are still left alone — they fail one call at a time, with a sentence naming the provider — and come back in `danglingRoles` for the client to surface.",
       "type": "object",
       "required": [
         "ok",
@@ -1801,6 +1801,19 @@
             "type": "string",
             "minLength": 1
           }
+        },
+        "defaultRepointedTo": {
+          "type": "string",
+          "minLength": 1,
+          "description": "The `provider/model` [roles].default now names, when the removal would otherwise have left it dangling. Absent when the default did not name the removed provider, or when nothing remaining had a model to repoint it at."
+        },
+        "rolesCleared": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "description": "Roles deleted rather than repointed, because the provider that left was the last one configured."
         }
       }
     },

@@ -1327,14 +1327,28 @@ mod tests {
         assert_eq!(local.auth_summary(), "none");
         assert!(local.models.is_empty() && !local.in_use, "absent reads as empty, not unknown");
 
-        // `provider/remove` — the two facts a confirmation line is built from.
+        // `provider/remove` — the facts a confirmation line is built from,
+        // including the repointed default the daemon writes so the next boot
+        // never crashes on a role naming a provider that is gone.
         let removed: RemoveProviderResult = serde_json::from_value(
             json!({"ok":true,"provider":"openai","path":"/tmp/p.toml",
-                   "credentialRemoved":true,"danglingRoles":["default"]}),
+                   "credentialRemoved":true,"danglingRoles":["fast","merge"],
+                   "defaultRepointedTo":"claude-max/claude-opus-5"}),
         )
         .expect("provider/remove decodes");
         assert_eq!(removed.credential_removed, Some(true));
-        assert_eq!(removed.dangling_roles, vec!["default".to_owned()]);
+        assert_eq!(removed.dangling_roles, vec!["fast".to_owned(), "merge".to_owned()]);
+        assert_eq!(
+            removed.default_repointed_to.as_deref(),
+            Some("claude-max/claude-opus-5")
+        );
+        let cleared: RemoveProviderResult = serde_json::from_value(
+            json!({"ok":true,"provider":"last-one","path":"/tmp/p.toml",
+                   "rolesCleared":["default","fast","merge"]}),
+        )
+        .expect("a last-provider removal decodes");
+        assert_eq!(cleared.roles_cleared.len(), 3);
+        assert!(cleared.default_repointed_to.is_none(), "nothing left to repoint at");
         let quiet: RemoveProviderResult =
             serde_json::from_value(json!({"ok":true,"provider":"local","path":"/tmp/p.toml"}))
                 .expect("a removal with nothing to say decodes");

@@ -22,10 +22,11 @@
  */
 
 import type { CodeMap } from "./incremental.ts";
-import { splitIdentifier } from "./qn.ts";
-import { clampBudget, renderDocument, type Section } from "./render.ts";
+import { familyOf, splitIdentifier } from "./qn.ts";
+import { clampBudget, MIN_BUDGET, renderDocument, type Section } from "./render.ts";
 import { staleCount } from "./query.ts";
 import type { CrossEdge, DegreeNode } from "./store.ts";
+import type { LanguageFamily } from "./types.ts";
 import { toonField, toonFlatTable, toonList, toonNote, type ToonNode, type ToonRow } from "./toon.ts";
 
 /**
@@ -63,6 +64,8 @@ interface Group {
   label: string;
   readonly dir: string;
   readonly files: string[];
+  /** The language families its files belong to. Resolution never crosses one, so this bounds its edges. */
+  readonly families: Set<LanguageFamily>;
   symbols: number;
   out: number;
   in: number;
@@ -113,10 +116,22 @@ export function overview(map: CodeMap, options: { budget?: number } = {}): strin
     into.in += flow.n;
   }
 
+  // An island that is the repository's only Rust — or its only Python — is not a disconnected
+  // subsystem: the resolver refuses to cross a language family at all, so those edges were
+  // never eligible to exist. Saying so is the difference between a finding and a false alarm.
+  const islands = languageIslands(groups);
+  // The head is never trimmed, so at the floor budget this annotation would be spending the
+  // reader's only rows on a caveat. Everywhere else it is worth its one line.
+  if (islands.length > 0 && budget > MIN_BUDGET) {
+    const named = islands.slice(0, 3).map((island) => `${island.label} (${[...island.families].sort().join("/")})`).join(", ");
+    const more = islands.length > 3 ? ` +${islands.length - 3}` : "";
+    head.push(toonNote(`islands by language: ${named}${more} — no cross-language edges by design, not a missing dependency`));
+  }
+
   const hubs = godNodes(map);
   const surprises = surprising(map, byFile);
   const entries = entryPoints(map, byFile);
-  const questions = suggestedQuestions(map, groups, hubs);
+  const questions = suggestedQuestions(map, groups, hubs, islands);
 
   const sections: Section[] = [];
   if (groups.length > 1) {
@@ -193,7 +208,9 @@ export function vocabulary(map: CodeMap, limit = 200): { term: string; count: nu
  * by its highest-degree member, because "." tells the reader nothing.
  */
 function partition(map: CodeMap): Group[] {
-  const files = map.store.allFiles().map((row) => row.path);
+  const rows = map.store.allFiles().map((row) => ({ path: row.path, family: familyOf(row.language) }));
+  const files = rows.map((row) => row.path);
+  const familyOfFile = new Map(rows.map((row) => [row.path, row.family]));
   const modules = [...map.store.modules().entries()]
     .filter(([, dir]) => dir.length > 0)
     .sort((a, b) => b[1].length - a[1].length);
@@ -202,10 +219,15 @@ function partition(map: CodeMap): Group[] {
   const claim = (dir: string, label: string): Group => {
     let group = groups.get(dir);
     if (!group) {
-      group = { label, dir, files: [], symbols: 0, out: 0, in: 0 };
+      group = { label, dir, files: [], families: new Set(), symbols: 0, out: 0, in: 0 };
       groups.set(dir, group);
     }
     return group;
+  };
+  const add = (group: Group, file: string): void => {
+    group.files.push(file);
+    const family = familyOfFile.get(file);
+    if (family) group.families.add(family);
   };
 
   // A file no manifest claims — a Rust crate beside the TypeScript packages, say — is
@@ -214,21 +236,35 @@ function partition(map: CodeMap): Group[] {
   const leftoverDepth = modules.reduce((deepest, [, dir]) => Math.max(deepest, dir.split("/").length), 1);
   for (const file of files) {
     const module = modules.find(([, dir]) => file === dir || file.startsWith(`${dir}/`));
-    if (module) claim(module[1], module[0]).files.push(file);
+    if (module) add(claim(module[1], module[0]), file);
     else {
       const dir = segment(file, leftoverDepth);
-      claim(dir, dir).files.push(file);
+      add(claim(dir, dir), file);
     }
   }
 
   for (let depth = 1; groups.size <= 1 && depth <= 3; depth += 1) {
     groups.clear();
-    for (const file of files) claim(segment(file, depth), segment(file, depth)).files.push(file);
+    for (const file of files) add(claim(segment(file, depth), segment(file, depth)), file);
   }
 
   const out = [...groups.values()];
   for (const group of out) if (group.label.length === 0) group.label = nameByHub(map, group);
   return out;
+}
+
+/**
+ * Partitions whose isolation is the language boundary rather than a missing dependency: they
+ * have no cross-group edges at all, and no other partition shares a language family with them,
+ * so no edge the resolver is willing to draw could ever have connected them. A repository's
+ * only Rust crate beside its TypeScript packages is the canonical case.
+ */
+function languageIslands(groups: readonly Group[]): Group[] {
+  if (groups.length < 2) return [];
+  return groups.filter((group) => {
+    if (group.files.length === 0 || group.out + group.in > 0 || group.families.size === 0) return false;
+    return groups.every((other) => other === group || ![...other.families].some((family) => group.families.has(family)));
+  });
 }
 
 /** The directory `path` sits in, truncated to `depth` segments. `""` for a repository-root file. */
@@ -354,7 +390,12 @@ function entryPoints(map: CodeMap, byFile: ReadonlyMap<string, Group>): ToonRow[
  * is a verb and an argument the reader can pass straight back to the tool, plus the measured
  * reason it is worth asking.
  */
-function suggestedQuestions(map: CodeMap, groups: readonly Group[], hubs: readonly DegreeNode[]): ToonRow[] {
+function suggestedQuestions(
+  map: CodeMap,
+  groups: readonly Group[],
+  hubs: readonly DegreeNode[],
+  islands: readonly Group[] = [],
+): ToonRow[] {
   const rows: ToonRow[] = [];
 
   for (const hub of hubs) {
@@ -368,8 +409,11 @@ function suggestedQuestions(map: CodeMap, groups: readonly Group[], hubs: readon
   }
 
   if (groups.length > 1) {
+    // A language island is already explained in the head; asking about it here would be
+    // inviting the reader to investigate a boundary the map drew on purpose.
+    const explained = new Set(islands);
     for (const group of [...groups].sort((a, b) => b.files.length - a.files.length)) {
-      if (group.out + group.in > 0 || group.files.length === 0) continue;
+      if (group.out + group.in > 0 || group.files.length === 0 || explained.has(group)) continue;
       rows.push(["search", group.label, `${group.label} has no edges to the rest of the graph — dead, or only reached dynamically?`]);
       break;
     }

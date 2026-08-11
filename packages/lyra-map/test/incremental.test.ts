@@ -455,7 +455,7 @@ describe("staleness", () => {
     const root = repository(FIXTURE);
     const map = open(root);
     await map.index();
-    expect(await map.stale()).toEqual({ added: [], changed: [], removed: [] });
+    expect(await map.stale()).toEqual({ added: [], changed: [], removed: [], skipped: [] });
 
     write(root, "packages/app/src/format.ts", `export function format(value: number): string { return "changed"; }\n`);
     write(root, "packages/app/src/fresh.ts", `export const fresh = 1;\n`);
@@ -465,9 +465,52 @@ describe("staleness", () => {
       added: ["packages/app/src/fresh.ts"],
       changed: ["packages/app/src/format.ts"],
       removed: ["packages/app/src/app.ts"],
+      skipped: [],
     });
     // Hashing every file must reach the same verdict as trusting mtime and size.
     expect(await map.stale({ hash: true })).toEqual(await map.stale());
+    map.close();
+  });
+
+  /**
+   * A file the indexer refuses is not drift. Reporting it as added would put a staleness
+   * warning on every answer that no amount of re-indexing could ever clear — which is
+   * exactly what one source file carrying a literal NUL byte did.
+   */
+  test("a file the indexer refuses is reported as skipped, never as an addition", async () => {
+    const root = repository({ "src/lib.ts": `export const value = 1;\n` });
+    const map = open(root);
+    await map.index();
+    write(root, "src/blob.ts", `export const data = "${"\0"}";\n`);
+
+    const report = await map.stale();
+    expect(report.added).toEqual([]);
+    expect(report.skipped).toEqual(["src/blob.ts"]);
+
+    // And an update pass over it leaves the index alone rather than half-accepting it.
+    await map.update(["src/blob.ts"]);
+    expect(map.store.fileRow("src/blob.ts")).toBeNull();
+    expect((await map.stale()).added).toEqual([]);
+    map.close();
+  });
+
+  test("an unchanged file whose mtime moved is re-stamped rather than re-parsed", async () => {
+    const root = repository(FIXTURE);
+    const map = open(root);
+    await map.index();
+    const before = map.store.fileRow("packages/app/src/format.ts")!;
+
+    const { utimesSync } = await import("node:fs");
+    const later = new Date(before.mtimeMs + 5_000);
+    utimesSync(join(root, "packages/app/src/format.ts"), later, later);
+    const stats = await map.update(["packages/app/src/format.ts"]);
+
+    expect(stats.changed).toBe(0);
+    expect(stats.unchanged).toBe(1);
+    const after = map.store.fileRow("packages/app/src/format.ts")!;
+    expect(after.mtimeMs).toBe(Math.round(later.getTime()));
+    expect(after.contentSha).toBe(before.contentSha);
+    expect(after.indexedAt).toBe(before.indexedAt);
     map.close();
   });
 

@@ -139,6 +139,14 @@ export interface AcpRemoveProviderResult {
   credentialRemoved?: boolean;
   /** Roles still pointing at the removed provider. Left in place on purpose; named so a client can say so. */
   danglingRoles?: string[];
+  /**
+   * What `[roles].default` now names, when removing the provider it named would have left the
+   * next boot resolving `@default` to nothing. Absent when the default did not name the removed
+   * provider, or when no remaining provider had a model to repoint it at.
+   */
+  defaultRepointedTo?: string;
+  /** Roles deleted outright, because the provider that left was the last one configured. */
+  rolesCleared?: string[];
 }
 /** How long one detection probe is given. Three run concurrently, so this is the whole call's cost. */
 export const ACP_DETECT_PROBE_TIMEOUT_MS = 3_000;

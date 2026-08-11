@@ -1,5 +1,5 @@
 import { afterAll, afterEach, beforeAll, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import {
@@ -122,6 +122,34 @@ describe("symbol resolution", () => {
     ]);
     // ...and the dotted tail disambiguates it.
     expect(resolveSymbol(map, "mid.reset").node?.qn).toBe("packages.mid.src.mid.reset");
+  });
+
+  /**
+   * The tool's own description promises a file path, and a reader always has one in hand —
+   * every other tool in the session is addressed that way.
+   */
+  test("a repository-relative path resolves to that file's node", () => {
+    expect(resolveSymbol(map, "packages/core/src/base.ts").node?.qn).toBe("packages.core.src.base");
+    expect(resolveSymbol(map, "./packages/core/src/base.ts").node?.qn).toBe("packages.core.src.base");
+    expect(resolveSymbol(map, join(root, "packages/core/src/base.ts")).node?.qn).toBe("packages.core.src.base");
+  });
+
+  test("an unambiguous tail of a path resolves too, and an ambiguous one answers with candidates", () => {
+    expect(resolveSymbol(map, "src/cloud.ts").node?.qn).toBe("packages.core.src.cloud");
+    const lookup = resolveSymbol(map, "src/index.ts");
+    expect(lookup.node?.qn).toBe("packages.core.src.index");
+    expect(resolveSymbol(map, "packages/nothing/here.ts").node).toBeUndefined();
+  });
+
+  test("explaining a file lists the symbols it defines and the modules it trades names with", () => {
+    const answer = explain(map, "packages/mid/src/mid.ts");
+    expect(answer).toContain("qn: packages.mid.src.mid");
+    expect(answer).toContain("kind: file");
+    expect(answer).not.toContain("found: 0");
+    // Its own symbols, and the import that gave it `base`.
+    expect(answer).toContain("middle,contains");
+    expect(answer).toContain("packages.core.src.base,packages/mid/src/mid.ts");
+    expect(answer).toContain("base,imports_from");
   });
 
   test("a name that matches nothing answers with the nearest hits, not with silence", () => {
@@ -379,6 +407,29 @@ describe("staleness", () => {
     expect(staleCount(local)).toBe(1);
     expect(search(local, "base")).toContain("stale: 1 files");
     expect(explain(local, "base")).toContain("stale: 1 files");
+    local.close();
+  });
+
+  /**
+   * A checkout, a formatter that rewrote a file byte-identically, a `touch`: the mtime moves
+   * and the content does not. Only a *content* change ever rewrote a file row, so before the
+   * hash check this counted as drift on every single answer, forever.
+   */
+  test("a file whose mtime moved but whose bytes did not is neither reported nor re-reported", async () => {
+    const touched = repository(FIXTURE);
+    const local = CodeMap.open({ root: touched, path: join(touched, ".lyra", "map.db") });
+    await local.index();
+    const target = join(touched, "packages/mid/src/mid.ts");
+    const stored = local.store.fileRow("packages/mid/src/mid.ts")!;
+
+    const later = new Date(stored.mtimeMs + 5_000);
+    utimesSync(target, later, later);
+    expect(staleCount(local)).toBe(0);
+    expect(search(local, "base")).not.toContain("stale:");
+    // Healed, not merely forgiven: the stored row now agrees with disk, so the next call is
+    // the cheap comparison again rather than another hash of the same unchanged file.
+    expect(local.store.fileRow("packages/mid/src/mid.ts")!.mtimeMs).toBe(Math.round(later.getTime()));
+    expect((await local.stale()).changed).toEqual([]);
     local.close();
   });
 });

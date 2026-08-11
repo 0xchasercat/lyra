@@ -101,10 +101,14 @@ async function runInteractive(cli: CliOptions): Promise<void> {
   const binary = await resolveTuiBinary();
   const child = Bun.spawn([binary], { cwd: process.cwd(), stdin: "pipe", stdout: "pipe", stderr: "inherit" });
   let runtime: LyraRuntime;
-  // Booting the runtime can fail (bad provider, unreadable config). The child is already
-  // running by then, so it is reaped here rather than left holding the terminal.
+  // Booting the runtime can still fail (unreadable config, a role naming nothing). The child is
+  // already running by then, and by then it has also started probing the terminal — so killing
+  // it is not enough. A killed child never finishes its own teardown, and the replies to the
+  // probes it had in flight (`4;0;rgb:…` palette answers) land in the shell that outlives it.
+  // Closing its stdin is the same clean disconnect a normal exit uses: the child sees EOF,
+  // restores the terminal itself, and only a child that will not take that hint is killed.
   try { runtime = await LyraRuntime.create(cli); }
-  catch (error) { child.kill(); await child.exited; throw error; }
+  catch (error) { await endChild(child); throw error; }
   let ended = false;
   const endInput = (): void => { if (ended) return; ended = true; try { child.stdin.end(); } catch { /* the child already went away */ } };
   shutdownTarget = { close: async () => { endInput(); await runtime.close(); } };
@@ -118,6 +122,23 @@ async function runInteractive(cli: CliOptions): Promise<void> {
     const code = await child.exited;
     if (code !== 0 && process.exitCode === undefined) process.exitCode = code;
   }
+}
+
+/** How long a TUI child is given to see EOF and restore the terminal before it is killed. */
+const CHILD_SHUTDOWN_GRACE_MS = 2_000;
+
+/**
+ * Shut a spawned TUI down the way it expects to be shut down: EOF on stdin, which it treats as
+ * a clean disconnect and answers by restoring the keyboard and screen modes it set. The kill is
+ * the fallback, not the plan — a child killed mid-probe leaves its own escape sequences and the
+ * terminal's replies to them in the user's shell.
+ */
+async function endChild(child: { stdin?: { end(): void } | null; exited: Promise<number>; kill(): void }): Promise<void> {
+  try { child.stdin?.end(); } catch { /* already gone; the wait below is still correct */ }
+  const exited = await Promise.race([child.exited, Bun.sleep(CHILD_SHUTDOWN_GRACE_MS).then(() => undefined)]);
+  if (exited !== undefined) return;
+  child.kill();
+  await child.exited;
 }
 
 /**
@@ -192,8 +213,27 @@ Auth plugins (the one executable extension point — see docs/plugins.md):
 
 Environment:
   LYRA_TUI_BIN  path to the lyra-tui binary, when it is not next to \`lyra\`
+  LYRA_DEBUG=1  print the full stack trace when a launch fails, not just the reason
 
 Configuration: ~/.lyra/config.toml, ~/.lyra/providers.toml, and <origin>/.lyra/config.toml
 `; }
 
-await main();
+/**
+ * The last line a failed launch prints.
+ *
+ * A boot failure used to escape `main()` entirely: Bun printed the exception with its own
+ * stack, full of `$bunfs` paths from inside the compiled bundle, which is noise to everyone who
+ * did not build Lyra and hides the one sentence that says what to fix. The message is the
+ * whole report now, and the trace is available to anyone who asks for it by name.
+ */
+function failureReport(error: unknown, debug: boolean): string {
+  const message = error instanceof Error ? error.message : String(error);
+  const trace = debug && error instanceof Error && typeof error.stack === "string" ? `\n${error.stack}\n` : "";
+  return `lyra: ${message.trim()}\n${trace}`;
+}
+
+try { await main(); }
+catch (error) {
+  process.stderr.write(failureReport(error, Bun.env.LYRA_DEBUG === "1"));
+  process.exit(1);
+}

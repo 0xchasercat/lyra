@@ -398,16 +398,21 @@ describe("model/add", () => {
       validator.assert(added, "#/$defs/requests/model~1add/result", "model/add result");
       expect(added).toEqual({ ok: true, provider: "gateway", model: "internal-coder-v3" });
 
+      // Declaring a model is not choosing one: the roles are exactly where they were.
+      expect(await readFile(providers, "utf8")).toContain(`default = "gateway/known-model"`);
+
       // Visible in the listing without a restart, and selectable, and it actually runs.
       expect(idsFor(await call("session/models") as ModelSurface, "gateway")).toEqual(["internal-coder-v3", "known-model"]);
       expect(await call("session/select_model", { model: "gateway/internal-coder-v3" })).toEqual({ provider: "gateway", model: "internal-coder-v3" });
       const turn = await call("session/prompt", { prompt: "hi" }) as { assistant: { content: Array<{ text?: string }> } };
       expect(turn.assistant.content[0]?.text).toBe("answered by internal-coder-v3 @ gateway");
 
-      // The declaration is on disk, beside what was already there rather than instead of it.
+      // The declaration is on disk, beside what was already there rather than instead of it —
+      // and the *selection* that followed it is on disk too, which is what makes the model this
+      // session ended on the model the next one starts on.
       const text = await readFile(providers, "utf8");
       expect(text).toContain(`models = ["known-model", "internal-coder-v3"]`);
-      expect(text).toContain(`default = "gateway/known-model"`);
+      expect(text).toContain(`default = "gateway/internal-coder-v3"`);
 
       // Declaring the same id twice is idempotent, not accumulative.
       expect(await call("model/add", { provider: "gateway", model: "internal-coder-v3" })).toEqual({ ok: true, provider: "gateway", model: "internal-coder-v3" });
@@ -551,7 +556,9 @@ describe("provider/get and provider/remove", () => {
       // The one not in use goes, and says what it left behind.
       const removed = await call("provider/remove", { provider: "beta" }) as Record<string, unknown>;
       validator.assert(removed, "#/$defs/requests/provider~1remove/result", "provider/remove result");
-      expect(removed).toMatchObject({ ok: true, provider: "beta", path: providers, danglingRoles: ["default", "fast", "merge"] });
+      // `default` is repointed at what is left — a dangling default is the next launch's crash,
+      // not a role that degrades — and the other two are reported as the leftovers they are.
+      expect(removed).toMatchObject({ ok: true, provider: "beta", path: providers, defaultRepointedTo: "alpha/model-a", danglingRoles: ["fast", "merge"] });
       // Not asked about the credential, so nothing is claimed about one.
       expect(removed.credentialRemoved).toBeUndefined();
 
@@ -559,8 +566,10 @@ describe("provider/get and provider/remove", () => {
       const text = await readFile(providers, "utf8");
       expect(text).not.toContain("[providers.beta]");
       expect(text).not.toContain("sk-beta");
-      // A role Lyra did not write is a role Lyra does not rewrite: it still says beta.
-      expect(text).toContain('default = "beta/model-b"');
+      // `fast` and `merge` are used by name, one call at a time: they still say beta, and say
+      // so out loud, rather than being repointed somewhere nobody chose.
+      expect(text).toContain('default = "alpha/model-a"');
+      expect(text).toContain('fast = "beta/model-b"');
       expect(await call("session/providers")).toEqual({ current: "alpha", available: ["alpha"] });
       expect((await call("session/models") as ModelSurface).providers.map((row) => row.provider)).toEqual(["alpha"]);
       expect(await call("provider/get", { provider: "beta" }).catch((error: Error) => error.message)).toContain(`Provider "beta" is not configured`);

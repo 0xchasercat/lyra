@@ -50,6 +50,8 @@ export interface StaleOptions {
 interface Pass {
   readonly extracted: Map<string, ExtractedFile>;
   readonly meta: Map<string, { mtimeMs: number; size: number }>;
+  /** Rows whose content is unchanged but whose stored mtime/size drifted — re-stamped, not re-parsed. */
+  readonly refreshed: Map<string, FileRow>;
   readonly changed: Set<string>;
   readonly surfaceChanged: Set<string>;
   readonly removed: Set<string>;
@@ -161,6 +163,10 @@ export class CodeMap {
    * Files on disk that disagree with the index. `mtime` and `size` are trusted as a first
    * filter and the content hash decides, so an out-of-band edit that preserved the mtime is
    * still caught whenever the size moved — and always, with `{ hash: true }`.
+   *
+   * A file the indexer refuses — binary, generated, minified, oversized — is reported as
+   * `skipped`, never as `added`. Calling it drift would be a warning that no amount of
+   * re-indexing can ever clear, and one such file makes every answer end in a false alarm.
    */
   stale(options: StaleOptions = {}): Promise<StaleReport> {
     return this.#serial(async () => {
@@ -168,10 +174,14 @@ export class CodeMap {
       const known = new Map(this.store.allFiles().map((row) => [row.path, row]));
       const added: string[] = [];
       const changed: string[] = [];
+      const skipped: string[] = [];
       for (const path of walk.files) {
         const row = known.get(path);
         if (!row) {
-          added.push(path);
+          // Only a file the indexer would actually accept counts as missing from the index.
+          const source = await readIndexable(this.root, path, this.#maxFileBytes);
+          if (source.ok) added.push(path);
+          else if (source.reason !== "missing") skipped.push(path);
           continue;
         }
         known.delete(path);
@@ -186,9 +196,19 @@ export class CodeMap {
         if (!source.ok) continue;
         // Hash directly: deciding whether a file moved never needs it parsed.
         if (hashContent(source.content) !== row.contentSha) changed.push(path);
+        // The bytes are the same and only the timestamp moved: heal the stored mtime so the
+        // cheap mtime check stops reporting this file as drifted on every single answer.
+        else this.#heal(row, info.mtimeMs, info.size);
       }
-      return { added, changed, removed: [...known.keys()].sort() };
+      return { added, changed, removed: [...known.keys()].sort(), skipped };
     });
+  }
+
+  /** Re-stamp a file row whose content is proven unchanged. Never touches nodes or edges. */
+  #heal(row: FileRow, mtimeMs: number, size: number): void {
+    const rounded = Math.round(mtimeMs);
+    if (row.mtimeMs === rounded && row.size === size) return;
+    this.store.putFile({ ...row, mtimeMs: rounded, size });
   }
 
   /** Row counts, exactly as stored. */
@@ -290,6 +310,7 @@ export class CodeMap {
     const pass: Pass = {
       extracted: new Map(),
       meta: new Map(),
+      refreshed: new Map(),
       changed: new Set(),
       surfaceChanged: new Set(),
       removed: new Set(),
@@ -336,6 +357,7 @@ export class CodeMap {
         };
         this.store.putFile(row);
       }
+      for (const [path, row] of pass.refreshed) if (!pass.changed.has(path) && !pass.removed.has(path)) this.store.putFile(row);
 
       // Every symbol that vanished must belong to a file this pass rewrote or removed.
       // Anything else means a delete escaped its file, and the write is refused whole.
@@ -407,6 +429,13 @@ export class CodeMap {
       return true;
     }
     pass.unchanged += 1;
+    // The bytes are what they were, so nothing is re-parsed — but a file that was touched,
+    // checked out, or rewritten with identical content now carries an mtime the stored row
+    // does not. Re-stamping it here is what stops the cheap staleness check from reporting
+    // the same file as drifted forever, since only a *content* change ever rewrote the row.
+    if (stored.mtimeMs !== source.mtimeMs || stored.size !== source.size) {
+      pass.refreshed.set(path, { ...stored, mtimeMs: source.mtimeMs, size: source.size });
+    }
     return false;
   }
 

@@ -31,6 +31,13 @@ export interface RefSite {
   readonly line: number;
   /** `this.x` / `self.x`: the target must be looked up in the enclosing type, not the file. */
   readonly onSelf?: boolean;
+  /**
+   * The name was written after a receiver — `x.query()`, `pkg.Load()`, `db.get()`. The
+   * receiver's type is not known here, so the resolver may only settle it with import
+   * evidence; a global-name guess would attach the call to whatever unrelated symbol
+   * happens to share the member's name.
+   */
+  readonly member?: boolean;
 }
 
 /** A declared type relationship, anchored at whatever symbol scope encloses it. */
@@ -120,19 +127,19 @@ function typeIdentifiers(
   return sites;
 }
 
-/** The called name, plus whether the call went through `this`/`self`. */
+/** The called name, whether the call went through `this`/`self`, and whether it had a receiver at all. */
 function calleeName(callee: Node | null, propertyTypes: ReadonlySet<string>, selfWords: ReadonlySet<string>):
-  | { name: string; onSelf: boolean }
+  | { name: string; onSelf: boolean; member: boolean }
   | undefined {
   if (!callee) return undefined;
   if (callee.type === "identifier" || callee.type === "type_identifier" || callee.type === "field_identifier") {
-    return { name: callee.text, onSelf: false };
+    return { name: callee.text, onSelf: false, member: false };
   }
   if (propertyTypes.has(callee.type)) {
     const property = callee.childForFieldName("property") ?? callee.childForFieldName("field") ?? callee.namedChildren[callee.namedChildCount - 1];
     const object = callee.childForFieldName("object") ?? callee.childForFieldName("operand") ?? callee.namedChildren[0];
     if (!property) return undefined;
-    return { name: property.text, onSelf: object !== undefined && selfWords.has(object.text) };
+    return { name: property.text, onSelf: object !== undefined && selfWords.has(object.text), member: true };
   }
   return undefined;
 }
@@ -369,6 +376,7 @@ function typescriptConfig(id: "typescript" | "tsx" | "javascript"): LanguageConf
             hint: "call",
             line: node.startPosition.row + 1,
             ...(callee.onSelf ? { onSelf: true } : {}),
+            ...(callee.member ? { member: true } : {}),
           }];
         }
         default:
@@ -516,6 +524,7 @@ const PYTHON_CONFIG: LanguageConfig = {
           hint: "call",
           line: node.startPosition.row + 1,
           ...(callee.onSelf ? { onSelf: true } : {}),
+          ...(callee.member ? { member: true } : {}),
         }];
       }
       default:
@@ -684,6 +693,7 @@ const RUST_CONFIG: LanguageConfig = {
             hint: "call",
             line: node.startPosition.row + 1,
             ...(callee.onSelf ? { onSelf: true } : {}),
+            ...(callee.member ? { member: true } : {}),
           }];
         }
         // `Type::associated(..)` — the associated function, attributed to its own name.
@@ -844,7 +854,14 @@ const GO_CONFIG: LanguageConfig = {
       case "call_expression": {
         const callee = calleeName(field(node, "function"), new Set(["selector_expression"]), new Set());
         if (!callee) return [];
-        return [{ name: callee.name, relation: "calls", context: "call", hint: "call", line: node.startPosition.row + 1 }];
+        return [{
+          name: callee.name,
+          relation: "calls",
+          context: "call",
+          hint: "call",
+          line: node.startPosition.row + 1,
+          ...(callee.member ? { member: true } : {}),
+        }];
       }
       default:
         return [];

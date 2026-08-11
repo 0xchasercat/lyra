@@ -23,12 +23,13 @@
  * nothing.
  */
 
-import { statSync } from "node:fs";
+import { hashContent } from "@lyra/edit";
+import { readFileSync, statSync } from "node:fs";
 import { resolve } from "node:path";
 import type { CodeMap } from "./incremental.ts";
-import { splitIdentifier } from "./qn.ts";
+import { fileQn, splitIdentifier, toPosix } from "./qn.ts";
 import { clampBudget, renderDocument, type Section } from "./render.ts";
-import type { Degree, DegreeNode } from "./store.ts";
+import type { Degree, DegreeNode, FileRow } from "./store.ts";
 import type { EdgeRelation, NodeKind, StoredEdge, StoredNode } from "./types.ts";
 import {
   QN_RULE,
@@ -74,6 +75,8 @@ const PATH_MAX_VISITS = 20_000;
 const EDGE_FETCH_CAP = 400;
 /** Files beyond which the cheap mtime staleness check is skipped rather than paid for. */
 const STALE_SCAN_CAP = 20_000;
+/** How many same-size mtime drifts one call will settle by hashing before it stops paying. */
+const STALE_HASH_CAP = 512;
 
 /**
  * How much each declaration kind is worth in a search ranking. A function or a method is
@@ -123,6 +126,12 @@ export function resolveSymbol(map: CodeMap, symbol: string): SymbolLookup {
   const exact = map.nodeByQn(query);
   if (exact) return { query, node: exact, candidates: [], suggestions: [] };
 
+  // A path is the spelling a reader already has in hand — it is what every other tool in the
+  // session takes — so it resolves to that file's own node, whose edges are exactly the
+  // file's symbols and the modules it trades names with.
+  const asPath = byPath(map, query);
+  if (asPath) return asPath;
+
   const byName = map.nodesByName(query);
   if (byName.length === 1) return { query, node: byName[0]!, candidates: [], suggestions: [] };
 
@@ -142,6 +151,30 @@ export function resolveSymbol(map: CodeMap, symbol: string): SymbolLookup {
   if (folded.length > 1) return { query, candidates: rankCandidates(folded), suggestions: [] };
 
   return { query, candidates: [], suggestions: nearest(map, query) };
+}
+
+/**
+ * A file path resolved to its own node: repository-relative, absolute under the root, or any
+ * unambiguous tail of one (`src/store.ts`). A tail that names several files answers with
+ * them as candidates rather than picking one, exactly as an ambiguous symbol does.
+ *
+ * Only path-shaped arguments reach the store: a bare `store.ts` is left to the name ladder,
+ * which already matches file nodes by their basename.
+ */
+function byPath(map: CodeMap, query: string): SymbolLookup | undefined {
+  const posix = toPosix(query).replace(/\/+$/, "");
+  const relative = posix.startsWith(`${toPosix(map.root)}/`) ? posix.slice(map.root.length + 1) : posix.replace(/^\.\//, "");
+  if (!relative.includes("/") || relative.length === 0) return undefined;
+
+  const node = map.nodeByQn(map.qnForPath(relative));
+  if (node) return { query, node, candidates: [], suggestions: [] };
+
+  const hits = map.store.filesWithSuffix(relative);
+  if (hits.length === 0) return undefined;
+  const nodes = hits.map((path) => map.nodeByQn(fileQn(path))).filter((found): found is StoredNode => found !== null);
+  if (nodes.length === 1) return { query, node: nodes[0]!, candidates: [], suggestions: [] };
+  if (nodes.length > 1) return { query, candidates: nodes, suggestions: [] };
+  return undefined;
 }
 
 /**
@@ -459,22 +492,59 @@ export function snippetTarget(
 
 /**
  * Files whose size or mtime no longer matches what was indexed. This is the cheap check —
- * it never hashes and never walks for new files, so it can run on every verb. A caller
- * that needs the exact answer awaits `CodeMap.stale()`.
+ * it never walks for new files, so it can run on every verb. A caller that needs the exact
+ * answer awaits `CodeMap.stale()`.
+ *
+ * A moved mtime over an unchanged size is the ambiguous case, and it is common: a checkout,
+ * a formatter that rewrote a file byte-identically, a `touch`. Reporting it costs the reader
+ * a warning about a file nothing happened to, so the content hash decides it — and when the
+ * content proves identical the stored timestamp is healed on the spot. Without that, only a
+ * *content* change ever rewrites a file row, so the same false alarm returns on every answer
+ * for the rest of the session.
  */
 export function staleCount(map: CodeMap): number {
   const files = map.store.allFiles();
   if (files.length > STALE_SCAN_CAP) return 0;
   let drifted = 0;
+  let hashed = 0;
+  const healed: FileRow[] = [];
   for (const row of files) {
+    let info;
     try {
-      const info = statSync(resolve(map.root, row.path));
-      if (Math.round(info.mtimeMs) !== row.mtimeMs || info.size !== row.size) drifted += 1;
+      info = statSync(resolve(map.root, row.path));
     } catch {
       drifted += 1;
+      continue;
+    }
+    const mtimeMs = Math.round(info.mtimeMs);
+    if (mtimeMs === row.mtimeMs && info.size === row.size) continue;
+    if (info.size !== row.size || hashed >= STALE_HASH_CAP) {
+      drifted += 1;
+      continue;
+    }
+    hashed += 1;
+    if (sameContent(map, row)) healed.push({ ...row, mtimeMs, size: info.size });
+    else drifted += 1;
+  }
+  if (healed.length > 0) {
+    try {
+      map.store.transaction(() => {
+        for (const row of healed) map.store.putFile(row);
+      });
+    } catch {
+      // A read verb that cannot heal still answers; the count above is already correct.
     }
   }
   return drifted;
+}
+
+/** Whether a file's bytes still hash to what the index recorded. */
+function sameContent(map: CodeMap, row: FileRow): boolean {
+  try {
+    return hashContent(readFileSync(resolve(map.root, row.path), "utf8")) === row.contentSha;
+  } catch {
+    return false;
+  }
 }
 
 /** Renders the ambiguous / not-found answers shared by every symbol verb. */

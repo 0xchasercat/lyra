@@ -2922,12 +2922,22 @@ pub struct RemoveProviderResult {
     /// "there was, and it was kept".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub credential_removed: Option<bool>,
-    /// Roles (`default`, `fast`, `merge`) that still point at the removed
-    /// provider. Reported rather than repointed: which model a role should name
-    /// instead is a decision, and `/model` is where decisions about models are
-    /// made.
+    /// Roles (`fast`, `merge`) that still point at the removed provider.
+    /// Reported rather than repointed: which model a role should name instead
+    /// is a decision, and `/model` is where decisions about models are made.
+    /// `default` is the exception — a session must boot on *something*, so the
+    /// daemon repoints it (see [`Self::default_repointed_to`]) rather than
+    /// leaving the next boot to crash on a reference to a provider that is gone.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub dangling_roles: Vec<String>,
+    /// Where `[roles].default` now points, when the removed provider was the
+    /// default and another provider remained to take it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_repointed_to: Option<String>,
+    /// Roles deleted outright because the removed provider was the last one —
+    /// there was nothing left to repoint at.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub roles_cleared: Vec<String>,
 }
 
 /// Params of the daemon→client `session/request_permission`.

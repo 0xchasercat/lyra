@@ -31,6 +31,7 @@ import {
   type AcpVerifyProviderParams,
   type AcpVerifyProviderResult,
 } from "@lyra/acp";
+import { chooseFallbackReference } from "./provider.ts";
 
 export type SetupAuth =
   | { type: "keychain"; token: string; service?: string; account?: string }
@@ -283,14 +284,89 @@ function authTypeOf(auth: Record<string, unknown>): AcpProviderAuthType {
   return type === "keychain" || type === "env" || type === "static" || type === "plugin" ? type : "none";
 }
 
+/** What persisting `[roles].default` wrote, and to which file. */
+export interface SavedDefaultRole {
+  /** The file that was written — the one that already defined `[roles].default`, or the user's. */
+  path: string;
+  /** The reference now stored, as `provider/model`. */
+  model: string;
+  /** False when the file already said exactly this and nothing was rewritten. */
+  changed: boolean;
+  warnings?: string[];
+}
+
+/**
+ * Persist `[roles].default`, so choosing a model in a session survives the session.
+ *
+ * The defect this closes was reported as "changing /provider doesn't automatically change the
+ * config": every in-session switch was live-only, so the file kept naming whatever was chosen
+ * at setup time. Two sessions of drift later the file named a provider that had since been
+ * removed, and the next launch walked into it before anything could report it.
+ *
+ * **Only `default`.** `fast` and `merge` are separate statements about separate jobs, and a
+ * user switching the main model has said nothing about either; rewriting all three from one
+ * `/model` was the other way to lose a user's configuration.
+ *
+ * **The file that already defines it.** Lyra reads several files in order and the last one to
+ * set `[roles].default` wins, so writing to any earlier one would persist something the next
+ * boot cannot see. When no file defines it, the write lands in `~/.lyra/providers.toml` — the
+ * file `provider/add` owns. The write itself is the same read-merge-render round trip every
+ * other writer here uses: content survives, comments do not, an unparseable file is never
+ * overwritten.
+ */
+export async function saveDefaultRole(
+  model: string,
+  options: { home?: string; paths?: readonly string[]; origin?: string; signal?: AbortSignal } = {},
+): Promise<SavedDefaultRole> {
+  if (typeof model !== "string" || model.trim().length === 0) throw new TypeError("A default role must name a model as provider/model.");
+  const reference = model.trim();
+  if (options.signal?.aborted) throw options.signal.reason;
+  const home = resolve(options.home ?? homedir());
+  const paths = options.paths ?? providerConfigPaths(options.origin ?? process.cwd(), home);
+  const path = await roleDefaultFile(paths) ?? join(home, ".lyra", "providers.toml");
+  const existing = await readProvidersFile(path);
+  const roles = isRecord(existing.value.roles) ? { ...existing.value.roles } : {};
+  if (roles.default === reference) return { path, model: reference, changed: false };
+  roles.default = reference;
+  const providers = isRecord(existing.value.providers) ? existing.value.providers : {};
+  await writeProvidersFile(path, renderProvidersFile(existing.value, providers, roles));
+  return {
+    path,
+    model: reference,
+    changed: true,
+    ...(existing.hadComments ? { warnings: [`Comments in ${path} were not preserved when [roles].default was updated; every provider, role, and setting in it was.`] } : {}),
+  };
+}
+
+/**
+ * Which configuration file currently defines `[roles].default`, in load order — the *last* one
+ * wins, because that is the one `loadProviderConfig` lets win. A file that cannot be read or
+ * parsed defines nothing for this purpose: the write it would receive belongs somewhere the
+ * next boot will actually read.
+ */
+async function roleDefaultFile(paths: readonly string[]): Promise<string | undefined> {
+  let found: string | undefined;
+  for (const candidate of paths) {
+    const path = resolve(candidate);
+    let parsed: unknown;
+    try { parsed = Bun.TOML.parse(await readFile(path, "utf8")); } catch { continue; }
+    if (isRecord(parsed) && isRecord(parsed.roles) && typeof parsed.roles.default === "string") found = path;
+  }
+  return found;
+}
+
 /** What `provider/remove` deleted, and what it deliberately did not. */
 export interface RemovedProviderSetup {
   path: string;
   provider: string;
   /** The auth table the removed declaration carried, so a caller can offer to clean it up. */
   auth?: Record<string, unknown>;
-  /** Roles still naming the removed provider. Left in the file on purpose. */
+  /** Roles still naming the removed provider after the write. Left in the file on purpose. */
   danglingRoles: string[];
+  /** What `[roles].default` was repointed to, when the removal would have left it dangling. */
+  defaultRepointedTo?: string;
+  /** Roles deleted outright, because the last provider left with them. */
+  rolesCleared?: string[];
   /** The other providers the file declared, all of which are still declared. */
   preserved: string[];
   warnings?: string[];
@@ -305,9 +381,17 @@ export interface RemovedProviderSetup {
  * that cannot be parsed is never rewritten, because a delete that also loses the providers it
  * was not about is the worst possible outcome of asking for a delete.
  *
- * Roles are deliberately not repaired. A role is a statement about what `@default` means, and
- * silently repointing one at a provider the user did not choose is a bigger surprise than a
- * role that dangles; the names come back instead, for the client to say out loud.
+ * `[roles].default` is the one role that *is* repaired, and only when repairing it is the
+ * lesser surprise. A dangling `default` is not a role that degrades — it is the reference the
+ * next boot resolves before anything else, and leaving it pointing at a provider that no longer
+ * exists is what turned a removal into a crash on the following launch. So when other providers
+ * remain it is repointed at one, deterministically (see [`chooseFallbackReference`]), and the
+ * new reference comes back in `defaultRepointedTo` to be said out loud; when the last provider
+ * has just left, every role naming it is cleared rather than repointed at nothing.
+ *
+ * `fast` and `merge` still dangle on purpose. They are used by name, one call at a time, and a
+ * dangling one fails that call with a sentence that names the provider and the fix — visibly
+ * broken rather than invisibly changed. Their names come back in `danglingRoles`.
  */
 export async function removeProviderSetup(
   provider: string,
@@ -327,20 +411,49 @@ export async function removeProviderSetup(
   const auth = isRecord(current?.auth) ? current.auth : undefined;
   const providers = { ...declared };
   delete providers[provider];
-  const roles = isRecord(existing.value.roles) ? existing.value.roles : {};
-  const danglingRoles = Object.entries(roles)
-    .filter(([, value]) => typeof value === "string" && value.slice(0, value.indexOf("/")) === provider)
-    .map(([role]) => role)
-    .sort();
+  const roles = isRecord(existing.value.roles) ? { ...existing.value.roles } : {};
+  const named = rolesNaming(roles, provider);
+  const remaining = Object.keys(providers);
+  let defaultRepointedTo: string | undefined;
+  let rolesCleared: string[] | undefined;
+  if (remaining.length === 0) {
+    // Nothing left to point at. A cleared role is a role a fresh setup will write again;
+    // a role naming a provider that cannot exist is a boot that fails for no reason.
+    for (const role of named) delete roles[role];
+    if (named.length > 0) rolesCleared = named;
+  } else if (named.includes("default")) {
+    defaultRepointedTo = await chooseFallbackReference(
+      remaining.map((name) => ({ name, models: declaredModels(providers[name]) })),
+      { home },
+    );
+    if (defaultRepointedTo !== undefined) roles.default = defaultRepointedTo;
+  }
   await writeProvidersFile(path, renderProvidersFile(existing.value, providers, roles));
   return {
     path,
     provider,
     ...(auth === undefined ? {} : { auth }),
-    danglingRoles,
-    preserved: Object.keys(providers),
+    // What the file says *after* the write: a repointed default is not dangling any more.
+    danglingRoles: rolesNaming(roles, provider),
+    ...(defaultRepointedTo === undefined ? {} : { defaultRepointedTo }),
+    ...(rolesCleared === undefined ? {} : { rolesCleared }),
+    preserved: remaining,
     ...(existing.hadComments ? { warnings: [`Comments in ${path} were not preserved when the provider was removed; every remaining provider, role, and setting in it was.`] } : {}),
   };
+}
+
+/** Every role whose model reference is served by one named provider, sorted. */
+function rolesNaming(roles: Record<string, unknown>, provider: string): string[] {
+  return Object.entries(roles)
+    .filter(([, value]) => typeof value === "string" && value.slice(0, value.indexOf("/")) === provider)
+    .map(([role]) => role)
+    .sort();
+}
+
+/** The `models` array a raw provider table declares, and nothing else it happens to contain. */
+function declaredModels(table: unknown): string[] {
+  const models = isRecord(table) ? table.models : undefined;
+  return Array.isArray(models) ? models.filter((value): value is string => typeof value === "string") : [];
 }
 
 /**

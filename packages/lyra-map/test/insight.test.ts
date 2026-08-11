@@ -90,6 +90,40 @@ describe("overview", () => {
     map.close();
   });
 
+  /**
+   * A crate with zero edges to the TypeScript packages is not a dead subsystem: the resolver
+   * refuses to cross a language family at all, so those edges were never eligible to exist.
+   * Before this, the brief invited the reader to investigate a boundary it had drawn itself.
+   */
+  test("a partition isolated only by its language says so instead of looking dead", async () => {
+    const map = await indexed(MIXED);
+    const brief = overview(map, { budget: MAX_BUDGET });
+
+    expect(brief).toContain("islands by language:");
+    expect(brief).toContain("crates/engine (rust)");
+    expect(brief).toContain("services/api (python)");
+    expect(brief).toContain("no cross-language edges by design");
+    // ...and the same partitions are not also offered as a suspicious dead end.
+    expect(brief).not.toContain("dead, or only reached dynamically");
+    map.close();
+  });
+
+  test("a partition isolated within its own language is still worth asking about", async () => {
+    const map = await indexed({
+      "package.json": JSON.stringify({ name: "fixture", workspaces: ["packages/*"] }),
+      "packages/core/package.json": JSON.stringify({ name: "@fixture/core" }),
+      "packages/core/src/engine.ts": `export function boot(): number { return 1; }\nexport function run(): number { return boot(); }\n`,
+      "packages/app/package.json": JSON.stringify({ name: "@fixture/app" }),
+      "packages/app/src/main.ts": `import { boot } from "@fixture/core";\nexport function main(): number { return boot(); }\n`,
+      "packages/orphan/package.json": JSON.stringify({ name: "@fixture/orphan" }),
+      "packages/orphan/src/alone.ts": `export function unreachableThing(): number { return 1; }\n`,
+    });
+    const brief = overview(map, { budget: MAX_BUDGET });
+    expect(brief).not.toContain("islands by language:");
+    expect(brief).toContain("dead, or only reached dynamically");
+    map.close();
+  });
+
   test("cross-package edge volume is counted in both directions", async () => {
     const map = await indexed(MIXED);
     const brief = overview(map, { budget: MAX_BUDGET });

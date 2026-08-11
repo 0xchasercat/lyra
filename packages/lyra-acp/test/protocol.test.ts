@@ -715,6 +715,12 @@ describe("frames on the wire", () => {
     validator.assert({ provider: "gateway", removeCredential: true }, "#/$defs/requests/provider~1remove/params", "remove with credential");
     validator.assert({ ok: true, provider: "gateway", path: "/home/u/.lyra/providers.toml" }, "#/$defs/removeProviderResult", "plain removal");
     validator.assert({ ok: true, provider: "gateway", path: "/p", credentialRemoved: false, danglingRoles: ["default", "fast"] }, "#/$defs/removeProviderResult", "removal with leftovers");
+    // `default` is the one role a removal repairs: it is what the next boot resolves before
+    // anything else, and leaving it naming a provider that is gone is how a removal turned
+    // into a crash on the following launch.
+    validator.assert({ ok: true, provider: "gateway", path: "/p", defaultRepointedTo: "openai/gpt-5.6", danglingRoles: ["fast"] }, "#/$defs/removeProviderResult", "removal that repointed the default");
+    validator.assert({ ok: true, provider: "gateway", path: "/p", rolesCleared: ["default", "fast", "merge"] }, "#/$defs/removeProviderResult", "removal of the last provider");
+    expect(validator.validate({ ok: true, provider: "g", path: "/p", defaultRepointedTo: "" }, "#/$defs/removeProviderResult").join("; ")).toContain("at least 1");
     // False is a measurement ("there was no keychain entry"), so it must not be confusable
     // with absent ("nobody asked me to look").
     expect(validator.validate({ ok: true, provider: "g", path: "/p", credentialRemoved: "no" }, "#/$defs/removeProviderResult").join("; ")).toContain("must be boolean");

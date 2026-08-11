@@ -163,6 +163,12 @@ export interface RawReference {
    * but never guesses at one globally, and never records it as unresolved.
    */
   readonly builtin: boolean;
+  /**
+   * The name was written after a receiver — `x.query()`, `db.get()`, `pkg.Load()`. The
+   * receiver's type is unknown outside a type checker, so the resolver will settle such a
+   * site only on import evidence: a global-name guess would be inventing the relation.
+   */
+  readonly member: boolean;
   readonly file: string;
   readonly line: number;
 }
@@ -218,6 +224,12 @@ export interface StaleReport {
   readonly changed: readonly string[];
   readonly added: readonly string[];
   readonly removed: readonly string[];
+  /**
+   * Files the walk found but the indexer deliberately refuses — binary, generated,
+   * minified, oversized. They are *not* drift: re-indexing will refuse them again, so
+   * reporting them as added would be a staleness warning that never clears.
+   */
+  readonly skipped: readonly string[];
 }
 
 /** One full-text hit, ranked by bm25 (lower is better). */

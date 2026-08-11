@@ -331,15 +331,18 @@ describe("removing a provider", () => {
     const { home, origin, path } = await seeded();
     const removed = await removeProviderSetup("gateway", { home });
     expect(removed.preserved).toEqual(["a6api"]);
-    // The roles that named it are reported, never rewritten: @default is the user's statement
-    // about what they want, and repointing it at a provider they did not choose is a bigger
-    // surprise than a role that visibly dangles.
-    expect(removed.danglingRoles).toEqual(["default", "merge"]);
+    // `default` is repaired and the rest are reported. The distinction is what the removed
+    // provider's roles cost: `@merge` fails the one call that names it, with a sentence saying
+    // which provider is missing, while a dangling `default` is what the *next boot* resolves
+    // before anything else — the crash this behaviour was written for.
+    expect(removed.defaultRepointedTo).toBe("a6api/gpt-5.6-sol");
+    expect(removed.danglingRoles).toEqual(["merge"]);
+    expect(removed.rolesCleared).toBeUndefined();
     expect(removed.warnings?.[0]).toContain("Comments");
 
     const config = await loadProviderConfig(providerConfigPaths(origin, home));
     expect(Object.keys(config.providers)).toEqual(["a6api"]);
-    expect(config.roles).toMatchObject({ default: "gateway/coder", fast: "a6api/gpt-5.6-sol", merge: "gateway/coder" });
+    expect(config.roles).toMatchObject({ default: "a6api/gpt-5.6-sol", fast: "a6api/gpt-5.6-sol", merge: "gateway/coder" });
     expect((await loadConfig(origin, home)).tui.theme).toBe("paper");
     expect(await readFile(path, "utf8")).not.toContain("gateway.example");
   });

@@ -231,6 +231,105 @@ describe("inference and dropping", () => {
   });
 });
 
+/**
+ * Every case here was a real edge this resolver drew across two packages that have nothing
+ * to do with each other. They are kept as fixtures because each one looked plausible in
+ * isolation, and the graph's whole value is that an edge in it means something.
+ */
+describe("guards against invented edges", () => {
+  test("a member call is never settled by a global name, however unique that name is", () => {
+    // Observed: `MapStore.hasFile`, a one-line SQL call, acquired a `calls` edge into
+    // `MapTool.query` in another package, because `query` was the only *method* by that name.
+    const result = resolved(
+      {
+        "packages/app/src/tool.ts": `export class MapTool {\n  query(text: string): number { return text.length; }\n}\n`,
+        "packages/map/src/store.ts": `export class MapStore {\n  hasFile(path: string): boolean { return this.db.query(path) > 0; }\n}\n`,
+      },
+      "packages/map/src/store.ts",
+    );
+    expect(result.edges).toEqual([]);
+    expect(result.unresolved).toEqual(["query"]);
+    expect(result.dropped).toBe(1);
+  });
+
+  test("a member call on a name nothing in the repository defines is dropped, not attached to a field", () => {
+    // Observed: `abortableSleep` -> `normalizeRequest.addEventListener`, a local field in
+    // another package that happened to be the only `addEventListener` in the index.
+    const result = resolved(
+      {
+        "packages/host/src/process.ts": `export function normalizeRequest(): void {\n  const addEventListener = 1;\n  void addEventListener;\n}\n`,
+        "packages/provider/src/client.ts": `export function abortableSleep(signal: AbortSignal): void {\n  signal.addEventListener("abort", () => {});\n}\n`,
+      },
+      "packages/provider/src/client.ts",
+    );
+    expect(describeEdges(result.edges)).toEqual([]);
+    expect(result.unresolved).toEqual(["addEventListener"]);
+  });
+
+  test("uniqueness is counted before the kind hint, so a lone survivor of filtering is not unique", () => {
+    // Observed: `artifactHash` -> `CodeMap.update`. Six symbols were named `update`; the
+    // call hint kept only the one method among them and the resolver called that unique.
+    const files = {
+      "packages/map/src/incremental.ts": `export class CodeMap {\n  update(paths: string[]): number { return paths.length; }\n}\n`,
+      "packages/acp/src/first.ts": `export const update = 1;\n`,
+      "packages/acp/src/second.ts": `export const update = 2;\n`,
+      "packages/tools/src/artifacts.ts": `export function artifactHash(): number {\n  return update();\n}\n`,
+    };
+    const result = resolved(files, "packages/tools/src/artifacts.ts");
+    expect(result.edges).toEqual([]);
+    expect(result.unresolved).toEqual(["update"]);
+
+    // With the field definitions gone the name really is unique, and the edge comes back.
+    const alone = resolved(
+      { "packages/map/src/incremental.ts": files["packages/map/src/incremental.ts"], "packages/tools/src/artifacts.ts": files["packages/tools/src/artifacts.ts"] },
+      "packages/tools/src/artifacts.ts",
+    );
+    expect(describeEdges(alone.edges)).toEqual([
+      "packages.tools.src.artifacts.artifactHash -calls/inferred-> packages.map.src.incremental.CodeMap.update @2",
+    ]);
+  });
+
+  test("a name too short to identify anything is dropped even when it is globally unique", () => {
+    const result = resolved(
+      {
+        "src/other.ts": `export function run(): number { return 1; }\n`,
+        "src/app.ts": `export function boot(): number { return run(); }\n`,
+      },
+      "src/app.ts",
+    );
+    expect(result.edges).toEqual([]);
+    expect(result.unresolved).toEqual(["run"]);
+  });
+
+  test("the kind hint can still veto a unique name, but only as the last word", () => {
+    // One global `payloadValue`, and it is a field: a call site does not reach a field.
+    const result = resolved(
+      {
+        "src/other.ts": `export const payloadValue = 1;\n`,
+        "src/app.ts": `export function boot(): number { return payloadValue(); }\n`,
+      },
+      "src/app.ts",
+    );
+    expect(result.edges).toEqual([]);
+    expect(result.unresolved).toEqual(["payloadValue"]);
+  });
+
+  test("a name imported from outside the repository is neither guessed at nor remembered", () => {
+    // The file itself proves where `writeFile` comes from. A same-named project symbol is a
+    // coincidence, and no future commit can make `node:fs` a repository module.
+    const result = resolved(
+      {
+        "src/decoy.ts": `export function writeFile(path: string): number { return path.length; }\n`,
+        "src/app.ts": `import { writeFile } from "node:fs/promises";\nexport function save(): unknown { return writeFile("a"); }\n`,
+      },
+      "src/app.ts",
+    );
+    expect(result.edges).toEqual([]);
+    expect(result.unresolved).toEqual([]);
+    expect(result.dropped).toBe(0);
+  });
+});
+
 describe("the language boundary", () => {
   test("a TypeScript name never resolves into another language, however unique it is", () => {
     const result = resolved(

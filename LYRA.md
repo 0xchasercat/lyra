@@ -714,6 +714,20 @@ merge   = "anthropic/claude-opus-5"
 
 `spawn({ model: '@fast' })` resolves through this.
 
+**`default` is written back.** A successful `/model` or `/provider` switch persists
+`[roles].default` — and only `default`; `fast` and `merge` are separate statements about
+separate jobs — into whichever config file already defines it, or `~/.lyra/providers.toml` when
+none does. A selection that lived only in the process is how the file drifted until it named a
+provider that had since been removed. Persistence never fails a switch: the switch already
+happened, so a file that cannot be written costs one report line.
+
+The same reason `provider/remove` repoints `[roles].default` at a remaining provider
+(alphabetical, first one that has a model) instead of leaving it dangling, and clears the roles
+naming the last provider to leave. `fast` and `merge` still dangle and are reported: they fail
+the one call that names them, by name. And a `default` that *is* stale — hand-edited, or from a
+version before any of this — degrades at boot rather than throwing: Lyra starts on the same
+deterministic fallback and says which role sent it there.
+
 **Switching mid-session** re-derives the whole payload from the transcript (§3.6). Lossy
 conversions are flagged in the TUI. Streaming is mandatory on all four transports.
 

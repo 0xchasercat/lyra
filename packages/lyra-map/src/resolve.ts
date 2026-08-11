@@ -8,6 +8,13 @@ export type ResolveInput = Pick<ExtractedFile, "path" | "language" | "imports" |
 /** Above this many same-named candidates, proximity is guessing rather than inferring. */
 const MAX_GLOBAL_CANDIDATES = 8;
 
+/**
+ * Shorter names than this are never inferred across files. `get`, `run`, `id`, `new` carry
+ * no evidence of identity — they collide by accident in every repository — and an edge
+ * built on one is a coincidence rendered as a fact.
+ */
+const MIN_INFERRED_NAME_LENGTH = 4;
+
 /** A package import can legitimately pull in a whole directory; bound the fan-out anyway. */
 const MAX_MODULE_FILES = 32;
 
@@ -67,6 +74,11 @@ const JS_REWRITES: readonly (readonly [string, readonly string[]])[] = [
  * 2. **Unique global name, same language family.** Exactly one symbol in the whole index
  *    carries the name, or several do and one is strictly closer in the directory tree
  *    than every other. The edge is `inferred`, and callers may discard it wholesale.
+ *    Three guards keep this from manufacturing facts: a call with a receiver
+ *    (`x.query()`) is never inferred at all, names shorter than
+ *    {@link MIN_INFERRED_NAME_LENGTH} are never inferred, and uniqueness is counted over
+ *    every definition of the name *before* the kind hint narrows the field — the hint may
+ *    only veto the winner, never elect one.
  * 3. **Drop.** Nothing is written. The name is recorded in `unresolved` so that the day a
  *    file starts exporting it, this file is re-resolved without a repository rescan.
  *
@@ -94,6 +106,13 @@ export function resolveFile(extracted: ResolveInput, store: ResolverStore, cache
   const evidence = new Map<string, { readonly files: readonly string[]; readonly imported: string }>();
   /** Modules pulled in wholesale (`import *`, a Go package, `import os`): any name may come from them. */
   const wholesale: string[] = [];
+  /**
+   * Local bindings the file itself proves are foreign: `readFile` from `node:fs`, `Frame`
+   * from a crate this repository does not contain. Their target is known — it is simply
+   * outside — so a use of one is neither a hole in the graph nor something a future commit
+   * could fill, and guessing at a same-named project symbol would be a fabrication.
+   */
+  const foreign = new Set<string>();
 
   for (const fact of extracted.imports) {
     const files = resolveModule(fact.specifier, extracted, store, cache);
@@ -105,6 +124,8 @@ export function resolveFile(extracted: ResolveInput, store: ResolverStore, cache
         for (const name of fact.names) if (name.imported !== "*") drop(name.imported);
         const tail = moduleTail(fact.specifier);
         if (tail) drop(tail);
+      } else {
+        for (const name of fact.names) if (name.imported !== "*") foreign.add(name.local);
       }
       continue;
     }
@@ -118,11 +139,14 @@ export function resolveFile(extracted: ResolveInput, store: ResolverStore, cache
 
   const wholesaleFiles = [...new Set(wholesale)];
   for (const reference of extracted.references) {
-    const target = resolveReference(reference, extracted, evidence, wholesaleFiles, store, cache);
+    const target = foreign.has(reference.name)
+      ? undefined
+      : resolveReference(reference, extracted, evidence, wholesaleFiles, store, cache);
     if (!target) {
       // A language builtin that no import claimed is not a hole in the graph; it is simply
       // not part of the repository, and recording it would bloat the re-resolution index.
-      if (!reference.builtin) drop(reference.name);
+      // The same is true of a name this file imported from outside the repository.
+      if (!reference.builtin && !foreign.has(reference.name)) drop(reference.name);
       continue;
     }
     if (target.confidence === "inferred") note(reference.name, "inferred");
@@ -203,20 +227,38 @@ function resolveReference(
   // every `map` call in the repository to whichever project symbol happens to be unique.
   if (reference.builtin) return undefined;
 
+  // A member call names a property of a value whose type nothing here knows. `db.get(path)`
+  // and `store.query(sql)` say nothing about which repository symbol — if any — is on the
+  // other end, so the only honest answers are import evidence (already tried above) and
+  // silence. Guessing here is what turns a one-line SQLite call into a call across packages.
+  if (reference.member) return undefined;
+
+  // Too short to carry meaning across a repository: `run`, `add`, `id` collide by accident,
+  // and a collision resolved by proximity is proximity's answer, not the code's.
+  if (reference.name.length < MIN_INFERRED_NAME_LENGTH) return undefined;
+
   const family = familyOf(extracted.language);
   const all = store.nodesByName(reference.name, family).filter((node) => node.file !== extracted.path && node.kind !== "file" && node.kind !== "test");
   if (all.length === 0 || all.length > MAX_GLOBAL_CANDIDATES) return undefined;
-  const preferred = all.filter((node) => KIND_PREFERENCE[reference.hint].has(node.kind));
-  const candidates = preferred.length > 0 ? preferred : all;
-  if (candidates.length === 1) return { node: candidates[0]!, confidence: "inferred" };
 
-  const scored = candidates
+  // Uniqueness is judged over every definition of the name, BEFORE the kind hint narrows
+  // anything. Filtering first and then calling the survivor unique is how `x.query()` found
+  // the one `query` that happened to be a method among three same-named symbols: the name
+  // was never unique, only the kind-filtered view of it was.
+  if (all.length === 1) return preferredOnly(all[0]!, reference);
+
+  const scored = all
     .map((node) => ({ node, score: sharedPrefix(extracted.path, node.file) }))
     .sort((a, b) => b.score - a.score || a.node.qn.localeCompare(b.node.qn));
   const best = scored[0]!;
   const runnerUp = scored[1]!;
   // A tie means the map would be inventing a fact. Say nothing instead.
-  return best.score > runnerUp.score ? { node: best.node, confidence: "inferred" } : undefined;
+  return best.score > runnerUp.score ? preferredOnly(best.node, reference) : undefined;
+}
+
+/** The kind hint is a veto on the winner, never a way to manufacture a unique candidate. */
+function preferredOnly(node: StoredNode, reference: RawReference): { node: StoredNode; confidence: "inferred" } | undefined {
+  return KIND_PREFERENCE[reference.hint].has(node.kind) ? { node, confidence: "inferred" } : undefined;
 }
 
 const KIND_PREFERENCE: Readonly<Record<RawReference["hint"], ReadonlySet<StoredNode["kind"]>>> = Object.freeze({

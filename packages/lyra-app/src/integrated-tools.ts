@@ -172,7 +172,7 @@ const MAP_DEFINITION: ToolDefinition = Object.freeze({
     properties: {
       op: { type: "string", enum: ["overview", "search", "explain", "impact", "path", "snippet"], description: "Which question to ask. Defaults to overview, or is inferred from the fields sent." },
       query: { type: "string", minLength: 1, description: "search: identifier fragments to look for, in the graph's own vocabulary." },
-      symbol: { type: "string", minLength: 1, description: "explain, impact, snippet: a symbol name, a qualified name, or a file path." },
+      symbol: { type: "string", minLength: 1, description: "explain, impact, snippet: a symbol name, a qualified name, or a repository-relative file path — a path answers for the file itself, with the symbols it defines and the modules it trades names with." },
       from: { type: "string", minLength: 1, description: "path: the symbol the connection starts at." },
       to: { type: "string", minLength: 1, description: "path: the symbol the connection ends at." },
       depth: { type: "integer", minimum: 1, description: "impact: how many hops of callers to follow. Small numbers answer the question; large ones bury it." },

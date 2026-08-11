@@ -40,7 +40,7 @@ import { parseLoopSpec, SoakRunner } from "./soak.ts";
 import { WorkspaceFileIndex } from "./completion.ts";
 import { runExternalAcpAgent } from "./external-acp.ts";
 import { durationMs, loadConfig } from "./config.ts";
-import { detectProviderApis, needsProviderSetup, providerAddInput, providerConfigPaths, providerSetupOptions, removeProviderCredential, removeProviderSetup, saveProviderModel, saveProviderSetup, verifyProviderSetup } from "./provider-setup.ts";
+import { detectProviderApis, needsProviderSetup, providerAddInput, providerConfigPaths, providerSetupOptions, removeProviderCredential, removeProviderSetup, saveDefaultRole, saveProviderModel, saveProviderSetup, verifyProviderSetup } from "./provider-setup.ts";
 import type { AcpAddModelParams, AcpAddModelResult, AcpAddProviderParams, AcpAddProviderResult, AcpDetectProviderParams, AcpDetectProviderResult, AcpGetProviderParams, AcpGetProviderResult, AcpModelsResult, AcpProviderModels, AcpProviderSetupOptions, AcpRemoveProviderParams, AcpRemoveProviderResult, AcpVerifyProviderParams, AcpVerifyProviderResult } from "@lyra/acp";
 import type { AuthConfig } from "@lyra/provider";
 
@@ -80,13 +80,16 @@ export class LyraRuntime {
     // A first run has nothing to select a model with, and refusing to boot is what left the
     // TUI with no way in (DESIGN.md §6.6). The daemon comes up unconfigured instead: the
     // session, the tools and every ACP method that is not about models are real, a prompt
-    // answers with an actionable error, and `provider/add` is the way out of it. Other
-    // configuration failures — unreadable TOML, a role pointing at a provider that is not
-    // there — still throw, because those name something to fix rather than something to set up.
+    // answers with an actionable error, and `provider/add` is the way out of it. A
+    // configuration that merely went *stale* — `[roles].default` still naming a provider that
+    // was removed — boots on a fallback and says so (see `createEnvironmentProvider`); the
+    // notices are held until there is a session to report them through. Only a configuration
+    // that names something to *fix* — unreadable TOML, a role that does not exist — still throws.
+    const bootNotices: string[] = [];
     let currentEnvironment = options.environment
       ?? (await needsProviderSetup(origin, options.model, options.home)
         ? createUnconfiguredEnvironment(await loadProviderConfig(providerConfigPaths(origin, options.home)))
-        : await createEnvironmentProvider({ configPaths: providerConfigPaths(origin, options.home), maxAttempts: runtimeConfig.reliability.max_retries, streamStallTimeoutMs: durationMs(runtimeConfig.reliability.stream_stall_timeout), turnTimeoutMs: durationMs(runtimeConfig.reliability.turn_timeout), ...(options.model === undefined ? {} : { model: options.model }), ...(options.home === undefined ? {} : { home: options.home }) }));
+        : await createEnvironmentProvider({ configPaths: providerConfigPaths(origin, options.home), maxAttempts: runtimeConfig.reliability.max_retries, streamStallTimeoutMs: durationMs(runtimeConfig.reliability.stream_stall_timeout), turnTimeoutMs: durationMs(runtimeConfig.reliability.turn_timeout), onNotice: (message) => { bootNotices.push(message); }, ...(options.model === undefined ? {} : { model: options.model }), ...(options.home === undefined ? {} : { home: options.home }) }));
     // Notifications are fire-and-forget. The daemon serializes its writes on an internal
     // tail, so frame order is preserved without the agent loop ever awaiting a socket —
     // a slow or wedged client must not be able to stall a turn.
@@ -233,6 +236,14 @@ export class LyraRuntime {
       ...(options.environment === undefined ? { configPaths: providerConfigPaths(origin, options.home) } : {}),
       ...(options.home === undefined ? {} : { home: options.home }),
     });
+    // Now that there is a transcript and a client to hear it: what the boot had to work
+    // around. One line each, through the same seam a turn-end observation uses, so the human
+    // sees it in the TUI and the model reads it at the top of its first turn.
+    for (const notice of bootNotices) {
+      main.report(notice);
+      emitUpdate({ sessionUpdate: "report", message: notice });
+      await options.onReport?.(notice);
+    }
     return new LyraRuntime(app, main);
   }
 
@@ -341,7 +352,15 @@ export class MainSession {
     await mkdir(sessionRoot, { recursive: true, mode: 0o700 });
     const path = join(sessionRoot, `${validName(options.sessionName)}.jsonl`);
     let store: TranscriptStore;
-    try { store = TranscriptStore.create({ path, name: options.sessionName, origin: options.app.origin, workspace: options.app.cwd, provider: options.environment.providerName, model: options.environment.model }); }
+    // A session header names the provider and model the transcript began under, and both are
+    // required to be non-empty — which an *unconfigured* environment has neither of. Booting
+    // unconfigured is the whole first-run design (§6.6), and it threw here instead: the daemon
+    // that was supposed to come up so the TUI could run its wizard died in the constructor of
+    // its own transcript. The placeholders are what "no provider yet" looks like in a header;
+    // the `provider_switch` entry the first selection appends is where a real one is recorded.
+    const provider = options.environment.providerName.length === 0 ? "unconfigured" : options.environment.providerName;
+    const model = options.environment.model.length === 0 ? "none" : options.environment.model;
+    try { store = TranscriptStore.create({ path, name: options.sessionName, origin: options.app.origin, workspace: options.app.cwd, provider, model }); }
     catch (error) { if (!(error instanceof Error && "code" in error && (error as { code?: unknown }).code === "EEXIST")) throw error; store = TranscriptStore.open(path); }
     const loop = createLoop(options.app, options.environment, store, options.contextWindow);
     const session = new MainSession(options, store, path, loop);
@@ -776,12 +795,20 @@ export class MainSession {
       const files = providerConfigPaths(this.app.origin, this.#home).join(", ");
       throw new Error(`[providers.${name}] was removed from ${removed.path}, but another configuration source still declares it, so the provider is still configured. Lyra reads, in order: ${files}, plus OPENAI_API_KEY and ANTHROPIC_API_KEY from the environment. Remove the declaration that remains.`);
     }
+    // Said out loud as well as returned. The structured fields are for a client that reads the
+    // schema; the report line reaches every client, including one whose result type predates
+    // these fields, and it is the sentence a user needs to understand why `@default` moved.
+    if (removed.defaultRepointedTo !== undefined) this.#note(`Removed provider ${name} was named by [roles].default, so the default is now ${removed.defaultRepointedTo}. Change it with /model, or edit ${removed.path}.`);
+    if (removed.rolesCleared !== undefined) this.#note(`Removed provider ${name} was the last one configured; the roles that named it (${removed.rolesCleared.join(", ")}) were cleared from ${removed.path}. Add a provider with /provider add.`);
+    if (removed.danglingRoles.length > 0) this.#note(`These roles still name the removed provider ${name}: ${removed.danglingRoles.map((role) => `@${role}`).join(", ")}. Using one fails until it is repointed — fix them in ${removed.path}.`);
     return {
       ok: true,
       provider: name,
       path: removed.path,
       ...(credentialRemoved === undefined ? {} : { credentialRemoved }),
       ...(removed.danglingRoles.length === 0 ? {} : { danglingRoles: removed.danglingRoles }),
+      ...(removed.defaultRepointedTo === undefined ? {} : { defaultRepointedTo: removed.defaultRepointedTo }),
+      ...(removed.rolesCleared === undefined ? {} : { rolesCleared: removed.rolesCleared }),
     };
   }
 
@@ -1163,8 +1190,56 @@ export class MainSession {
     this.#loop = createLoop(this.app, next, this.#store, this.contextWindow, this.#models);
     this.#emit([{ sessionUpdate: "model_changed", provider: next.providerName, model: next.model, apiType: next.provider.transport.apiType }]);
     await previous.provider.transport.close?.();
+    // Strictly after the switch has happened: persistence is a consequence of the choice, and
+    // it is never allowed to undo one. See `#persistDefaultRole`.
+    await this.#persistDefaultRole(next.providerName, next.model);
     void this.refreshModels(false).catch(() => undefined);
     return { provider: next.providerName, model: next.model };
+  }
+
+  /**
+   * Write the model this session just switched to into `[roles].default`.
+   *
+   * "Changing /provider doesn't automatically change the config" was the user's own diagnosis
+   * of the crash this closes, and it was exactly right: a selection lived in the process and
+   * nowhere else, so the file went on naming a setup-time choice while the session ran on
+   * something else. Every restart threw the drift away, and one of those files eventually named
+   * a provider that had been removed.
+   *
+   * Two rules make this safe to do on every switch. It is **only `default`** — `fast` and
+   * `merge` are separate choices about separate jobs and are left alone. And it **cannot fail
+   * the switch**: the live switch already happened, the provider is already answering, so a
+   * read-only file or a config no session owns costs one warning line and nothing else.
+   *
+   * A session handed its configuration rather than reading one persists nothing. Its
+   * configuration exists only in memory, was never on disk, and writing a caller's in-process
+   * choice into the user's home is not a thing this session was asked to do.
+   */
+  async #persistDefaultRole(provider: string, model: string): Promise<void> {
+    if (this.#configPaths === undefined || provider.length === 0 || model.length === 0) return;
+    const reference = `${provider}/${model}`;
+    try {
+      const saved = await saveDefaultRole(reference, { paths: this.#configPaths, origin: this.app.origin, ...(this.#home === undefined ? {} : { home: this.#home }) });
+      if (!saved.changed) return;
+      // The live copy learns what the file now says, so `@default` in this very session — a
+      // spawned child's model, the next bare id — resolves to what was just chosen.
+      this.#environment = { ...this.#environment, config: { ...this.#environment.config, roles: { ...this.#environment.config.roles, default: reference } } };
+      this.#updateEnvironment(this.#environment);
+      for (const warning of saved.warnings ?? []) this.#note(warning);
+    } catch (error) {
+      this.#note(`Switched to ${reference}, but [roles].default could not be saved: ${error instanceof Error ? error.message : String(error)} This session is running on ${reference}; the next one will start on whatever ${this.#providersPath()} names.`);
+    }
+  }
+
+  /**
+   * One line to a human now and to the model at the top of its next turn: the transcript half,
+   * the client's `report` update, and the host's own reporter. Bookkeeping never throws — a
+   * warning that failed to be delivered must not become a second failure.
+   */
+  #note(message: string): void {
+    try { this.report(message); } catch { /* a transcript that cannot take a note is not a failure */ }
+    this.#emit([{ sessionUpdate: "report", message }]);
+    void Promise.resolve(this.#onReport?.(message)).catch(() => undefined);
   }
 
   #replaceStore(store: TranscriptStore, path: string, reason: "new" | "load"): void {
