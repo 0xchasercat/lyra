@@ -47,9 +47,9 @@ export interface CodeMapStatus {
 export interface CodeMapServiceOptions {
   readonly root: string;
   /** Where a degradation notice goes. Called at most once per service. */
-  readonly onWarning?: (message: string) => void;
+  readonly onWarning?: (message: string) => void | Promise<void>;
   /** Where a progress line goes for a first index big enough to be worth announcing. */
-  readonly onReport?: (message: string) => void;
+  readonly onReport?: (message: string) => void | Promise<void>;
   readonly debounceMs?: number;
 }
 
@@ -95,8 +95,8 @@ export class CodeMapService implements MapAccess {
   #updateFailure: string | undefined;
   #closed = false;
   readonly #debounceMs: number;
-  readonly #onWarning: ((message: string) => void) | undefined;
-  readonly #onReport: ((message: string) => void) | undefined;
+  readonly #onWarning: ((message: string) => void | Promise<void>) | undefined;
+  readonly #onReport: ((message: string) => void | Promise<void>) | undefined;
 
   constructor(options: CodeMapServiceOptions) {
     if (!options || typeof options.root !== "string" || options.root.length === 0) {
@@ -216,6 +216,7 @@ export class CodeMapService implements MapAccess {
     if (this.#closed) return;
     this.#closed = true;
     if (this.#timer !== undefined) { clearTimeout(this.#timer); this.#timer = undefined; }
+    this.#pending.clear();
     await this.#started?.catch(() => undefined);
     await this.#queue.catch(() => undefined);
     this.#map?.close();
@@ -247,13 +248,17 @@ export class CodeMapService implements MapAccess {
       // only progress the underlying index exposes: it writes in one transaction, so there is
       // no half-built graph to count.
       const walk = await walkRepository(this.root);
+      // A short-lived session may close while a large tree is still being sized. There is no
+      // consumer left for the index or its progress lines, so do not start the expensive pass.
+      if (this.#closed) return;
       this.#total = walk.files.length;
       const announced = this.#total >= ANNOUNCE_ABOVE_FILES;
-      if (announced) this.#onReport?.(`[map] Indexing ${this.#total} files in the background; the map tool answers "indexing" until it lands.`);
+      if (announced) this.#notify(this.#onReport, `[map] Indexing ${this.#total} files in the background; the map tool answers "indexing" until it lands.`);
       const stats = await this.#map.index();
+      if (this.#closed) return;
       this.#indexed = stats.files;
       this.#phase = "ready";
-      if (announced) this.#onReport?.(`[map] Indexed ${stats.files} files, ${stats.nodes} symbols, ${stats.edges} relations in ${(stats.elapsedMs / 1000).toFixed(1)}s.`);
+      if (announced) this.#notify(this.#onReport, `[map] Indexed ${stats.files} files, ${stats.nodes} symbols, ${stats.edges} relations in ${(stats.elapsedMs / 1000).toFixed(1)}s.`);
       await this.#drainPending();
     } catch (error) { this.#disable(error); }
   }
@@ -341,12 +346,18 @@ export class CodeMapService implements MapAccess {
     this.#pending.clear();
     try { this.#map?.close(); } catch { /* a store that cannot close is already gone */ }
     this.#map = undefined;
-    this.#onWarning?.(`[map] The code graph is unavailable for this session: ${this.#reason} Every other tool is unaffected; use grep, glob, and read to explore.`);
+    this.#notify(this.#onWarning, `[map] The code graph is unavailable for this session: ${this.#reason} Every other tool is unaffected; use grep, glob, and read to explore.`);
   }
 
   /** A write failed but the graph is still good. Remembered, and reported on every answer. */
   #degrade(error: unknown): void {
     this.#updateFailure = message(error);
+  }
+
+  /** A background observer is never allowed to outlive, or fail, the service it observes. */
+  #notify(callback: ((message: string) => void | Promise<void>) | undefined, message: string): void {
+    if (this.#closed || callback === undefined) return;
+    try { void Promise.resolve(callback(message)).catch(() => undefined); } catch { /* reporting is best effort */ }
   }
 }
 

@@ -7,6 +7,17 @@ import { isValidAuthPluginId, PluginAuth } from "./plugin-auth.ts";
 
 export type WebSocketPreference = "auto" | "on" | "off";
 
+/**
+ * How hard a reasoning model thinks before it answers, in the provider's own vocabulary.
+ *
+ * Sent as `reasoning.effort` on the Responses API and `reasoning_effort` on Chat Completions.
+ * The Anthropic transport has no equivalent knob, so a definition that sets it there is
+ * rejected at parse time rather than silently ignored.
+ */
+export type ReasoningEffort = "none" | "minimal" | "low" | "medium" | "high" | "xhigh";
+
+export const REASONING_EFFORTS: readonly ReasoningEffort[] = ["none", "minimal", "low", "medium", "high", "xhigh"];
+
 export type AuthConfig =
   | { type: "env"; var: string }
   | { type: "none" }
@@ -20,6 +31,7 @@ export interface ProviderDefinition {
   websocket?: WebSocketPreference;
   auth: AuthConfig;
   models?: string[];
+  reasoning_effort?: ReasoningEffort;
 }
 
 export interface ProviderFileConfig {
@@ -31,6 +43,7 @@ export interface ResolvedProvider extends HttpTransportConfig {
   apiType: Exclude<ProviderApiType, "openai_websocket">;
   websocket: WebSocketPreference;
   models: string[];
+  reasoningEffort?: ReasoningEffort;
 }
 
 export async function loadProviderConfig(path?: string | readonly string[]): Promise<ProviderFileConfig> {
@@ -96,6 +109,7 @@ export function resolveProvider(
     apiType: definition.api_type,
     websocket: definition.websocket ?? "auto",
     models: definition.models ?? [],
+    ...(definition.reasoning_effort === undefined ? {} : { reasoningEffort: definition.reasoning_effort }),
     ...(definition.api_type === "anthropic_messages"
       ? {
         // An API key goes in `x-api-key`; a plugin returns a *bearer* token by contract, and
@@ -159,12 +173,17 @@ function parseDefinition(name: string, value: unknown): ProviderDefinition {
   if (models !== undefined && (!Array.isArray(models) || !models.every((model) => typeof model === "string"))) {
     throw new Error(`Provider ${name} models must be an array of model ids`);
   }
+  const reasoningEffort = value.reasoning_effort;
+  if (reasoningEffort !== undefined && !isReasoningEffort(reasoningEffort)) {
+    throw new Error(`Provider ${name} reasoning_effort must be one of ${REASONING_EFFORTS.join(", ")}`);
+  }
   return {
     base_url: value.base_url,
     api_type: value.api_type,
     auth,
     ...(websocket === undefined ? {} : { websocket }),
     ...(models === undefined ? {} : { models }),
+    ...(reasoningEffort === undefined ? {} : { reasoning_effort: reasoningEffort }),
   };
 }
 
@@ -201,6 +220,13 @@ function validateDefinition(name: string, definition: ProviderDefinition): void 
   if (definition.api_type !== "openai_responses" && definition.websocket === "on") {
     throw new Error(`Provider ${name} enables websocket, but WebSocket mode requires api_type=openai_responses`);
   }
+  if (definition.api_type === "anthropic_messages" && definition.reasoning_effort !== undefined) {
+    throw new Error(`Provider ${name} sets reasoning_effort, but the Anthropic Messages API has no reasoning effort parameter; it applies to openai_responses and openai_completions only`);
+  }
+}
+
+function isReasoningEffort(value: unknown): value is ReasoningEffort {
+  return typeof value === "string" && (REASONING_EFFORTS as readonly string[]).includes(value);
 }
 
 function isApiType(value: unknown): value is ProviderDefinition["api_type"] {

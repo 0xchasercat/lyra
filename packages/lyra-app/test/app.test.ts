@@ -115,6 +115,9 @@ describe("Lyra application composition", () => {
       expect(agents).toHaveLength(1);
       expect(agents[0]!.integration.hint[0]).toContain("git fetch");
       expect((await runtime.session.context() as { payload: { messages: unknown[] } }).payload.messages.length).toBeGreaterThan(0);
+      // A service completing during application shutdown has no live transcript to report to.
+      await runtime.session.close();
+      expect(() => runtime.session.report("late background report")).not.toThrow();
     } finally { await runtime.close(); await rm(root, { recursive: true, force: true }); }
   }, 30_000);
 

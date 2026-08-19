@@ -244,6 +244,21 @@ describe("the graph in a session", () => {
     expect(map.graph()!.nodesByName("lateArrival")).not.toHaveLength(0);
   }, 20_000);
 
+  test("closing during the first walk stops the index without sending a late report", async () => {
+    const root = await fixture("lyra-map-close-");
+    await Promise.all(Array.from({ length: 300 }, (_, index) => writeFile(
+      join(root, "src", `extra-${index}.ts`),
+      `export const extra${index} = ${index};\n`,
+    )));
+    const reports: string[] = [];
+    const map = new CodeMapService({ root, onReport: (message) => { reports.push(message); } });
+
+    map.ensureStarted();
+    await map.close();
+
+    expect(reports).toEqual([]);
+  }, 20_000);
+
   test("the index lives inside .lyra, so nothing searches, commits, or checkpoints it", async () => {
     const root = await fixture();
     const app = await LyraApplication.boot({ origin: root, session: "map-state", spawnExecutor: async () => "", sessions: sessionServices(), home: join(root, "home") });

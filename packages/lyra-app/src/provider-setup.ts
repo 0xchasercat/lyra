@@ -534,6 +534,7 @@ function materialize(definition: ProviderDefinition): Record<string, unknown> {
     ...(definition.websocket === undefined ? {} : { websocket: definition.websocket }),
     auth: { ...definition.auth },
     models: [...(definition.models ?? [])],
+    ...(definition.reasoning_effort === undefined ? {} : { reasoning_effort: definition.reasoning_effort }),
   };
 }
 

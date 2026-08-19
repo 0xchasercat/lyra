@@ -118,8 +118,8 @@ export class LyraApplication {
     // drifted. Neither can fail the boot: an indexing crash disables the `map` tool for the
     // session, warns once, and leaves everything else exactly as it was.
     const maps = new CodeMapRegistry({
-      onWarning: (message) => { void options.onReport?.(message); },
-      onReport: (message) => { void options.onReport?.(message); },
+      onWarning: (message) => options.onReport?.(message),
+      onReport: (message) => options.onReport?.(message),
     });
     const map = maps.get(cwd);
     map.ensureStarted();
