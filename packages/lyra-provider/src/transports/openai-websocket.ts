@@ -264,6 +264,7 @@ export class OpenAIWebSocketTransport implements ProviderTransport {
     const systemPrefix = await providerSystemPrefix(this.config, context.signal);
     const payload = buildResponsesRequest(request, {
       stream: false,
+      ...(this.config.reasoningEffort === undefined ? {} : { reasoningEffort: this.config.reasoningEffort }),
       ...(!generate ? { generate: false } : {}),
       input: prepared.input,
       previousResponseId: prepared.previousResponseId,

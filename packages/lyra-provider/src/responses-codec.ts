@@ -1,4 +1,5 @@
 import { joinSystemPrefix } from "./auth.ts";
+import type { ReasoningEffort } from "./config.ts";
 import { classifyProviderError, type ProviderFault } from "./errors.ts";
 import type {
   CanonicalMessage,
@@ -14,6 +15,8 @@ export type ResponseItem = Readonly<Record<string, unknown>>;
 
 export interface ResponsesRequestOptions {
   stream: boolean;
+  /** `reasoning.effort` for the request; omitted when the provider does not set one. */
+  reasoningEffort?: ReasoningEffort;
   previousResponseId?: string | null;
   input?: readonly ResponseItem[];
   generate?: boolean;
@@ -60,6 +63,7 @@ export function buildResponsesRequest(
     body.previous_response_id = options.previousResponseId;
   }
   if (options.generate !== undefined) body.generate = options.generate;
+  if (options.reasoningEffort !== undefined) body.reasoning = { effort: options.reasoningEffort };
   if (request.maxOutputTokens !== undefined) body.max_output_tokens = request.maxOutputTokens;
   if (request.temperature !== undefined) body.temperature = request.temperature;
   if (request.metadata !== undefined) body.metadata = request.metadata;

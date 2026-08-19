@@ -1,5 +1,6 @@
 import { providerHeaders, providerSystemPrefix } from "../auth.ts";
 import type { HttpTransportConfig } from "../auth.ts";
+import type { ReasoningEffort } from "../config.ts";
 import { fetchProviderRoute } from "../endpoints.ts";
 import { classifyProviderError, ProviderFault } from "../errors.ts";
 import { usesMaxCompletionTokens } from "../models.ts";
@@ -32,11 +33,16 @@ interface StreamState {
   toolCallsClosed: boolean;
 }
 
+export interface OpenAICompletionsTransportConfig extends HttpTransportConfig {
+  /** Forwarded as `reasoning_effort` on every request this transport sends. */
+  reasoningEffort?: ReasoningEffort;
+}
+
 export class OpenAICompletionsTransport implements ProviderTransport {
   readonly apiType = "openai_completions" as const;
   readonly id: string;
 
-  constructor(private readonly config: HttpTransportConfig) {
+  constructor(private readonly config: OpenAICompletionsTransportConfig) {
     this.id = config.id;
   }
 
@@ -45,7 +51,7 @@ export class OpenAICompletionsTransport implements ProviderTransport {
     context: TransportContext,
   ): AsyncGenerator<ProviderEvent> {
     const headers = await providerHeaders(this.config, context.signal);
-    const body = serializeRequest(request, await providerSystemPrefix(this.config, context.signal));
+    const body = serializeRequest(request, await providerSystemPrefix(this.config, context.signal), this.config.reasoningEffort);
     let serializedBody: string;
     try {
       serializedBody = JSON.stringify(body);
@@ -88,7 +94,11 @@ export class OpenAICompletionsTransport implements ProviderTransport {
   }
 }
 
-function serializeRequest(request: ProviderRequest, systemPrefix?: string): Readonly<Record<string, unknown>> {
+function serializeRequest(
+  request: ProviderRequest,
+  systemPrefix?: string,
+  reasoningEffort?: ReasoningEffort,
+): Readonly<Record<string, unknown>> {
   const messages: Record<string, unknown>[] = [];
   // Its own system message, ahead of Lyra's: the same separation the Anthropic transport gets
   // from a separate system block, in the shape this wire format has for it.
@@ -130,6 +140,7 @@ function serializeRequest(request: ProviderRequest, systemPrefix?: string): Read
         : { max_tokens: request.maxOutputTokens }),
     ...(request.temperature === undefined ? {} : { temperature: request.temperature }),
     ...(request.metadata === undefined ? {} : { metadata: request.metadata }),
+    ...(reasoningEffort === undefined ? {} : { reasoning_effort: reasoningEffort }),
   };
 }
 

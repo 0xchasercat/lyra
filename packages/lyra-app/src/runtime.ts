@@ -309,6 +309,7 @@ export class MainSession {
   readonly #configPaths: readonly string[] | undefined;
   #environment: EnvironmentProvider;
   #store: TranscriptStore;
+  #closed = false;
   readonly #toolCalls = new Map<string, number>();
   #models: ModelInfo[] = [];
   #inputTokens = 0;
@@ -585,7 +586,12 @@ export class MainSession {
     }
     return rows;
   }
-  report(message: string): void { this.#store.append({ type: "message", role: "user", content: [{ type: "text", text: `[report] ${message}` }], status: "complete" }); }
+  report(message: string): void {
+    // Application services shut down after the session's active turn. A background service may
+    // finish in that interval; its last observation has no live session to belong to.
+    if (this.#closed) return;
+    this.#store.append({ type: "message", role: "user", content: [{ type: "text", text: `[report] ${message}` }], status: "complete" });
+  }
 
   async dump(): Promise<string> { const text = JSON.stringify(this.#store.entries(), null, 2); await copyToClipboard(text); return text; }
 
@@ -1046,7 +1052,13 @@ export class MainSession {
     return runner.run(goal, spec);
   }
 
-  async close(): Promise<void> { this.#activeController?.abort(new DOMException("Session closed", "AbortError")); await this.#activeTurn?.catch(() => undefined); this.#store.close(); }
+  async close(): Promise<void> {
+    if (this.#closed) return;
+    this.#closed = true;
+    this.#activeController?.abort(new DOMException("Session closed", "AbortError"));
+    await this.#activeTurn?.catch(() => undefined);
+    this.#store.close();
+  }
   async closeProvider(): Promise<void> { await this.#environment.provider.transport.close?.(); }
 
   async #runPrompt(text: string, signal: AbortSignal, source: TurnSource): Promise<AgentTurnResult> {

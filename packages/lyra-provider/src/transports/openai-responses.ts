@@ -4,6 +4,7 @@ import {
   providerSystemPrefix,
   type HttpTransportConfig,
 } from "../auth.ts";
+import type { ReasoningEffort } from "../config.ts";
 import { fetchProviderRoute } from "../endpoints.ts";
 import { classifyProviderError, type ProviderFault } from "../errors.ts";
 import {
@@ -26,6 +27,8 @@ import type {
 } from "../types.ts";
 
 export interface OpenAIResponsesTransportConfig extends HttpTransportConfig {
+  /** Forwarded as `reasoning.effort` on every request this transport sends. */
+  reasoningEffort?: ReasoningEffort;
   responsesPath?: string;
   compactPath?: string;
   compactThreshold?: number;
@@ -183,6 +186,7 @@ export class OpenAIResponsesTransport implements ProviderTransport {
         headers,
         body: JSON.stringify(buildResponsesRequest(request, {
           stream: true,
+          ...(this.config.reasoningEffort === undefined ? {} : { reasoningEffort: this.config.reasoningEffort }),
           ...(!generate ? { generate: false } : {}),
           input: prepared.input,
           previousResponseId: prepared.previousResponseId,
