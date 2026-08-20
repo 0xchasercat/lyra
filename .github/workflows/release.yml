@@ -43,6 +43,7 @@ jobs:
             echo "::error::tag $GITHUB_REF_NAME does not match packages/lyra-app version $declared"
             exit 1
           fi
+      - run: bun run build
       - run: bun run check
 
   build:
