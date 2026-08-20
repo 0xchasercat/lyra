@@ -77,9 +77,15 @@ jobs:
           apt-get update -qq
           apt-get install -y --no-install-recommends \
             ca-certificates curl unzip xz-utils git build-essential python3 pkg-config libssl-dev
-          # Node is here only to run node-gyp for the tree-sitter rebuild below.
+          # tree-sitter's install hook invokes `node-gyp` by name during `bun install`,
+          # before the explicit compatibility rebuild below. NodeSource ships npm but not a
+          # node-gyp executable, so install it first and keep one version for both builds.
           curl -fsSL https://deb.nodesource.com/setup_18.x | bash -
           apt-get install -y --no-install-recommends nodejs
+          npm install --global node-gyp@10.3.1
+          node_gyp_bin="$(npm prefix --global)/bin"
+          echo "$node_gyp_bin" >> "$GITHUB_PATH"
+          "$node_gyp_bin/node-gyp" --version
           curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
@@ -99,7 +105,7 @@ jobs:
           prebuild=$(find node_modules -type f -path "*tree-sitter/prebuilds/linux-$arch/tree-sitter.node" | head -1)
           [ -n "$prebuild" ] || { echo "::error::no tree-sitter prebuild found to replace"; exit 1; }
           package=${prebuild%/prebuilds/*}
-          ( cd "$package" && npx --yes node-gyp@10 rebuild --napi_build_version=8 )
+          ( cd "$package" && node-gyp rebuild --napi_build_version=8 )
           # rm first: bun hardlinks from its install cache, and writing through the
           # link would corrupt the cache for every later build on this runner.
           rm -f "$prebuild"
