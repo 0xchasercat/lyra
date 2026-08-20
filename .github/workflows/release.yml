@@ -97,21 +97,25 @@ jobs:
 
       - run: bun install --frozen-lockfile
 
-      - name: Rebuild the tree-sitter binding against this base
+      - name: Rebuild tree-sitter native addons against this base
         if: matrix.container != ''
         run: |
           set -eu
           arch=$(uname -m); case "$arch" in x86_64) arch=x64;; aarch64) arch=arm64;; esac
-          prebuild=$(find node_modules -type f -path "*tree-sitter/prebuilds/linux-$arch/tree-sitter.node" | head -1)
-          [ -n "$prebuild" ] || { echo "::error::no tree-sitter prebuild found to replace"; exit 1; }
-          package=${prebuild%/prebuilds/*}
-          ( cd "$package" && node-gyp rebuild --napi_build_version=8 )
-          # rm first: bun hardlinks from its install cache, and writing through the
-          # link would corrupt the cache for every later build on this runner.
-          rm -f "$prebuild"
-          cp "$package/build/Release/tree_sitter_runtime_binding.node" "$prebuild"
-          echo "Rebuilt $prebuild; it now requires at most:"
-          strings "$prebuild" | grep -oE 'GLIBCXX_3\.4\.[0-9]+' | sort -t. -k3 -n | tail -1 || echo "  (no libstdc++ requirement)"
+          for addon in tree-sitter tree-sitter-typescript tree-sitter-python tree-sitter-rust tree-sitter-go; do
+            prebuild=$(find node_modules -type f -path "*/$addon/prebuilds/linux-$arch/$addon.node" | head -1)
+            [ -n "$prebuild" ] || { echo "::error::no $addon prebuild found to replace"; exit 1; }
+            package=${prebuild%/prebuilds/*}
+            ( cd "$package" && node-gyp rebuild --napi_build_version=8 )
+            rebuilt=$(find "$package/build/Release" -maxdepth 1 -type f -name '*.node' | head -1)
+            [ -n "$rebuilt" ] || { echo "::error::$addon rebuild produced no native addon"; exit 1; }
+            # rm first: bun hardlinks from its install cache, and writing through the
+            # link would corrupt the cache for every later build on this runner.
+            rm -f "$prebuild"
+            cp "$rebuilt" "$prebuild"
+            echo "Rebuilt $prebuild; it now requires at most:"
+            strings "$prebuild" | grep -oE 'GLIBCXX_3\.4\.[0-9]+' | sort -t. -k3 -n | tail -1 || echo "  (no libstdc++ requirement)"
+          done
 
       - name: Build the bundle
         run: bun run build
