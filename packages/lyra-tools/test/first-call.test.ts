@@ -372,9 +372,9 @@ describe("first-call ergonomics", () => {
       // The guard that matters is untouched: an existing file still needs its real tag.
       const overwrite = await registry.execute("write", { path: "blank-tag.txt", content: "again\n", tag: "#000000" }, context);
       expect(overwrite.isError).toBe(true);
-      expect(text(overwrite)).toContain("read it first");
-      // ... and the error names the call that produces the tag it is asking for.
+      // The error names the call that produces the tag it is asking for.
       expect(text(overwrite)).toContain('read({ path: "blank-tag.txt" })');
+      expect(text(overwrite)).toContain("#TAG");
     } finally { await close(); }
   });
 

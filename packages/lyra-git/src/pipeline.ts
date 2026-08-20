@@ -16,6 +16,8 @@ const NAME = /^[a-z0-9][a-z0-9-]{0,79}$/;
 const EXCLUDE_ENTRY = "/.lyra/";
 /** How many uncommitted paths a child's integration summary carries before it is cut. */
 const MAX_INTEGRATION_PATHS = 50;
+/** Safe identity for merge commits made in Lyra's throwaway apply clone on an unconfigured host. */
+const FALLBACK_GIT_IDENTITY = Object.freeze({ name: "Lyra", email: "lyra@localhost" });
 interface GitOutput { stdout: string; stderr: string; exitCode: number; }
 
 /**
@@ -99,6 +101,11 @@ export class GitPipeline {
     const clone = await this.git(this.origin, ["clone", "--local", this.origin, stagingPath], signal);
     if (clone.exitCode !== 0) throw new Error(`Could not create transactional apply repository: ${clone.stderr.trim()}.`);
     try {
+      // Repository-local identity is deliberately not copied by `git clone`. Carry the
+      // origin's effective identity into this disposable clone, and use Lyra's identity only
+      // on fresh hosts (such as CI) where the user has configured none. Without this, Git
+      // rejects a non-fast-forward merge before it can even report real file conflicts.
+      await this.configureApplyIdentity(stagingPath, signal);
       const priorTasks: string[] = [];
       for (const workspace of preview.workspaces) {
         const branch = `agent/${workspace.name}`;
@@ -172,6 +179,16 @@ export class GitPipeline {
     const status = await this.git(this.origin, ["status", "--porcelain"], signal);
     if (status.exitCode !== 0) throw new Error(`Cannot inspect origin before ${operation}: ${status.stderr.trim()}.`);
     if (status.stdout.trim().length > 0) throw new Error(`Origin has tracked or untracked changes; commit, move, or restore them before ${operation} so the merge lands on a state you can name.`);
+  }
+  private async configureApplyIdentity(repo: string, signal?: AbortSignal): Promise<void> {
+    const configuredName = await this.git(this.origin, ["config", "--get", "user.name"], signal);
+    const configuredEmail = await this.git(this.origin, ["config", "--get", "user.email"], signal);
+    const name = nonEmpty(process.env.GIT_COMMITTER_NAME) ?? nonEmpty(process.env.GIT_AUTHOR_NAME) ?? (configuredName.exitCode === 0 ? nonEmpty(configuredName.stdout) : undefined) ?? FALLBACK_GIT_IDENTITY.name;
+    const email = nonEmpty(process.env.GIT_COMMITTER_EMAIL) ?? nonEmpty(process.env.GIT_AUTHOR_EMAIL) ?? (configuredEmail.exitCode === 0 ? nonEmpty(configuredEmail.stdout) : undefined) ?? FALLBACK_GIT_IDENTITY.email;
+    for (const [key, value] of [["user.name", name], ["user.email", email]] as const) {
+      const set = await this.git(repo, ["config", "--local", key, value], signal);
+      if (set.exitCode !== 0) throw new Error(`Could not configure ${key} in transactional apply repository: ${set.stderr.trim() || `git exited ${set.exitCode}`}.`);
+    }
   }
   private async git(cwd: string, args: readonly string[], signal?: AbortSignal): Promise<GitOutput> {
     if (signal?.aborted) throw signal.reason;
@@ -268,5 +285,6 @@ function validateWorkspace(value: AgentWorkspace): AgentWorkspace {
   return { name: value.name, path: resolve(value.path), task: value.task };
 }
 function timestampName(date: Date): string { return date.toISOString().replace(/[-:]/g, "").replace(/\.\d{3}Z$/, "Z").toLowerCase(); }
+function nonEmpty(value: string | undefined): string | undefined { const trimmed = value?.trim(); return trimmed === undefined || trimmed.length === 0 ? undefined : trimmed; }
 async function exists(path: string): Promise<boolean> { try { await stat(path); return true; } catch { return false; } }
 async function atomicJson(path: string, value: unknown): Promise<void> { const temporary = `${path}.${process.pid}.${randomBytes(4).toString("hex")}.tmp`; await writeFile(temporary, `${JSON.stringify(value)}\n`, { flag: "wx", mode: 0o600 }); await rename(temporary, path); }

@@ -279,9 +279,21 @@ describe("LspManager", () => {
   });
 });
 
+function commandWorks(command: string): boolean {
+  const executable = Bun.which(command);
+  if (executable === null) return false;
+  try {
+    return Bun.spawnSync([executable, "--version"], { stdout: "ignore", stderr: "ignore" }).success;
+  } catch {
+    return false;
+  }
+}
+
 // Opportunistic: real servers are the only proof the handshake is right, but a
-// missing toolchain is not a test failure.
-describe.skipIf(Bun.which("rust-analyzer") === null)("rust-analyzer integration", () => {
+// missing toolchain is not a test failure. `Bun.which` alone is insufficient on
+// rustup installations: its rust-analyzer shim exists even when the component does not.
+const rustToolchainAvailable = commandWorks("rust-analyzer") && commandWorks("cargo");
+describe.skipIf(!rustToolchainAvailable)("rust-analyzer integration", () => {
   test("survives real startup traffic and navigates a real crate", async () => {
     const root = await workspace();
     await writeFile(join(root, "Cargo.toml"), "[package]\nname = \"probe\"\nversion = \"0.1.0\"\nedition = \"2021\"\n");

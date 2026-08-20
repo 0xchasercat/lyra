@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdtemp, rm } from "node:fs/promises";
+import { access, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -14,6 +14,14 @@ import {
 
 const hosts: ProcessHost[] = [];
 const roots: string[] = [];
+
+async function waitForPath(path: string, timeoutMs = 2_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    try { await access(path); return; } catch { await Bun.sleep(5); }
+  }
+  throw new Error(`Timed out waiting for ${path}`);
+}
 
 afterEach(async () => {
   await Promise.all(hosts.splice(0).map((host) => host.close()));
@@ -147,8 +155,11 @@ describe("classed process execution", () => {
     hosts.push(host);
     // `background` rather than a heavy classification: what is under test is cancellation,
     // not which pattern happens to send a command to the background this month.
-    const handle = await host.run({ command: "printf partial; sleep 5", cwd: root, background: true });
-    await new Promise((resolve) => setTimeout(resolve, 20));
+    const handle = await host.run({ command: "printf partial; : > cancel-ready; sleep 5", cwd: root, background: true });
+    // Wait for an observable event from inside the shell. A fixed 20ms delay raced process
+    // startup when the full suite saturated a small CI runner, so it sometimes cancelled
+    // before the `printf` this test is specifically meant to preserve.
+    await waitForPath(join(root, "cancel-ready"));
     expect(await host.cancel(handle.id)).toBe(true);
     const result = await host.wait(handle.id);
     expect(result?.stdout).toContain("partial");
@@ -165,9 +176,11 @@ describe("classed process execution", () => {
     const host = new ProcessHost({ nproc: 1, defaultTimeoutMs: 1_000 });
     hosts.push(host);
     const result = await host.run({
-      command: "printf before; /usr/bin/perl -e 'select undef, undef, undef, 1'; printf after",
+      command: "printf before; /usr/bin/perl -e 'select undef, undef, undef, 5'; printf after",
       cwd: root,
-      timeoutMs: 40,
+      // Leave enough startup headroom for a highly parallel CI run. The five-second command
+      // still proves the host's own deadline rather than the child ending naturally.
+      timeoutMs: 1_000,
     });
     expect(result).toMatchObject({ stdout: "before", signal: "SIGTERM", timedOut: true });
     expect(result.stdout).not.toContain("after");

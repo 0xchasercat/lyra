@@ -287,29 +287,26 @@ describe("daemon conformance", () => {
     const writer = new Writer();
     try {
       await runtime.app.acp.handleLine(JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize" }), writer);
-      const call = async (id: number, method: string, params?: unknown): Promise<unknown> => {
-        await runtime.app.acp.handleLine(JSON.stringify({ jsonrpc: "2.0", id, method, ...(params === undefined ? {} : { params }) }));
-        await new Promise((resolve) => setTimeout(resolve, 10));
-        const message = writer.messages().find((entry) => entry.id === id);
-        if (message?.error !== undefined) throw new Error(JSON.stringify(message.error));
-        return message?.result;
-      };
+      // `handleLine` accepts and launches requests; it does not wait for their handlers. Poll
+      // for each response so a busy CI runner cannot turn a valid asynchronous reply into an
+      // undefined result merely by taking longer than one 10ms timer tick.
+      const call = caller(runtime, writer);
 
-      const snapshot = await call(2, "session/snapshot") as { descriptor: { sessionId: string } };
+      const snapshot = await call("session/snapshot") as { descriptor: { sessionId: string } };
       validator.assert(snapshot, "#/$defs/requests/session~1snapshot/result", "session/snapshot result");
-      const list = await call(3, "session/list") as Array<{ sessionId: string; active: boolean }>;
+      const list = await call("session/list") as Array<{ sessionId: string; active: boolean }>;
       validator.assert(list, "#/$defs/requests/session~1list/result", "session/list result");
       // A listing row is addressable: its sessionId is the one `session/update` frames carry.
       expect(list.find((row) => row.active)?.sessionId).toBe(snapshot.descriptor.sessionId);
-      validator.assert(await call(4, "session/providers"), "#/$defs/requests/session~1providers/result", "session/providers result");
-      expect(await call(5, "session/cancel", { rewoundToComposer: true })).toEqual({ cancelled: false });
-      const steer = await call(6, "session/steer", { prompt: "no turn is running" });
+      validator.assert(await call("session/providers"), "#/$defs/requests/session~1providers/result", "session/providers result");
+      expect(await call("session/cancel", { rewoundToComposer: true })).toEqual({ cancelled: false });
+      const steer = await call("session/steer", { prompt: "no turn is running" });
       validator.assert(steer, "#/$defs/requests/session~1steer/result", "session/steer result");
       expect(steer).toEqual({ delivery: "prompted", pending: 0 });
 
       // The model surface is cross-provider: `current` is a full reference, and the catalogue
       // is grouped by provider rather than being the active one's list.
-      const models = await call(7, "session/models") as { providers: Array<{ provider: string; models: Array<{ id: string }> }>; current: string };
+      const models = await call("session/models") as { providers: Array<{ provider: string; models: Array<{ id: string }> }>; current: string };
       expect(models.current).toBe("fixture/fixture-model");
       expect(models.providers.map((row) => row.provider)).toEqual(["fixture"]);
       // The endpoint is unreachable on purpose, so the declared models are the whole answer —

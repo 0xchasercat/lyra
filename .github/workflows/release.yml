@@ -45,10 +45,10 @@ jobs:
           fi
       - name: Reset TypeScript build state
         run: bun run clean
-      - name: Typecheck and test
-        run: bun run check
       - name: Build release bundle
         run: bun run build
+      - name: Typecheck and test
+        run: bun run check
 
   build:
     needs: check

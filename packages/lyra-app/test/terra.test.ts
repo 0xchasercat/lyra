@@ -437,6 +437,10 @@ async function repository(prefix: string): Promise<string> {
   await writeFile(join(root, ".gitignore"), ".lyra/\n");
   await writeFile(join(root, "base.txt"), "base\n");
   await git(root, ["init", "-q", "-b", "main"]);
+  // The integration recipe performs an ordinary merge in the launch repository. Keep the
+  // fixture self-contained: a clean CI runner has no global Git author configuration.
+  await git(root, ["config", "user.name", "Lyra Test"]);
+  await git(root, ["config", "user.email", "lyra@example.test"]);
   await git(root, ["add", "."]);
   await git(root, ["commit", "-q", "-m", "base"]);
   return root;

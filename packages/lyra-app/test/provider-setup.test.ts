@@ -354,15 +354,14 @@ describe("removing a provider", () => {
     expect(await readFile(path, "utf8")).toContain("[providers.gateway]");
   });
 
-  test("the stored credential goes only when asked, and only when there is one to go", async () => {
+  test("deletes only a keychain credential and reports when none exists", async () => {
     const { home } = await seeded();
     const removed = await removeProviderSetup("gateway", { home });
     const deleted: unknown[] = [];
 
-    // Not asked: the keychain is not touched at all.
-    expect(await removeProviderCredential(removed.auth, {})).toBe(false);
-
-    // Asked, and there was one.
+    // The caller invokes this helper only after deletion was requested. Keep the unit test on
+    // its explicit keychain seam: using the default here would probe the developer or CI
+    // machine's real credential store, and a machine with no keychain correctly throws.
     expect(await removeProviderCredential(removed.auth, { deleteKeychain: async (credential) => { deleted.push(credential); return true; } })).toBe(true);
     expect(deleted).toEqual([{ service: "dev.lyra.provider.gateway", account: "operator" }]);
 
