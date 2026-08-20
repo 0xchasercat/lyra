@@ -64,7 +64,7 @@ jobs:
             container: debian:bullseye
           - runner: macos-latest
             platform: darwin-arm64
-          - runner: macos-13
+          - runner: macos-15-intel
             platform: darwin-x64
     runs-on: ${{ matrix.runner }}
     container: ${{ matrix.container }}
