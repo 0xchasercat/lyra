@@ -109,6 +109,15 @@ export class CodeMapService implements MapAccess {
   }
 
   ensureStarted(): void {
+    // A kill switch for one specific question: is the native parser implicated in a crash?
+    // The graph is the only thing in a session that runs tree-sitter, so with it off no parse
+    // happens at all, and a crash that survives is not the parser's doing. It disables the
+    // `map` tool and nothing else -- grep, glob and read cover the same ground more slowly --
+    // which is exactly what the service already does when indexing fails on its own.
+    if (Bun.env.LYRA_DISABLE_CODE_MAP !== undefined && Bun.env.LYRA_DISABLE_CODE_MAP !== "") {
+      this.#disable(new Error("disabled by LYRA_DISABLE_CODE_MAP."));
+      return;
+    }
     if (this.#phase !== "cold" || this.#closed) return;
     this.#phase = "indexing";
     this.#started = this.#firstPass();

@@ -231,7 +231,7 @@ function classify(
 
   if (isContextOverflowMessage(message)) return "context_overflow";
   if (isQuotaMessage(message)) return "quota";
-  if (message.includes("refus") || message.includes("content policy")) return "refusal";
+  if (isRefusalMessage(message)) return "refusal";
   if (message.includes("model") && (message.includes("not found") || message.includes("deprecated"))) {
     return "model_unavailable";
   }
@@ -272,6 +272,29 @@ const TRANSIENT_MESSAGE_PATTERNS: readonly RegExp[] = [
 
 function isTransientMessage(message: string): boolean {
   return TRANSIENT_MESSAGE_PATTERNS.some((pattern) => pattern.test(message));
+}
+
+/**
+ * The provider declining on policy grounds, in the words it actually uses.
+ *
+ * A refusal is not a malformed request, and calling it one costs the reader the single fact
+ * that explains the turn: nothing about the request was wrong, the service simply would not
+ * answer it. Only the literal word "refuse" was matched before, which none of these say --
+ * a benchmark task about defeating an HTML filter came back as `bad_request`.
+ *
+ * Retry behaviour is unchanged either way: both are fatal, because asking again identically
+ * gets the same answer.
+ */
+const REFUSAL_MESSAGE_PATTERNS: readonly RegExp[] = [
+  /\bcontent policy\b/,
+  /\busage polic(?:y|ies)\b/,
+  /\bsafety (?:system|filter|policy)\b/,
+  /\bflagged for (?:possible|potential)\b/,
+  /\brejected as a result of\b/,
+];
+
+function isRefusalMessage(message: string): boolean {
+  return message.includes("refus") || REFUSAL_MESSAGE_PATTERNS.some((p) => p.test(message));
 }
 
 function extractError(body: unknown): { code?: string; message?: string } {

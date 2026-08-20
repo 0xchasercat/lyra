@@ -364,3 +364,25 @@ describe("replayed assistant message identity", () => {
     expect(JSON.stringify(input)).not.toContain("e_01M0EE1");
   });
 });
+
+describe("a provider declining on policy grounds", () => {
+  test("is a refusal, in the words providers actually use", () => {
+    // Read as `bad_request` these lose the one fact that explains the turn: the request was
+    // fine, the service would not answer it. Seen on real benchmark tasks about defeating an
+    // HTML filter and about cryptanalysis.
+    for (const body of [
+      "This content was flagged for possible cybersecurity risk. If this seems wrong, rephrase and try again.",
+      "This task has been permanently stopped by the service safety filter and cannot continue.",
+      "Your request was rejected as a result of our safety system.",
+      "This violates our usage policies.",
+    ]) {
+      expect(classifyProviderError({ status: 400, body }).classification).toBe("refusal");
+    }
+  });
+
+  test("does not swallow ordinary bad requests", () => {
+    for (const body of ["Unknown parameter: foo", "Invalid schema for tool 'bash'"]) {
+      expect(classifyProviderError({ status: 400, body }).classification).toBe("bad_request");
+    }
+  });
+});
