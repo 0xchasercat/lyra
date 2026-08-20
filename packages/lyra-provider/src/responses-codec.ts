@@ -315,6 +315,8 @@ export class ResponsesStreamDecoder {
   private readonly callArguments = new Map<string, string>();
   private readonly callsEnded = new Set<string>();
   private readonly reasoningEmitted = new Set<string>();
+  /** item id -> the phase the provider gave that assistant message, if any. */
+  private readonly itemPhase = new Map<string, string>();
   private readonly textEmitted = new Set<string>();
   /** Text already streamed, per `item_id:content_index` slot — the ledger content dedup reads. */
   private readonly streamedText = new Map<string, string>();
@@ -395,9 +397,29 @@ export class ResponsesStreamDecoder {
 
   private itemAdded(event: Record<string, unknown>): ProviderEvent[] {
     const item = requiredRecord(event.item, "output item", event);
+    this.notePhase(item);
     if (item.type !== "function_call") return [];
     const call = this.captureCall(item, event);
     return this.startCall(call);
+  }
+
+  /**
+   * Remember an assistant message's phase, keyed by the item id its text deltas carry.
+   *
+   * Recorded from `output_item.added` (which arrives before the first delta), from
+   * `output_item.done`, and from the terminal `response.output` — a translating proxy may
+   * skip any of the three, and the phase must survive whichever one it does send.
+   */
+  private notePhase(item: Record<string, unknown>, fallbackId?: string): void {
+    if (item.type !== "message" || item.role !== "assistant") return;
+    const id = stringValue(item.id) ?? fallbackId;
+    const phase = stringValue(item.phase);
+    if (id === undefined || phase === undefined) return;
+    this.itemPhase.set(id, phase);
+  }
+
+  private phaseFor(key: string): string | undefined {
+    return this.itemPhase.get(key.slice(0, key.lastIndexOf(":")));
   }
 
   private argumentsDelta(event: Record<string, unknown>): ProviderEvent[] {
@@ -433,7 +455,8 @@ export class ResponsesStreamDecoder {
     const addition = isCumulativeResend(streamed, delta) ? delta.slice(streamed.length) : delta;
     if (addition.length === 0) return [];
     this.streamedText.set(key, streamed + addition);
-    return [{ type: "text_delta", text: addition }];
+    const phase = this.phaseFor(key);
+    return [{ type: "text_delta", text: addition, ...(phase === undefined ? {} : { phase }) }];
   }
 
   /**
@@ -448,7 +471,8 @@ export class ResponsesStreamDecoder {
     if (text.length === 0) return [];
     if (this.alreadyRendered(key, text)) return [];
     this.completedText.add(text);
-    return [{ type: "text_delta", text }];
+    const phase = this.phaseFor(key);
+    return [{ type: "text_delta", text, ...(phase === undefined ? {} : { phase }) }];
   }
 
   private alreadyRendered(key: string, text: string): boolean {
@@ -477,6 +501,7 @@ export class ResponsesStreamDecoder {
     const index = numberValue(event.output_index);
     if (index !== undefined && this.isEchoedInput(item, index)) return [];
     this.recordOutput(event, item);
+    this.notePhase(item);
     if (item.type === "reasoning") return this.emitReasoning(item, event);
     if (item.type !== "function_call") return [];
 
@@ -510,7 +535,12 @@ export class ResponsesStreamDecoder {
         const synthetic = { output_index: index, item };
         if (item.type === "reasoning") events.push(...this.emitReasoning(item, synthetic));
         else if (item.type === "function_call") events.push(...this.finishTerminalCall(item, synthetic));
-        else if (item.type === "message") events.push(...this.emitTerminalMessage(item, index));
+        else if (item.type === "message") {
+          // `emitTerminalMessage` keys content by this same fallback when the item carries no
+          // id of its own, so the phase must be filed under it too.
+          this.notePhase(item, `output:${index}`);
+          events.push(...this.emitTerminalMessage(item, index));
+        }
       }
       this.output = produced;
     }
@@ -639,18 +669,33 @@ export class ResponsesStreamDecoder {
 
 function serializeMessage(message: CanonicalMessage, destination: ResponseItem[]): void {
   let content: Record<string, unknown>[] = [];
+  let phase: string | undefined;
   const flush = (): void => {
     if (content.length === 0) return;
     destination.push({
       type: "message",
       role: message.role,
       content,
-      ...(message.role === "assistant" ? { id: message.id, status: "completed" } : {}),
+      // No `id`. On a Responses input item that field is the *provider's* item id, and Lyra's
+      // is its own transcript id (`e_01J…`), which the API rejects outright:
+      //   Invalid 'input[1].id': 'e_01J…'. Expected an ID that begins with 'msg'.
+      // It cost nothing to send and broke every replay of an assistant message that carried
+      // text — commentary, or a marker such as "interrupted" — which is every such turn once
+      // the conversation is replayed rather than chained. Item identity is compared by
+      // `itemFingerprint`, which ignores ids, so nothing here needed one.
+      ...(message.role === "assistant" ? { status: "completed" } : {}),
+      ...(phase === undefined ? {} : { phase }),
     });
     content = [];
+    phase = undefined;
   };
 
   for (const block of message.content) {
+    // One canonical message can hold a run of commentary and the final answer that followed
+    // it. They were separate items on the wire and have to go back as separate items, or the
+    // phase of whichever won would be claimed by the other's text too.
+    if (block.type === "text" && block.phase !== phase && content.length > 0) flush();
+    if (block.type === "text") phase = block.phase;
     if (block.type === "reasoning") {
       flush();
       if (block.raw.type !== "reasoning") {

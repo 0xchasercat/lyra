@@ -281,6 +281,14 @@ export class OpenAIResponsesTransport implements ProviderTransport {
 
 
   private beginTurn(): void {
+    // The guard protects the chain, and only the chain: two interleaved turns would each
+    // commit over the other's response id and canonical window, and the loser would then
+    // chain from a window that never existed. Without a chain there is nothing to corrupt —
+    // every request already carries its whole conversation and reads no shared state — so
+    // concurrent turns are simply allowed. That is not hypothetical: a session that spawns a
+    // subagent, or compacts while the main loop runs, resolves both to this one transport,
+    // and refusing the second killed the turn outright.
+    if (!this.chain.chains) return;
     if (this.inFlight) {
       throw classifyProviderError({
         code: "invalid_role_sequence",

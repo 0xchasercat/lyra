@@ -96,6 +96,11 @@ const CONTENT_CODES = new Set([
 ]);
 const REFUSAL_CODES = new Set(["content_policy_violation", "refusal"]);
 const TRANSIENT_CODES = new Set([
+  // Gateways spell an overloaded backend a dozen ways. The codes are collected here and the
+  // wording is matched below, because neither list is ever complete on its own.
+  "server_is_overloaded",
+  "server_overloaded",
+  "engine_overloaded",
   // A dropped response chain is a fact about the server's store, not about the request: the
   // transports rebuild the chain from scratch and the next attempt carries the whole
   // conversation. It only reaches this classifier when a transport could not swallow it —
@@ -230,6 +235,7 @@ function classify(
   if (message.includes("model") && (message.includes("not found") || message.includes("deprecated"))) {
     return "model_unavailable";
   }
+  if (isTransientMessage(message)) return "transient";
   if (isTransientCause(cause)) return "transient";
 
   return "bad_request";
@@ -242,6 +248,30 @@ function isContextOverflowMessage(message: string): boolean {
 
 function isQuotaMessage(message: string): boolean {
   return QUOTA_MESSAGE_PATTERN.test(message);
+}
+
+/**
+ * A provider saying "not now" rather than "not this".
+ *
+ * An overloaded backend is the one failure that is certain to be temporary — the message
+ * itself asks for a retry — and it reaches Lyra as an error event inside a 200 stream, so
+ * there is no status to classify it by. Without this it falls through to `bad_request`, which
+ * is fatal: a whole session dies of a condition that a few seconds of backoff would clear.
+ *
+ * The patterns stay narrow. "Try again" alone is not enough — plenty of permanent failures
+ * suggest trying again after you fix something — so only wording that points at the server's
+ * load or a deadline counts.
+ */
+const TRANSIENT_MESSAGE_PATTERNS: readonly RegExp[] = [
+  /\boverloaded\b/,
+  /\bat capacity\b/,
+  /\btemporarily unavailable\b/,
+  /\btry again (?:later|shortly|in a (?:few|moment|little))/,
+  /\bplease retry\b/,
+];
+
+function isTransientMessage(message: string): boolean {
+  return TRANSIENT_MESSAGE_PATTERNS.some((pattern) => pattern.test(message));
 }
 
 function extractError(body: unknown): { code?: string; message?: string } {

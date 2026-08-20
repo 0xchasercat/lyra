@@ -1,0 +1,146 @@
+# Build the platform bundles `scripts/package.ts` produces and publish them as a
+# GitHub release.
+#
+# Two things here are load-bearing rather than incidental:
+#
+# 1. **Every bundle is built on its own platform.** `bun build --compile` embeds the
+#    native addons it finds in `node_modules` — tree-sitter and its grammars — so a
+#    bundle is only as portable as the machine that produced it. Cross-compiling
+#    would embed the host's addons and ship a binary that dies on `require`.
+#
+# 2. **Linux builds run on Debian bullseye, not on the runner's Ubuntu.** A binary
+#    inherits the glibc and libstdc++ floor of whatever built it, and the runner is
+#    far newer than the images this agent is run inside. Bullseye (glibc 2.31,
+#    libstdc++ GLIBCXX_3.4.28) is old enough for bookworm, jammy and noble alike.
+#    The tree-sitter core binding is rebuilt from source there for the same reason:
+#    the prebuild npm ships needs GLIBCXX_3.4.31, which bookworm does not have, and
+#    embedding it produces a bundle that cannot load its own parser.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version-file: package.json
+      - run: bun install --frozen-lockfile
+      - name: Tag and package version must agree
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          declared=$(bun --print 'require("./packages/lyra-app/package.json").version')
+          tagged=${GITHUB_REF_NAME#v}
+          if [ "$declared" != "$tagged" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match packages/lyra-app version $declared"
+            exit 1
+          fi
+      - run: bun run check
+
+  build:
+    needs: check
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            platform: linux-x64
+            container: debian:bullseye
+          - runner: ubuntu-24.04-arm
+            platform: linux-arm64
+            container: debian:bullseye
+          - runner: macos-latest
+            platform: darwin-arm64
+          - runner: macos-13
+            platform: darwin-x64
+    runs-on: ${{ matrix.runner }}
+    container: ${{ matrix.container }}
+    steps:
+      - name: Install build tooling (Linux container)
+        if: matrix.container != ''
+        run: |
+          set -eu
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update -qq
+          apt-get install -y --no-install-recommends \
+            ca-certificates curl unzip xz-utils git build-essential python3 pkg-config libssl-dev
+          # Node is here only to run node-gyp for the tree-sitter rebuild below.
+          curl -fsSL https://deb.nodesource.com/setup_18.x | bash -
+          apt-get install -y --no-install-recommends nodejs
+          curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version-file: package.json
+
+      - run: bun install --frozen-lockfile
+
+      - name: Rebuild the tree-sitter binding against this base
+        if: matrix.container != ''
+        run: |
+          set -eu
+          arch=$(uname -m); case "$arch" in x86_64) arch=x64;; aarch64) arch=arm64;; esac
+          prebuild=$(find node_modules -type f -path "*tree-sitter/prebuilds/linux-$arch/tree-sitter.node" | head -1)
+          [ -n "$prebuild" ] || { echo "::error::no tree-sitter prebuild found to replace"; exit 1; }
+          package=${prebuild%/prebuilds/*}
+          ( cd "$package" && npx --yes node-gyp@10 rebuild --napi_build_version=8 )
+          # rm first: bun hardlinks from its install cache, and writing through the
+          # link would corrupt the cache for every later build on this runner.
+          rm -f "$prebuild"
+          cp "$package/build/Release/tree_sitter_runtime_binding.node" "$prebuild"
+          echo "Rebuilt $prebuild; it now requires at most:"
+          strings "$prebuild" | grep -oE 'GLIBCXX_3\.4\.[0-9]+' | sort -t. -k3 -n | tail -1 || echo "  (no libstdc++ requirement)"
+
+      - name: Build the bundle
+        run: bun run build
+
+      - name: Prove the bundle runs where nothing is installed
+        run: |
+          set -eu
+          cd "$(mktemp -d)"
+          "$GITHUB_WORKSPACE/dist/lyra-${{ matrix.platform }}/lyra" --help > /dev/null
+          echo "lyra --help ok outside the workspace"
+
+      - name: Archive
+        run: |
+          set -eu
+          version=$(bun --print 'require("./packages/lyra-app/package.json").version')
+          tar -czf "lyra-$version-${{ matrix.platform }}.tar.gz" -C dist "lyra-${{ matrix.platform }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bundle-${{ matrix.platform }}
+          path: lyra-*-${{ matrix.platform }}.tar.gz
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: bundle-*
+          merge-multiple: true
+          path: dist
+      - name: Checksums
+        run: cd dist && sha256sum lyra-*.tar.gz | tee SHA256SUMS
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "$GITHUB_REF_NAME" \
+            --generate-notes

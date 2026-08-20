@@ -6,8 +6,8 @@ import { NoAuth } from "../src/auth.ts";
 import { classifyProviderError } from "../src/errors.ts";
 import { loadProviderConfig, resolveProvider } from "../src/config.ts";
 import { createProviderTransport } from "../src/registry.ts";
-import { buildResponsesRequest } from "../src/responses-codec.ts";
-import type { ProviderRequest } from "../src/types.ts";
+import { buildResponsesRequest, ResponsesStreamDecoder } from "../src/responses-codec.ts";
+import type { ProviderEvent, ProviderRequest } from "../src/types.ts";
 
 const temporaryPaths: string[] = [];
 const servers: Bun.Server<unknown>[] = [];
@@ -207,5 +207,160 @@ response_chaining = false
     const config = await loadProviderConfig(path);
     expect(config.providers.gateway?.response_chaining).toBe(false);
     expect(resolveProvider("gateway", config.providers.gateway!).chaining).toBe(false);
+  });
+});
+
+describe("an overloaded backend", () => {
+  // The failure arrives as an error event inside a 200 stream, so there is no status to
+  // classify by, and the gateway's code is its own invention. Read as `bad_request` it ends
+  // the session outright — which is how 15 of 25 benchmark trials died on a condition that
+  // clears in seconds.
+  test("is transient however the gateway spells it", () => {
+    const coded = classifyProviderError({ body: { code: "server_is_overloaded", message: "Our servers are currently overloaded. Please try again later." } });
+    expect(coded.classification).toBe("transient");
+
+    // Same fact, no code at all.
+    const prose = classifyProviderError({ body: "Our servers are currently overloaded. Please try again later." });
+    expect(prose.classification).toBe("transient");
+
+    for (const message of ["The engine is at capacity", "Service temporarily unavailable", "Busy — please retry"]) {
+      expect(classifyProviderError({ body: { message } }).classification).toBe("transient");
+    }
+  });
+
+  test("does not drag ordinary bad requests along with it", () => {
+    for (const message of ["Unknown parameter: foo", "Invalid schema for tool 'bash'", "Try again with a valid model id"]) {
+      expect(classifyProviderError({ status: 400, body: { message } }).classification).toBe("bad_request");
+    }
+  });
+});
+
+describe("concurrent turns on one Responses transport", () => {
+  async function transportWith(chaining: boolean | undefined, onRequest: () => void) {
+    const server = Bun.serve({
+      port: 0,
+      async fetch(incoming) {
+        await incoming.json();
+        onRequest();
+        await Bun.sleep(40);  // hold the turn open so the second one genuinely overlaps
+        const frames = `event: response.completed\ndata: ${JSON.stringify({ type: "response.completed", response: { id: "resp_x", output: [], usage: { input_tokens: 1, output_tokens: 0 } } })}\n\n`;
+        return new Response(frames, { headers: { "content-type": "text/event-stream" } });
+      },
+    });
+    servers.push(server);
+    return createProviderTransport({
+      id: "t", baseUrl: `http://127.0.0.1:${server.port}/v1`, auth: new NoAuth(),
+      apiType: "openai_responses", websocket: "off", models: [],
+      ...(chaining === undefined ? {} : { chaining }),
+    });
+  }
+
+  const drain = async (transport: ReturnType<typeof createProviderTransport>) => {
+    const context = { signal: new AbortController().signal, headersTimeoutMs: 5_000 };
+    for await (const _ of transport.stream(request, context)) { /* drain */ }
+  };
+
+  test("are allowed when there is no chain to corrupt", async () => {
+    let seen = 0;
+    const transport = await transportWith(false, () => { seen += 1; });
+    // A main loop and a subagent, on the same provider, at the same time.
+    await Promise.all([drain(transport), drain(transport)]);
+    expect(seen).toBe(2);
+  });
+
+  test("are still refused while a chain is being built", async () => {
+    const transport = await transportWith(undefined, () => { /* count not needed */ });
+    const first = drain(transport);
+    await expect(drain(transport)).rejects.toThrow(/already has an in-flight turn/);
+    await first;
+  });
+});
+
+describe("assistant message phase", () => {
+  // GPT-5.5-class models label each assistant message: "commentary" for an intermediate
+  // update, "final_answer" for the answer. A stateless client replays those messages itself,
+  // so dropping the label tells the model its own commentary was the answer — and it stops.
+  const decode = (events: unknown[]) => {
+    const decoder = new ResponsesStreamDecoder({});
+    const out: ProviderEvent[] = [];
+    for (const event of events) out.push(...decoder.consume(event));
+    return out;
+  };
+
+  const item = (id: string, phase: string, text: string) => ({
+    type: "message", role: "assistant", id, phase,
+    content: [{ type: "output_text", text }],
+  });
+
+  test("is read from the stream and carried on the text it labels", () => {
+    const events = decode([
+      { type: "response.output_item.added", output_index: 0, item: item("m1", "commentary", "") },
+      { type: "response.output_text.delta", item_id: "m1", content_index: 0, delta: "Working on it." },
+      { type: "response.output_item.added", output_index: 1, item: item("m2", "final_answer", "") },
+      { type: "response.output_text.delta", item_id: "m2", content_index: 0, delta: "42" },
+    ]);
+    expect(events).toEqual([
+      { type: "text_delta", text: "Working on it.", phase: "commentary" },
+      { type: "text_delta", text: "42", phase: "final_answer" },
+    ]);
+  });
+
+  test("survives a provider that only sends whole items", () => {
+    const events = decode([
+      { type: "response.completed", response: { id: "r1", output: [item("m9", "final_answer", "done")], usage: { input_tokens: 1, output_tokens: 1 } } },
+    ]);
+    expect(events).toContainEqual({ type: "text_delta", text: "done", phase: "final_answer" });
+  });
+
+  test("goes back on the wire as separate items, each keeping its own label", () => {
+    const request: ProviderRequest = {
+      model: "gpt-5.6", system: "", tools: [],
+      messages: [
+        { id: "u1", role: "user", content: [{ type: "text", text: "hi" }] },
+        {
+          id: "a1", role: "assistant", content: [
+            { type: "text", text: "Working on it.", phase: "commentary" },
+            { type: "text", text: "42", phase: "final_answer" },
+          ],
+        },
+      ],
+    };
+    const body = buildResponsesRequest(request, { stream: true });
+    const input = body.input as Record<string, unknown>[];
+    const assistant = input.filter((i) => i.role === "assistant");
+    expect(assistant).toHaveLength(2);
+    expect(assistant[0]?.phase).toBe("commentary");
+    expect(assistant[1]?.phase).toBe("final_answer");
+    expect((assistant[0]?.content as { text: string }[])[0]?.text).toBe("Working on it.");
+    expect((assistant[1]?.content as { text: string }[])[0]?.text).toBe("42");
+  });
+
+  test("an unlabelled message is still sent unlabelled", () => {
+    const request: ProviderRequest = {
+      model: "gpt-5.6", system: "", tools: [],
+      messages: [{ id: "a1", role: "assistant", content: [{ type: "text", text: "plain" }] }],
+    };
+    const input = buildResponsesRequest(request, { stream: true }).input as Record<string, unknown>[];
+    expect(input[0]).not.toHaveProperty("phase");
+  });
+});
+
+describe("replayed assistant message identity", () => {
+  test("carries no id: Lyra's transcript id is not a provider item id", () => {
+    // The API validates the field it is being handed:
+    //   Invalid 'input[1].id': 'e_01M0EE1…'. Expected an ID that begins with 'msg'.
+    // which rejected the whole request — so a turn that produced any assistant text could
+    // never be replayed.
+    const request: ProviderRequest = {
+      model: "gpt-5.6", system: "", tools: [],
+      messages: [{
+        id: "e_01M0EE1STYBDZRMHQSSRGCGMN4", role: "assistant",
+        content: [{ type: "text", text: "I will multiply." }],
+      }],
+    };
+    const input = buildResponsesRequest(request, { stream: true }).input as Record<string, unknown>[];
+    expect(input[0]).not.toHaveProperty("id");
+    expect(input[0]?.status).toBe("completed");
+    expect(JSON.stringify(input)).not.toContain("e_01M0EE1");
   });
 });

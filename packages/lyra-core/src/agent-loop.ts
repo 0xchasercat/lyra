@@ -654,7 +654,7 @@ function errorMessage(error: unknown): string | undefined {
 }
 
 type MutableAssemblyBlock =
-  | { type: "text"; text: string }
+  | { type: "text"; text: string; phase?: string }
   | { type: "thinking"; thinking: string; signature?: string }
   | { type: "reasoning"; provider: "openai"; raw: Readonly<Record<string, unknown>> }
   | {
@@ -680,8 +680,10 @@ class AttemptAssembly {
       case "text_delta": {
         if (event.text.length === 0) return;
         const last = this.blocks.at(-1);
-        if (last?.type === "text") last.text += event.text;
-        else this.blocks.push({ type: "text", text: event.text });
+        // Commentary and the final answer are different messages to the model even when they
+        // arrive back to back, so a change of phase ends the block rather than extending it.
+        if (last?.type === "text" && last.phase === event.phase) last.text += event.text;
+        else this.blocks.push({ type: "text", text: event.text, ...(event.phase === undefined ? {} : { phase: event.phase }) });
         return;
       }
       case "thinking_delta": {
@@ -742,7 +744,9 @@ class AttemptAssembly {
     for (const block of this.blocks) {
       switch (block.type) {
         case "text":
-          if (block.text.length > 0) content.push({ type: "text", text: block.text });
+          if (block.text.length > 0) {
+            content.push({ type: "text", text: block.text, ...(block.phase === undefined ? {} : { phase: block.phase }) });
+          }
           break;
         case "thinking":
           if (block.thinking.length > 0) {
