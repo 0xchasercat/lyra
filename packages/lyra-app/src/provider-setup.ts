@@ -526,6 +526,42 @@ export async function saveProviderModel(
   return { path, provider, model: id, models: current.models as string[], added };
 }
 
+export interface SavedProviderCapability {
+  path: string;
+  provider: string;
+  changed: boolean;
+}
+
+/**
+ * Remember that a provider's endpoint cannot chain Responses turns.
+ *
+ * Written the first time the endpoint refuses a `previous_response_id`, so the next session
+ * starts where this one ended up instead of rediscovering it. Field-wise like every other
+ * update here: everything the file already had for that provider survives, and a provider the
+ * file has never heard of (an environment-default one) is left alone rather than materialised
+ * from a live definition that nobody asked to persist.
+ */
+export async function saveProviderResponseChaining(
+  provider: string,
+  chaining: boolean,
+  options: { home?: string; signal?: AbortSignal } = {},
+): Promise<SavedProviderCapability> {
+  if (options.signal?.aborted) throw options.signal.reason;
+  const home = resolve(options.home ?? homedir());
+  const path = join(home, ".lyra", "providers.toml");
+  const existing = await readProvidersFile(path);
+  const declared = isRecord(existing.value.providers) ? existing.value.providers : {};
+  const current = isRecord(declared[provider]) ? { ...declared[provider] as Record<string, unknown> } : undefined;
+  if (current === undefined || current.response_chaining === chaining) {
+    return { path, provider, changed: false };
+  }
+  current.response_chaining = chaining;
+  const providers = { ...declared, [provider]: current };
+  const roles = isRecord(existing.value.roles) ? existing.value.roles as Record<string, string> : {};
+  await writeProvidersFile(path, renderProvidersFile(existing.value, providers, roles));
+  return { path, provider, changed: true };
+}
+
 /** A live provider definition as the TOML table that would have produced it. */
 function materialize(definition: ProviderDefinition): Record<string, unknown> {
   return {
@@ -535,6 +571,7 @@ function materialize(definition: ProviderDefinition): Record<string, unknown> {
     auth: { ...definition.auth },
     models: [...(definition.models ?? [])],
     ...(definition.reasoning_effort === undefined ? {} : { reasoning_effort: definition.reasoning_effort }),
+    ...(definition.response_chaining === undefined ? {} : { response_chaining: definition.response_chaining }),
   };
 }
 

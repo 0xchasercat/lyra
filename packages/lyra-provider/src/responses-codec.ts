@@ -59,7 +59,12 @@ export function buildResponsesRequest(
     include: ["reasoning.encrypted_content"],
     stream: options.stream,
   };
-  if (options.previousResponseId !== undefined) {
+  // `null` is the chain state's way of saying "no previous response — this input is complete",
+  // and on the wire that is the *absence* of the field, not a null. The distinction matters:
+  // Responses-compatible gateways in front of a ChatGPT backend reject the parameter outright
+  // ("Unsupported parameter: previous_response_id"), null included, so sending one fails every
+  // first request of a session against them while buying nothing anywhere else.
+  if (options.previousResponseId !== undefined && options.previousResponseId !== null) {
     body.previous_response_id = options.previousResponseId;
   }
   if (options.generate !== undefined) body.generate = options.generate;
@@ -129,6 +134,19 @@ export interface ResponsesChainOptions {
    * nothing, because that chain was going to be refused and replayed anyway.
    */
   readonly stateful?: boolean;
+
+  /**
+   * Whether `previous_response_id` may be sent at all. Default `true`.
+   *
+   * A gateway in front of a ChatGPT backend cannot resolve one: with `store: false` (§5.2)
+   * nothing was retained to chain from, and rather than answering
+   * `previous_response_not_found` it refuses the turn in prose ("its earlier conversation
+   * context is unavailable or expired") -- or rejects the parameter outright. Recovery
+   * handles that, but it spends a failed request per turn to relearn the same fact. Setting
+   * this to `false` skips the attempt: every request carries the whole window, which is what
+   * the retry would have sent anyway.
+   */
+  readonly chaining?: boolean;
 }
 
 export interface PreparedResponseInput {
@@ -146,13 +164,34 @@ export class ResponsesChainState {
     | { model: string; source: ResponseItem[]; output: readonly ResponseItem[] }
     | undefined;
   private readonly stateful: boolean;
+  private chaining: boolean;
 
   constructor(options: ResponsesChainOptions = {}) {
     this.stateful = options.stateful ?? false;
+    this.chaining = options.chaining ?? true;
+  }
+
+  /** Whether a `previous_response_id` may still be offered to this endpoint. */
+  get chains(): boolean {
+    return this.chaining;
+  }
+
+  /**
+   * Stop offering `previous_response_id` for the rest of this transport's life.
+   *
+   * An endpoint that refused one chain refuses them all: the refusal describes the endpoint,
+   * not the turn. Without this, every later turn spends one failed request relearning it.
+   */
+  disableChaining(): void {
+    this.chaining = false;
+    this.break();
   }
 
   prepare(request: ProviderRequest): PreparedResponseInput {
     const fullInput = serializeResponseItems(request.messages);
+    if (!this.chaining) {
+      return { fullInput, input: fullInput, previousResponseId: null, incremental: false };
+    }
     if (
       this.responseId !== undefined &&
       this.model === request.model &&
@@ -200,7 +239,7 @@ export class ResponsesChainState {
     responseId: string | undefined,
     output: readonly ResponseItem[],
   ): void {
-    if (responseId === undefined) {
+    if (!this.chaining || responseId === undefined) {
       this.clearLiveChain();
       return;
     }

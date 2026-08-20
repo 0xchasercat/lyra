@@ -129,6 +129,32 @@ const CONTEXT_MESSAGE_PATTERNS: readonly RegExp[] = [
 const QUOTA_MESSAGE_PATTERN = /\b(?:quota|credits?|billing)\b/;
 
 /**
+ * A chain the endpoint cannot resolve, stated in prose instead of as a code.
+ *
+ * OpenAI answers a stale `previous_response_id` with `previous_response_not_found`, which
+ * needs no pattern. A gateway in front of a ChatGPT backend instead returns 403 with
+ * "The service cannot safely review this request because its earlier conversation context is
+ * unavailable or expired. Resend the complete context..." -- the same fact, and the same
+ * recovery (resend the whole window), so it is read as the same code rather than surfacing
+ * as a fatal permission error.
+ */
+const DROPPED_CHAIN_MESSAGE_PATTERNS: readonly RegExp[] = [
+  /\bearlier conversation context is (?:unavailable|expired)/,
+  /\bresend the complete context\b/,
+  /\bunsupported parameter:\s*previous_response_id\b/,
+  /\bprevious[_ ]response[_ ]id\b[^.]*\b(?:not found|expired|unavailable|invalid)\b/,
+  // The same gateway, refusing the same chained turn, in two wordings: which one it picks
+  // depends on whether it could find a session for the id. Both mean the referenced turn is
+  // not there to continue from, and both are answered by resending the whole window.
+  /\bcannot safely review this (?:task|request)\b/,
+  /\bstable session identifier\b/,
+];
+
+function isDroppedChainMessage(message: string): boolean {
+  return DROPPED_CHAIN_MESSAGE_PATTERNS.some((pattern) => pattern.test(message));
+}
+
+/**
  * The provider refusing *our own* `max_tokens`, which is not a context overflow.
  *
  * The two collide because both are 400s whose prose is about tokens and maximums:
@@ -159,13 +185,16 @@ export function classifyProviderError(input: ProviderErrorInput): ProviderFault 
   const providerMessage =
     input.message ?? extracted.message ?? messageFromCause(input.cause) ?? undescribedFailure(status, input.cause, input.url);
   const retryAfterMs = parseRetryAfter(input.headers);
-  const classification = classify(status, code, providerMessage.toLowerCase(), input.cause);
+  // A gateway that states a dropped chain in prose gets the code OpenAI would have sent, so
+  // one recovery path serves both and a 403 saying so does not read as a revoked credential.
+  const effectiveCode = code ?? (isDroppedChainMessage(providerMessage.toLowerCase()) ? "previous_response_not_found" : undefined);
+  const classification = classify(status, effectiveCode, providerMessage.toLowerCase(), input.cause);
 
   return new ProviderFault({
     classification,
     providerMessage,
     ...(status === undefined ? {} : { status }),
-    ...(code === undefined ? {} : { code }),
+    ...(effectiveCode === undefined ? {} : { code: effectiveCode }),
     ...(retryAfterMs === undefined ? {} : { retryAfterMs }),
     ...(input.body === undefined ? {} : { raw: input.body }),
     ...(input.cause === undefined ? {} : { cause: input.cause }),
@@ -216,10 +245,18 @@ function isQuotaMessage(message: string): boolean {
 }
 
 function extractError(body: unknown): { code?: string; message?: string } {
+  // Not every gateway wraps its complaint in OpenAI's `{ error: { message } }`. A bare string
+  // body and FastAPI's `{ "detail": ... }` are both common, and reading neither is why a
+  // provider that said exactly what was wrong was reported as answering with an empty body.
+  const plain = stringValue(body);
+  if (plain !== undefined) return { message: plain };
   if (!isRecord(body)) return {};
-  const nested = isRecord(body.error) ? body.error : body;
+  const detail = isRecord(body.detail) ? body.detail : undefined;
+  const nested = isRecord(body.error) ? body.error : detail ?? body;
   const code = stringValue(nested.code) ?? stringValue(nested.type);
-  const message = stringValue(nested.message) ?? stringValue(body.message);
+  const message = stringValue(nested.message)
+    ?? stringValue(body.message)
+    ?? stringValue(body.detail);
   return {
     ...(code === undefined ? {} : { code }),
     ...(message === undefined ? {} : { message }),

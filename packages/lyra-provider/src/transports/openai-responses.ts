@@ -29,6 +29,15 @@ import type {
 export interface OpenAIResponsesTransportConfig extends HttpTransportConfig {
   /** Forwarded as `reasoning.effort` on every request this transport sends. */
   reasoningEffort?: ReasoningEffort;
+  /** `false` never sends `previous_response_id`; every request carries the whole window. */
+  chaining?: boolean;
+  /**
+   * Told once, the first time this endpoint refuses a chain and the transport stops trying.
+   *
+   * The caller's cue to remember the fact past this process — writing `response_chaining =
+   * false` onto the provider — so the next session never spends the failed request at all.
+   */
+  onChainingUnsupported?: () => void;
   responsesPath?: string;
   compactPath?: string;
   compactThreshold?: number;
@@ -46,12 +55,15 @@ export class OpenAIResponsesTransport implements ProviderTransport {
   readonly id: string;
 
   private readonly config: OpenAIResponsesTransportConfig;
-  private readonly chain = new ResponsesChainState();
+  private readonly chain: ResponsesChainState;
   private inFlight = false;
 
   constructor(config: OpenAIResponsesTransportConfig) {
     this.config = config;
     this.id = config.id;
+    this.chain = new ResponsesChainState(
+      config.chaining === undefined ? {} : { chaining: config.chaining },
+    );
   }
 
   async *stream(
@@ -80,6 +92,7 @@ export class OpenAIResponsesTransport implements ProviderTransport {
           // the client to discard the partial output rather than append a second copy to it.
           if (!recovered && !emitted && prepared.incremental && fault.code === "previous_response_not_found") {
             recovered = true;
+            this.noteChainRefused();
             prepared = this.chain.recovery(request);
             continue;
           }
@@ -108,6 +121,7 @@ export class OpenAIResponsesTransport implements ProviderTransport {
           const fault = asProviderFault(cause);
           this.chain.break();
           if (!recovered && prepared.incremental && fault.code === "previous_response_not_found") {
+            this.noteChainRefused();
             recovered = true;
             prepared = this.chain.recovery(request);
             continue;
@@ -235,6 +249,21 @@ export class OpenAIResponsesTransport implements ProviderTransport {
         message: "The Responses stream ended before a terminal event",
       });
     }
+  }
+
+  /**
+   * Give up on chaining for good, once, and tell the caller so it can be remembered.
+   *
+   * A conforming endpoint drops a stored response occasionally — expiry, an eviction — and
+   * chaining is still worth attempting there. An endpoint that cannot chain at all refuses
+   * every time, and the two are indistinguishable from one refusal. Stopping after the first
+   * costs a conforming endpoint nothing but full inputs for the rest of one session, and saves
+   * a gateway that never chains one failed request on every turn of every session.
+   */
+  private noteChainRefused(): void {
+    if (!this.chain.chains) return;
+    this.chain.disableChaining();
+    this.config.onChainingUnsupported?.();
   }
 
   private contextManagement(): readonly Readonly<Record<string, unknown>>[] | undefined {

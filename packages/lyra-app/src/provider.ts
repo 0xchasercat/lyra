@@ -1,6 +1,7 @@
 import { resolve as resolvePath } from "node:path";
 import { authPluginRoot, cachedModels, createProviderTransport, loadProviderConfig, ProviderFault, ReliableProvider, resolveProvider, resolveModelRole } from "@lyra/provider";
 import type { AuthConfig, AuthSource, ModelInfo, ProviderDefinition, ProviderFileConfig, ProviderTransport, ResolveProviderOptions } from "@lyra/provider";
+import { saveProviderResponseChaining } from "./provider-setup.ts";
 
 export interface EnvironmentProviderOptions {
   configPath?: string;
@@ -192,7 +193,17 @@ export function createConfiguredProvider(config: ProviderFileConfig, options: Om
   const definition = config.providers[providerName];
   if (!definition) throw new Error(`Provider "${providerName}" is not configured (you asked for "${reference}"). Available: ${Object.keys(config.providers).join(", ") || "none"}. Add it with "/provider add" or add [providers.${providerName}] to Lyra TOML.`);
   const resolved = resolveProvider(providerName, definition, pluginOptions(options.home));
-  const transport = createProviderTransport(resolved);
+  // An endpoint that cannot chain Responses turns teaches Lyra so on its first refusal; the
+  // lesson is written onto the provider so the next session opens already knowing it. Best
+  // effort by design: a read-only or unwritable config still runs, it just relearns next time.
+  const transport = createProviderTransport({
+    ...resolved,
+    onChainingUnsupported: (): void => {
+      void saveProviderResponseChaining(providerName, false, {
+        ...(options.home === undefined ? {} : { home: options.home }),
+      }).catch(() => { /* remembering is an optimisation, never a reason to fail a turn */ });
+    },
+  });
   const auth = resolved.auth;
   const provider = new ReliableProvider(transport, {
     ...(options.maxAttempts === undefined ? {} : { maxAttempts: options.maxAttempts }),
