@@ -6,11 +6,12 @@
   "workspaces": ["packages/*"],
   "scripts": {
     "test": "bun test",
-    "typecheck": "tsc -b",
+    "typecheck": "tsc -b --force",
     "check": "bun run typecheck && bun test",
     "build": "bun scripts/package.ts",
     "install:local": "bun scripts/package.ts --install",
-    "lyra": "bun packages/lyra-app/src/cli.ts"
+    "lyra": "bun packages/lyra-app/src/cli.ts",
+    "clean": "tsc -b --clean"
   },
   "devDependencies": {
     "@types/bun": "^1.3.14",
