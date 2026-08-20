@@ -106,7 +106,7 @@ describe("classifyProviderError adversarial inputs", () => {
   });
 
   test("does not mistake malformed bodies for classified provider errors", () => {
-    for (const body of [null, [], "plain string", { error: [] }, { error: { code: 7, message: {} } }]) {
+    for (const body of [null, [], { error: [] }, { error: { code: 7, message: {} } }]) {
       const fault = classifyProviderError({ status: 400, body });
       expect(fault.classification).toBe("bad_request");
       // A body that describes nothing leaves the status as the only fact there is, and the
@@ -115,6 +115,18 @@ describe("classifyProviderError adversarial inputs", () => {
       // as the entire explanation of a failed turn.
       expect(fault.providerMessage).toBe("The provider answered HTTP 400 with an empty error body");
     }
+  });
+
+  test("reads a body that is just the sentence, or names it under `detail`", () => {
+    // Not every gateway wraps its complaint in `{ error: { message } }`. A bare string and
+    // FastAPI's `{ detail }` both say exactly what went wrong, and reporting such a response
+    // as "an empty error body" hides the one fact the turn failed for.
+    const bare = classifyProviderError({ status: 400, body: "Unsupported parameter: verbosity" });
+    expect(bare.providerMessage).toBe("Unsupported parameter: verbosity");
+    expect(bare.classification).toBe("bad_request");
+    const detailed = classifyProviderError({ status: 400, body: { detail: "Unsupported parameter: session_id" } });
+    expect(detailed.providerMessage).toBe("Unsupported parameter: session_id");
+    expect(detailed.classification).toBe("bad_request");
   });
 
   test("describes an empty error response and a non-error rejection by what is actually known", () => {

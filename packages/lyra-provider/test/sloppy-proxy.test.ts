@@ -227,9 +227,10 @@ describe("a proxy that speaks /responses badly", () => {
       // Turn 1 has no chain to try. Turn 2 tries the stored chain, is refused, and retries
       // once with the whole conversation — three requests, never a fourth.
       expect(proxy.requests).toHaveLength(3);
-      expect(proxy.requests[0]?.previous_response_id).toBeNull();
+      // No chain to continue is the *absence* of the parameter, not a null literal.
+      expect(proxy.requests[0]).not.toHaveProperty("previous_response_id");
       expect(typeof proxy.requests[1]?.previous_response_id).toBe("string");
-      expect(proxy.requests[2]?.previous_response_id).toBeNull();
+      expect(proxy.requests[2]).not.toHaveProperty("previous_response_id");
       expect((proxy.requests[2]?.input as unknown[]).length).toBe(3);
     } finally {
       await proxy.stop();

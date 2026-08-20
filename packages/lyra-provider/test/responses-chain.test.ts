@@ -148,6 +148,8 @@ describe("the Responses chain never puts a tool result on the wire without its c
         if (item.type === "function_call_output") expect(seen.has(item.call_id)).toBe(true);
       }
     }
-    expect(bodies[1]?.previous_response_id).toBeNull();
+    // The chain was dropped for this turn, which the wire shows by carrying no
+    // previous_response_id at all.
+    expect(bodies[1]).not.toHaveProperty("previous_response_id");
   });
 });

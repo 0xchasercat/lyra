@@ -59,7 +59,12 @@ export function buildResponsesRequest(
     include: ["reasoning.encrypted_content"],
     stream: options.stream,
   };
-  if (options.previousResponseId !== undefined) {
+  // `null` is the chain state's way of saying "no previous response — this input is complete",
+  // and on the wire that is the *absence* of the field, not a null. The distinction matters:
+  // Responses-compatible gateways in front of a ChatGPT backend reject the parameter outright
+  // ("Unsupported parameter: previous_response_id"), null included, so sending one fails every
+  // first request of a session against them while buying nothing anywhere else.
+  if (options.previousResponseId !== undefined && options.previousResponseId !== null) {
     body.previous_response_id = options.previousResponseId;
   }
   if (options.generate !== undefined) body.generate = options.generate;
@@ -129,6 +134,19 @@ export interface ResponsesChainOptions {
    * nothing, because that chain was going to be refused and replayed anyway.
    */
   readonly stateful?: boolean;
+
+  /**
+   * Whether `previous_response_id` may be sent at all. Default `true`.
+   *
+   * A gateway in front of a ChatGPT backend cannot resolve one: with `store: false` (§5.2)
+   * nothing was retained to chain from, and rather than answering
+   * `previous_response_not_found` it refuses the turn in prose ("its earlier conversation
+   * context is unavailable or expired") -- or rejects the parameter outright. Recovery
+   * handles that, but it spends a failed request per turn to relearn the same fact. Setting
+   * this to `false` skips the attempt: every request carries the whole window, which is what
+   * the retry would have sent anyway.
+   */
+  readonly chaining?: boolean;
 }
 
 export interface PreparedResponseInput {
@@ -146,13 +164,34 @@ export class ResponsesChainState {
     | { model: string; source: ResponseItem[]; output: readonly ResponseItem[] }
     | undefined;
   private readonly stateful: boolean;
+  private chaining: boolean;
 
   constructor(options: ResponsesChainOptions = {}) {
     this.stateful = options.stateful ?? false;
+    this.chaining = options.chaining ?? true;
+  }
+
+  /** Whether a `previous_response_id` may still be offered to this endpoint. */
+  get chains(): boolean {
+    return this.chaining;
+  }
+
+  /**
+   * Stop offering `previous_response_id` for the rest of this transport's life.
+   *
+   * An endpoint that refused one chain refuses them all: the refusal describes the endpoint,
+   * not the turn. Without this, every later turn spends one failed request relearning it.
+   */
+  disableChaining(): void {
+    this.chaining = false;
+    this.break();
   }
 
   prepare(request: ProviderRequest): PreparedResponseInput {
     const fullInput = serializeResponseItems(request.messages);
+    if (!this.chaining) {
+      return { fullInput, input: fullInput, previousResponseId: null, incremental: false };
+    }
     if (
       this.responseId !== undefined &&
       this.model === request.model &&
@@ -200,7 +239,7 @@ export class ResponsesChainState {
     responseId: string | undefined,
     output: readonly ResponseItem[],
   ): void {
-    if (responseId === undefined) {
+    if (!this.chaining || responseId === undefined) {
       this.clearLiveChain();
       return;
     }
@@ -276,6 +315,8 @@ export class ResponsesStreamDecoder {
   private readonly callArguments = new Map<string, string>();
   private readonly callsEnded = new Set<string>();
   private readonly reasoningEmitted = new Set<string>();
+  /** item id -> the phase the provider gave that assistant message, if any. */
+  private readonly itemPhase = new Map<string, string>();
   private readonly textEmitted = new Set<string>();
   /** Text already streamed, per `item_id:content_index` slot — the ledger content dedup reads. */
   private readonly streamedText = new Map<string, string>();
@@ -356,9 +397,29 @@ export class ResponsesStreamDecoder {
 
   private itemAdded(event: Record<string, unknown>): ProviderEvent[] {
     const item = requiredRecord(event.item, "output item", event);
+    this.notePhase(item);
     if (item.type !== "function_call") return [];
     const call = this.captureCall(item, event);
     return this.startCall(call);
+  }
+
+  /**
+   * Remember an assistant message's phase, keyed by the item id its text deltas carry.
+   *
+   * Recorded from `output_item.added` (which arrives before the first delta), from
+   * `output_item.done`, and from the terminal `response.output` — a translating proxy may
+   * skip any of the three, and the phase must survive whichever one it does send.
+   */
+  private notePhase(item: Record<string, unknown>, fallbackId?: string): void {
+    if (item.type !== "message" || item.role !== "assistant") return;
+    const id = stringValue(item.id) ?? fallbackId;
+    const phase = stringValue(item.phase);
+    if (id === undefined || phase === undefined) return;
+    this.itemPhase.set(id, phase);
+  }
+
+  private phaseFor(key: string): string | undefined {
+    return this.itemPhase.get(key.slice(0, key.lastIndexOf(":")));
   }
 
   private argumentsDelta(event: Record<string, unknown>): ProviderEvent[] {
@@ -394,7 +455,8 @@ export class ResponsesStreamDecoder {
     const addition = isCumulativeResend(streamed, delta) ? delta.slice(streamed.length) : delta;
     if (addition.length === 0) return [];
     this.streamedText.set(key, streamed + addition);
-    return [{ type: "text_delta", text: addition }];
+    const phase = this.phaseFor(key);
+    return [{ type: "text_delta", text: addition, ...(phase === undefined ? {} : { phase }) }];
   }
 
   /**
@@ -409,7 +471,8 @@ export class ResponsesStreamDecoder {
     if (text.length === 0) return [];
     if (this.alreadyRendered(key, text)) return [];
     this.completedText.add(text);
-    return [{ type: "text_delta", text }];
+    const phase = this.phaseFor(key);
+    return [{ type: "text_delta", text, ...(phase === undefined ? {} : { phase }) }];
   }
 
   private alreadyRendered(key: string, text: string): boolean {
@@ -438,6 +501,7 @@ export class ResponsesStreamDecoder {
     const index = numberValue(event.output_index);
     if (index !== undefined && this.isEchoedInput(item, index)) return [];
     this.recordOutput(event, item);
+    this.notePhase(item);
     if (item.type === "reasoning") return this.emitReasoning(item, event);
     if (item.type !== "function_call") return [];
 
@@ -471,7 +535,12 @@ export class ResponsesStreamDecoder {
         const synthetic = { output_index: index, item };
         if (item.type === "reasoning") events.push(...this.emitReasoning(item, synthetic));
         else if (item.type === "function_call") events.push(...this.finishTerminalCall(item, synthetic));
-        else if (item.type === "message") events.push(...this.emitTerminalMessage(item, index));
+        else if (item.type === "message") {
+          // `emitTerminalMessage` keys content by this same fallback when the item carries no
+          // id of its own, so the phase must be filed under it too.
+          this.notePhase(item, `output:${index}`);
+          events.push(...this.emitTerminalMessage(item, index));
+        }
       }
       this.output = produced;
     }
@@ -600,18 +669,33 @@ export class ResponsesStreamDecoder {
 
 function serializeMessage(message: CanonicalMessage, destination: ResponseItem[]): void {
   let content: Record<string, unknown>[] = [];
+  let phase: string | undefined;
   const flush = (): void => {
     if (content.length === 0) return;
     destination.push({
       type: "message",
       role: message.role,
       content,
-      ...(message.role === "assistant" ? { id: message.id, status: "completed" } : {}),
+      // No `id`. On a Responses input item that field is the *provider's* item id, and Lyra's
+      // is its own transcript id (`e_01J…`), which the API rejects outright:
+      //   Invalid 'input[1].id': 'e_01J…'. Expected an ID that begins with 'msg'.
+      // It cost nothing to send and broke every replay of an assistant message that carried
+      // text — commentary, or a marker such as "interrupted" — which is every such turn once
+      // the conversation is replayed rather than chained. Item identity is compared by
+      // `itemFingerprint`, which ignores ids, so nothing here needed one.
+      ...(message.role === "assistant" ? { status: "completed" } : {}),
+      ...(phase === undefined ? {} : { phase }),
     });
     content = [];
+    phase = undefined;
   };
 
   for (const block of message.content) {
+    // One canonical message can hold a run of commentary and the final answer that followed
+    // it. They were separate items on the wire and have to go back as separate items, or the
+    // phase of whichever won would be claimed by the other's text too.
+    if (block.type === "text" && block.phase !== phase && content.length > 0) flush();
+    if (block.type === "text") phase = block.phase;
     if (block.type === "reasoning") {
       flush();
       if (block.raw.type !== "reasoning") {

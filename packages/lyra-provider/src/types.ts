@@ -8,7 +8,16 @@ export type ProviderApiType =
 
 export type MessageRole = "user" | "assistant";
 
-export type TextBlock = { type: "text"; text: string };
+/**
+ * `phase` is the model's own label for what a message *is*: an intermediate update
+ * (`"commentary"`) or the answer the turn was for (`"final_answer"`).
+ *
+ * GPT-5.5-class models emit it on every assistant message and read it back on replay. Drop it
+ * and a stateless client tells the model that its own running commentary was the final answer
+ * — after which it stops, having apparently already answered. It is carried opaquely: the
+ * vocabulary belongs to the provider, and Lyra only has to return what it was given.
+ */
+export type TextBlock = { type: "text"; text: string; phase?: string };
 export type ThinkingBlock = {
   type: "thinking";
   thinking: string;
@@ -88,7 +97,7 @@ export type StopReason =
   | "cancelled";
 
 export type ProviderEvent =
-  | { type: "text_delta"; text: string }
+  | { type: "text_delta"; text: string; phase?: string }
   | { type: "thinking_delta"; thinking: string }
   | { type: "thinking_signature"; signature: string }
   | { type: "reasoning_item"; item: Readonly<Record<string, unknown>> }

@@ -32,6 +32,15 @@ export interface ProviderDefinition {
   auth: AuthConfig;
   models?: string[];
   reasoning_effort?: ReasoningEffort;
+  /**
+   * `false` stops the Responses transport from ever sending `previous_response_id`.
+   *
+   * Set it for a gateway that cannot resolve one -- a ChatGPT-backend proxy answers such a
+   * turn with a 403 whose prose says the earlier context is unavailable, and since every
+   * request already says `store: false` there was never anything to chain from. Ignored by
+   * the other wire formats, which have no chain.
+   */
+  response_chaining?: boolean;
 }
 
 export interface ProviderFileConfig {
@@ -44,6 +53,14 @@ export interface ResolvedProvider extends HttpTransportConfig {
   websocket: WebSocketPreference;
   models: string[];
   reasoningEffort?: ReasoningEffort;
+  chaining?: boolean;
+  /**
+   * Called once if the endpoint turns out not to support Responses chaining at all.
+   *
+   * Resolution reads the file; this is how the runtime writes back to it. The caller decides
+   * what remembering means — persisting `response_chaining = false`, or nothing.
+   */
+  onChainingUnsupported?: () => void;
 }
 
 export async function loadProviderConfig(path?: string | readonly string[]): Promise<ProviderFileConfig> {
@@ -110,6 +127,7 @@ export function resolveProvider(
     websocket: definition.websocket ?? "auto",
     models: definition.models ?? [],
     ...(definition.reasoning_effort === undefined ? {} : { reasoningEffort: definition.reasoning_effort }),
+    ...(definition.response_chaining === undefined ? {} : { chaining: definition.response_chaining }),
     ...(definition.api_type === "anthropic_messages"
       ? {
         // An API key goes in `x-api-key`; a plugin returns a *bearer* token by contract, and
@@ -177,6 +195,10 @@ function parseDefinition(name: string, value: unknown): ProviderDefinition {
   if (reasoningEffort !== undefined && !isReasoningEffort(reasoningEffort)) {
     throw new Error(`Provider ${name} reasoning_effort must be one of ${REASONING_EFFORTS.join(", ")}`);
   }
+  const responseChaining = value.response_chaining;
+  if (responseChaining !== undefined && typeof responseChaining !== "boolean") {
+    throw new Error(`Provider ${name} response_chaining must be true or false`);
+  }
   return {
     base_url: value.base_url,
     api_type: value.api_type,
@@ -184,6 +206,7 @@ function parseDefinition(name: string, value: unknown): ProviderDefinition {
     ...(websocket === undefined ? {} : { websocket }),
     ...(models === undefined ? {} : { models }),
     ...(reasoningEffort === undefined ? {} : { reasoning_effort: reasoningEffort }),
+    ...(responseChaining === undefined ? {} : { response_chaining: responseChaining }),
   };
 }
 
